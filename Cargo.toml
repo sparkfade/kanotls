@@ -1,0 +1,42 @@
+[workspace]
+members = [
+    "crates/config",
+    "crates/tunnel",
+    "crates/session",
+    "crates/proto",
+    "kanotls",
+]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rustls = { version = "0.23", features = ["ring", "std"], default-features = false }
+webpki-roots = "0.26"
+snow = "0.10"
+rand = "0.8"
+hex = "0.4"
+blake2 = "0.10"
+lru = "0.13"
+clap = { version = "4", features = ["derive"] }
+bytes = "1"
+lazy_static = "1"
+subtle = "2"
+socket2 = { version = "0.5", features = ["all"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3

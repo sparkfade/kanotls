@@ -1,0 +1,21 @@
+[package]
+name = "kanotls"
+version = "1.0.0"
+edition.workspace = true
+
+[[bin]]
+name = "kanotls"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+kanotls-config = { path = "../crates/config" }
+kanotls-tunnel = { path = "../crates/tunnel" }
+kanotls-session = { path = "../crates/session" }
+kanotls-proto = { path = "../crates/proto" }
