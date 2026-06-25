@@ -1,0 +1,17 @@
+[package]
+name = "kanotls-session"
+version = "1.0.0"
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+futures.workspace = true
+bytes.workspace = true
+kanotls-config = { path = "../config" }
+kanotls-tunnel = { path = "../tunnel" }
+snow.workspace = true
+
+[dev-dependencies]
