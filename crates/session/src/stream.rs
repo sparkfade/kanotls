@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, Notify, RwLock};
 
 const SYNACK_TIMEOUT_SECS: u64 = 10;
 
@@ -65,6 +65,7 @@ pub(crate) struct StreamInit {
     pub pending_data: Arc<Mutex<HashMap<u32, Vec<Vec<u8>>>>>,
     pub pending_fin: Arc<Mutex<std::collections::HashSet<u32>>>,
     pub closing_streams: Arc<Mutex<std::collections::HashSet<u32>>>,
+    pub pending_notify: Arc<Notify>,
     pub open_state: StreamOpenState,
     pub buffered_stream_bytes: Arc<AtomicUsize>,
 }
@@ -81,6 +82,7 @@ pub struct Stream {
     pending_data: Arc<Mutex<HashMap<u32, Vec<Vec<u8>>>>>,
     pending_fin: Arc<Mutex<std::collections::HashSet<u32>>>,
     closing_streams: Arc<Mutex<std::collections::HashSet<u32>>>,
+    pending_notify: Arc<Notify>,
     open_state: StreamOpenState,
     deferred_target: Option<Vec<u8>>,
     read_closed: bool,
@@ -103,6 +105,7 @@ impl Stream {
             pending_data: init.pending_data,
             pending_fin: init.pending_fin,
             closing_streams: init.closing_streams,
+            pending_notify: init.pending_notify,
             open_state: init.open_state,
             deferred_target: None,
             read_closed: false,
@@ -114,30 +117,42 @@ impl Stream {
     }
 
     pub async fn read(&mut self) -> Option<Vec<u8>> {
-        if let Ok(data) = self.data_rx.try_recv() {
-            self.buffered_stream_bytes
-                .fetch_sub(data.len(), Ordering::Relaxed);
-            return Some(data);
-        }
-        if self.read_closed {
-            return None;
-        }
-        tokio::select! {
-            data = self.data_rx.recv() => {
-                if let Some(ref d) = data {
-                    self.buffered_stream_bytes
-                        .fetch_sub(d.len(), Ordering::Relaxed);
-                }
-                data
+        loop {
+            if let Ok(data) = self.data_rx.try_recv() {
+                self.buffered_stream_bytes
+                    .fetch_sub(data.len(), Ordering::Relaxed);
+                return Some(data);
             }
-            _ = self.fin_rx.recv() => {
-                if let Ok(data) = self.data_rx.try_recv() {
-                    self.buffered_stream_bytes
-                        .fetch_sub(data.len(), Ordering::Relaxed);
-                    return Some(data);
+            if let Some(data) = self.try_drain_pending_data() {
+                return Some(data);
+            }
+            if self.read_closed {
+                return None;
+            }
+
+            tokio::select! {
+                data = self.data_rx.recv() => {
+                    if let Some(ref d) = data {
+                        self.buffered_stream_bytes
+                            .fetch_sub(d.len(), Ordering::Relaxed);
+                    }
+                    return data;
                 }
-                self.read_closed = true;
-                None
+                _ = self.pending_notify.notified() => {
+                    continue;
+                }
+                _ = self.fin_rx.recv() => {
+                    if let Ok(data) = self.data_rx.try_recv() {
+                        self.buffered_stream_bytes
+                            .fetch_sub(data.len(), Ordering::Relaxed);
+                        return Some(data);
+                    }
+                    if let Some(data) = self.try_drain_pending_data() {
+                        return Some(data);
+                    }
+                    self.read_closed = true;
+                    return None;
+                }
             }
         }
     }
@@ -487,7 +502,9 @@ impl Drop for Stream {
             && try_send_fin_frame(stream_id, &writer)
                 .is_ok();
         if let Ok(mut streams) = self.streams.try_write() {
-            streams.remove(&stream_id);
+            if let Some(handle) = streams.get_mut(&stream_id) {
+                handle.read_closed = true;
+            }
         }
         if let Ok(mut pending_data) = self.pending_data.try_lock() {
             pending_data.remove(&stream_id);
@@ -517,6 +534,22 @@ impl Stream {
     async fn clear_pending_client_state(&self) {
         self.pending_data.lock().await.remove(&self.stream_id);
         self.pending_fin.lock().await.remove(&self.stream_id);
+    }
+
+    fn try_drain_pending_data(&self) -> Option<Vec<u8>> {
+        let mut pending = self.pending_data.try_lock().ok()?;
+        let queue = pending.get_mut(&self.stream_id)?;
+        if queue.is_empty() {
+            pending.remove(&self.stream_id);
+            return None;
+        }
+        let data = queue.remove(0);
+        self.buffered_stream_bytes
+            .fetch_sub(data.len(), Ordering::Relaxed);
+        if queue.is_empty() {
+            pending.remove(&self.stream_id);
+        }
+        Some(data)
     }
 
     fn deferred_open_frames(&self) -> Option<Vec<Vec<u8>>> {
