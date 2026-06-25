@@ -1,0 +1,50 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "tag": "tls-in",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "tunnel",
+      "settings": {
+        "password": "CHANGE_ME_min_32_bytes_use_openssl_rand_-base64_48",
+        "camouflage": {
+          "host": "example.com",
+          "port": 443
+        },
+        "session": {
+          "max_streams_per_session": 256,
+          "idle_timeout_secs": 300
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "direct"
+    }
+,
+    {
+      "tag": "socks5-out",
+      "protocol": "socks5",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 1080,
+        "username": "",
+        "password": ""
+      }
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inbound_tag": ["tls-in"],
+        "outbound_tag": "direct"
+      }
+    ]
+  }
+}

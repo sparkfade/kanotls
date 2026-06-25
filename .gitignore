@@ -1,0 +1,25 @@
+# Rust
+target/
+out/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test data artifacts
+TEST/
+
+# Configs with secrets
+config/*-secret.json
+*.secret.json
+
+REALITY/
