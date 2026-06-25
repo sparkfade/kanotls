@@ -1,9 +1,10 @@
 use crate::frame::{Frame, CMD_SYNACK};
 use crate::session::{PendingAcceptFlushResult, Session, SessionConfig, StreamHandle, TrafficClass};
 use kanotls_tunnel::SnowyStream;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::warn;
 
 const NEW_STREAM_CHANNEL_CAPACITY: usize = 128;
@@ -53,12 +54,14 @@ impl ServerSessionHandler {
 
         let (data_tx, data_rx) = mpsc::channel(128);
         let (fin_tx, fin_rx) = mpsc::channel(1);
+        let pending_notify = Arc::new(Notify::new());
 
         let handle = StreamHandle {
             data_tx: data_tx.clone(),
             fin_tx: fin_tx.clone(),
             synack_tx: None,
             read_closed: false,
+            pending_notify: pending_notify.clone(),
         };
 
         self.session.streams.write().await.insert(sid, handle);
@@ -84,6 +87,8 @@ impl ServerSessionHandler {
                 write_closed: false,
                 closed: matches!(flush_result, PendingAcceptFlushResult::ClosedLocally),
                 buffered_stream_bytes: self.session.buffered_stream_bytes.clone(),
+                pending_data: self.session.pending_data.clone(),
+                pending_notify,
             },
         ))
     }
@@ -102,45 +107,78 @@ pub struct ServerStream {
     write_closed: bool,
     closed: bool,
     buffered_stream_bytes: Arc<AtomicUsize>,
+    pending_data: Arc<Mutex<HashMap<u32, Vec<Vec<u8>>>>>,
+    pending_notify: Arc<Notify>,
 }
 
 impl ServerStream {
     pub async fn read(&mut self) -> Option<Vec<u8>> {
-        if let Ok(data) = self.data_rx.try_recv() {
-            let _ = self.buffered_stream_bytes.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |v| Some(v.saturating_sub(data.len())),
-            );
-            return Some(data);
+        loop {
+            if let Ok(data) = self.data_rx.try_recv() {
+                let _ = self.buffered_stream_bytes.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(data.len())),
+                );
+                return Some(data);
+            }
+            if let Some(data) = self.try_drain_pending_data() {
+                return Some(data);
+            }
+            if self.read_closed {
+                return None;
+            }
+
+            tokio::select! {
+                data = self.data_rx.recv() => {
+                    if let Some(ref d) = data {
+                        let _ = self.buffered_stream_bytes.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |v| Some(v.saturating_sub(d.len())),
+                        );
+                    }
+                    return data;
+                }
+                _ = self.pending_notify.notified() => {
+                    continue;
+                }
+                _ = self.fin_rx.recv() => {
+                    if let Ok(data) = self.data_rx.try_recv() {
+                        let _ = self.buffered_stream_bytes.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |v| Some(v.saturating_sub(data.len())),
+                        );
+                        return Some(data);
+                    }
+                    if let Some(data) = self.try_drain_pending_data() {
+                        return Some(data);
+                    }
+                    self.read_closed = true;
+                    return None;
+                }
+            }
         }
-        if self.read_closed {
+    }
+
+    fn try_drain_pending_data(&self) -> Option<Vec<u8>> {
+        let mut pending = self.pending_data.try_lock().ok()?;
+        let queue = pending.get_mut(&self.sid)?;
+        if queue.is_empty() {
+            pending.remove(&self.sid);
             return None;
         }
-        tokio::select! {
-            data = self.data_rx.recv() => {
-                if let Some(ref d) = data {
-                    let _ = self.buffered_stream_bytes.fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |v| Some(v.saturating_sub(d.len())),
-                    );
-                }
-                data
-            },
-            _ = self.fin_rx.recv() => {
-                if let Ok(data) = self.data_rx.try_recv() {
-                    let _ = self.buffered_stream_bytes.fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |v| Some(v.saturating_sub(data.len())),
-                    );
-                    return Some(data);
-                }
-                self.read_closed = true;
-                None
-            },
+        let data = queue.remove(0);
+        let _ = self.buffered_stream_bytes.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(data.len())),
+        );
+        if queue.is_empty() {
+            pending.remove(&self.sid);
         }
+        Some(data)
     }
 
     pub async fn write(&self, data: &[u8]) -> Result<(), anyhow::Error> {

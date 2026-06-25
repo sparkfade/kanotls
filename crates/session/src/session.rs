@@ -90,6 +90,8 @@ const MAX_PENDING_STREAMS: usize = 1024;
 const STREAM_CHANNEL_CAPACITY: usize = 32;
 const MAX_SESSION_REASSEMBLY_BYTES: usize = 1024 * 1024;
 const WRITE_CHANNEL_CAPACITY: usize = 64;
+const MAX_STREAM_OVERFLOW_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PENDING_FLUSH_SIZE: usize = 256 * 1024;
 
 const LAZY_FLUSH_MS: u64 = 5;
 
@@ -107,7 +109,7 @@ pub struct Session {
     close_notify: Arc<Notify>,
     pending_inbound_streams: AtomicUsize,
     pending_open_streams: Arc<Mutex<HashMap<u32, PendingOpenStream>>>,
-    pending_data: Arc<Mutex<HashMap<u32, Vec<Vec<u8>>>>>,
+    pub(crate) pending_data: Arc<Mutex<HashMap<u32, Vec<Vec<u8>>>>>,
     pending_fin: Arc<Mutex<HashSet<u32>>>,
     closing_streams: Arc<Mutex<HashSet<u32>>>,
     on_new_stream: Option<Arc<dyn Fn(u32) -> bool + Send + Sync>>,
@@ -129,10 +131,11 @@ pub(crate) struct StreamHandle {
     pub fin_tx: mpsc::Sender<()>,
     pub synack_tx: Option<oneshot::Sender<Vec<u8>>>,
     pub read_closed: bool,
+    pub pending_notify: Arc<Notify>,
 }
 
 enum PshDispatch {
-    Deliver(mpsc::Sender<Vec<u8>>),
+    Deliver(mpsc::Sender<Vec<u8>>, Arc<Notify>),
     SynackPending,
     Closing,
     NotFound,
@@ -178,7 +181,8 @@ pub(crate) enum TrafficClass {
 }
 
 pub(crate) struct SessionWriter {
-    tx: mpsc::Sender<WriteRequest>,
+    control_tx: mpsc::Sender<WriteRequest>,
+    bulk_tx: mpsc::Sender<WriteRequest>,
     close_requested: Arc<AtomicBool>,
     close_notify: Arc<Notify>,
 }
@@ -187,7 +191,6 @@ struct WriteRequest {
     packets: Vec<Vec<u8>>,
     response_tx: oneshot::Sender<Result<(), String>>,
     flush: FlushBehavior,
-    traffic_class: TrafficClass,
 }
 
 pub(crate) struct PendingWrite {
@@ -368,12 +371,14 @@ impl Session {
         let (data_tx, data_rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
         let (fin_tx, fin_rx) = mpsc::channel(1);
         let (synack_tx, synack_rx) = oneshot::channel();
+        let pending_notify = Arc::new(Notify::new());
 
         let handle = StreamHandle {
             data_tx,
             fin_tx,
             synack_tx: Some(synack_tx),
             read_closed: false,
+            pending_notify: pending_notify.clone(),
         };
         let mut handle_guard = PendingStreamHandleGuard {
             stream_id: sid,
@@ -431,6 +436,7 @@ impl Session {
             pending_data: self.pending_data.clone(),
             pending_fin: self.pending_fin.clone(),
             closing_streams: self.closing_streams.clone(),
+            pending_notify,
             open_state: if has_deferred_open {
                 StreamOpenState::DeferredUnsent(vec![syn])
             } else {
@@ -609,7 +615,10 @@ impl Session {
                             } else if handle.read_closed {
                                 PshDispatch::Closing
                             } else {
-                                PshDispatch::Deliver(handle.data_tx.clone())
+                                PshDispatch::Deliver(
+                                    handle.data_tx.clone(),
+                                    handle.pending_notify.clone(),
+                                )
                             }
                         })
                         .unwrap_or(PshDispatch::NotFound)
@@ -625,22 +634,43 @@ impl Session {
                             "ignoring late stream data after local close"
                         );
                     }
-                    PshDispatch::Deliver(data_tx) => {
-                        if data_tx.send(frame.payload).await.is_err() {
-                            trace!(
-                                stream_id = frame.stream_id,
-                                "dropping stream data after receiver closed"
-                            );
-                        } else {
-                            self.buffered_stream_bytes
-                                .fetch_add(payload_len, Ordering::Relaxed);
+                    PshDispatch::Deliver(data_tx, notify) => {
+                        match data_tx.try_send(frame.payload) {
+                            Ok(()) => {
+                                self.buffered_stream_bytes
+                                    .fetch_add(payload_len, Ordering::Relaxed);
+                            }
+                            Err(mpsc::error::TrySendError::Full(payload)) => {
+                                if self.store_pending_data(frame.stream_id, payload).await {
+                                    notify.notify_one();
+                                } else {
+                                    warn!(
+                                        stream_id = frame.stream_id,
+                                        "closing stream: pending overflow limit exceeded"
+                                    );
+                                    let _ = self.close_stream(frame.stream_id).await;
+                                }
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                trace!(
+                                    stream_id = frame.stream_id,
+                                    "dropping stream data after receiver closed"
+                                );
+                            }
                         }
                     }
                     PshDispatch::NotFound => {
-                        warn!(
-                            stream_id = frame.stream_id,
-                            "dropping stream data for unopened stream"
-                        );
+                        if self.is_closing_stream(frame.stream_id) {
+                            trace!(
+                                stream_id = frame.stream_id,
+                                "ignoring late stream data for closing stream"
+                            );
+                        } else {
+                            warn!(
+                                stream_id = frame.stream_id,
+                                "dropping stream data for unopened stream"
+                            );
+                        }
                     }
                 }
             }
@@ -780,12 +810,12 @@ impl Session {
         Ok(())
     }
 
-    async fn store_pending_data(&self, sid: u32, payload: Vec<u8>) {
+    async fn store_pending_data(&self, sid: u32, payload: Vec<u8>) -> bool {
         let mut pending = self.pending_data.lock().await;
         let total_bytes: usize = pending.values().flatten().map(Vec::len).sum();
         if total_bytes.saturating_add(payload.len()) > MAX_PENDING_STREAM_BYTES {
             warn!("dropping pending stream data: pending byte limit exceeded");
-            return;
+            return false;
         }
 
         if !pending.contains_key(&sid) && pending.len() >= MAX_PENDING_STREAMS {
@@ -793,18 +823,27 @@ impl Session {
                 stream_id = sid,
                 "dropping pending stream data: pending stream limit exceeded"
             );
-            return;
+            return false;
         }
 
         let queue = pending.entry(sid).or_default();
+        let stream_bytes: usize = queue.iter().map(Vec::len).sum();
+        if stream_bytes.saturating_add(payload.len()) > MAX_STREAM_OVERFLOW_BYTES {
+            warn!(
+                stream_id = sid,
+                "dropping pending stream data: per-stream overflow byte limit exceeded"
+            );
+            return false;
+        }
         if queue.len() >= MAX_PENDING_STREAM_FRAMES {
             warn!(
                 stream_id = sid,
                 "dropping pending stream data: per-stream frame limit exceeded"
             );
-            return;
+            return false;
         }
         queue.push(payload);
+        true
     }
 
     async fn store_pending_fin(&self, sid: u32) {
@@ -915,6 +954,13 @@ impl Session {
         self.pending_open_streams.lock().await.contains_key(&sid)
     }
 
+    fn is_closing_stream(&self, sid: u32) -> bool {
+        self.closing_streams
+            .try_lock()
+            .map(|guard| guard.contains(&sid))
+            .unwrap_or(false)
+    }
+
     pub(crate) async fn flush_pending_accept_stream(
         &self,
         sid: u32,
@@ -971,7 +1017,7 @@ impl Session {
     }
 
     async fn flush_client_pending_stream(&self, sid: u32) {
-        let (pending_data, pending_fin, data_tx, fin_tx) = {
+        let (pending_data, pending_fin, data_tx, fin_tx, notify) = {
             let mut streams = self.streams.write().await;
             let Some(handle) = streams.get_mut(&sid) else {
                 return;
@@ -979,6 +1025,7 @@ impl Session {
 
             let data_tx = handle.data_tx.clone();
             let fin_tx = handle.fin_tx.clone();
+            let notify = handle.pending_notify.clone();
             let pending_data = self
                 .pending_data
                 .lock()
@@ -986,24 +1033,49 @@ impl Session {
                 .remove(&sid)
                 .unwrap_or_default();
             let pending_fin = self.pending_fin.lock().await.remove(&sid);
-            (pending_data, pending_fin, data_tx, fin_tx)
+            (pending_data, pending_fin, data_tx, fin_tx, notify)
         };
 
+        let mut all_delivered = true;
+        let mut remaining: Vec<Vec<u8>> = Vec::new();
+
         for payload in pending_data {
-            let payload_len = payload.len();
-            if data_tx.try_send(payload).is_err() {
-                warn!(
-                    stream_id = sid,
-                    "closing stream: receiver queue full while flushing pre-SYNACK data"
-                );
-                let _ = self.close_stream(sid).await;
-                return;
+            if all_delivered {
+                let payload_len = payload.len();
+                match data_tx.try_send(payload) {
+                    Ok(()) => {
+                        self.buffered_stream_bytes
+                            .fetch_add(payload_len, Ordering::Relaxed);
+                    }
+                    Err(mpsc::error::TrySendError::Full(payload)) => {
+                        remaining.push(payload);
+                        all_delivered = false;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        warn!(
+                            stream_id = sid,
+                            "closing stream: receiver closed while flushing pre-SYNACK data"
+                        );
+                        let _ = self.close_stream(sid).await;
+                        return;
+                    }
+                }
+            } else {
+                remaining.push(payload);
             }
-            self.buffered_stream_bytes
-                .fetch_add(payload_len, Ordering::Relaxed);
         }
 
-        if pending_fin {
+        if !remaining.is_empty() {
+            let mut pending = self.pending_data.lock().await;
+            let queue = pending.entry(sid).or_default();
+            for item in remaining {
+                queue.push(item);
+            }
+            drop(pending);
+            notify.notify_one();
+        }
+
+        if all_delivered && pending_fin {
             let _ = fin_tx.try_send(());
             self.streams.write().await.remove(&sid);
             self.clear_closing_stream(sid).await;
@@ -1024,14 +1096,16 @@ impl SessionWriter {
         } else {
             FlowDirection::S2C
         };
-        let (tx, rx) = mpsc::channel(WRITE_CHANNEL_CAPACITY);
+        let (control_tx, control_rx) = mpsc::channel(WRITE_CHANNEL_CAPACITY);
+        let (bulk_tx, bulk_rx) = mpsc::channel(WRITE_CHANNEL_CAPACITY);
         let run_close_requested = close_requested.clone();
         let run_close_notify = close_notify.clone();
         let run_activity = activity.clone();
         tokio::spawn(async move {
             Self::run(
                 write_half,
-                rx,
+                control_rx,
+                bulk_rx,
                 run_close_requested,
                 run_close_notify,
                 run_activity,
@@ -1040,7 +1114,8 @@ impl SessionWriter {
             .await;
         });
         Self {
-            tx,
+            control_tx,
+            bulk_tx,
             close_requested,
             close_notify,
         }
@@ -1073,15 +1148,17 @@ impl SessionWriter {
             anyhow::bail!("session writer closed");
         }
         let (response_tx, response_rx) = oneshot::channel();
-        self.tx
-            .send(WriteRequest {
-                packets,
-                response_tx,
-                flush,
-                traffic_class,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("session writer closed"))?;
+        let tx = match traffic_class {
+            TrafficClass::Control => &self.control_tx,
+            TrafficClass::Bulk => &self.bulk_tx,
+        };
+        tx.send(WriteRequest {
+            packets,
+            response_tx,
+            flush,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("session writer closed"))?;
 
         Ok(PendingWrite {
             response_rx: Some(response_rx),
@@ -1099,19 +1176,22 @@ impl SessionWriter {
         }
 
         let (response_tx, _response_rx) = oneshot::channel();
-        self.tx
-            .try_send(WriteRequest {
-                packets,
-                response_tx,
-                flush,
-                traffic_class,
-            })
-            .map_err(|err| anyhow::anyhow!("failed to queue session write: {}", err))
+        let tx = match traffic_class {
+            TrafficClass::Control => &self.control_tx,
+            TrafficClass::Bulk => &self.bulk_tx,
+        };
+        tx.try_send(WriteRequest {
+            packets,
+            response_tx,
+            flush,
+        })
+        .map_err(|err| anyhow::anyhow!("failed to queue session write: {}", err))
     }
 
     async fn run(
         mut write_half: SplitWriteHalf,
-        mut rx: mpsc::Receiver<WriteRequest>,
+        mut control_rx: mpsc::Receiver<WriteRequest>,
+        mut bulk_rx: mpsc::Receiver<WriteRequest>,
         close_requested: Arc<AtomicBool>,
         close_notify: Arc<Notify>,
         activity: Arc<ActivityTracker>,
@@ -1126,11 +1206,13 @@ impl SessionWriter {
             }
 
             tokio::select! {
+                biased;
+
                 _ = close_notify.notified() => {
                     break;
                 }
-                maybe_request = rx.recv() => {
-                    let Some(request) = maybe_request else { break; };
+                maybe_control = control_rx.recv() => {
+                    let Some(request) = maybe_control else { break; };
 
                     if close_requested.load(Ordering::Relaxed) {
                         let msg = "session writer closed".to_string();
@@ -1141,58 +1223,67 @@ impl SessionWriter {
                         break;
                     }
 
-                    if request.traffic_class == TrafficClass::Control {
-                        if !pending.is_empty() {
-                            match Self::emit_pending(&mut pending, &mut write_half, &activity).await {
-                                Ok(()) => {
-                                    for responder in responders.drain(..) {
-                                        let _ = responder.send(Ok(()));
-                                    }
-                                }
-                                Err(e) => {
-                                    let msg = e.to_string();
-                                    for responder in responders.drain(..) {
-                                        let _ = responder.send(Err(msg.clone()));
-                                    }
-                                    let _ = request.response_tx.send(Err(msg));
-                                    break;
+                    if !pending.is_empty() {
+                        match Self::emit_pending(&mut pending, &mut write_half, &activity).await {
+                            Ok(()) => {
+                                for responder in responders.drain(..) {
+                                    let _ = responder.send(Ok(()));
                                 }
                             }
-                        }
-
-                        let prepare_result: Result<(), String> =
-                            write_half.with_stream(|stream| {
-                                let state = stream.control_state();
-                                for packet in &request.packets {
-                                    let size = stream.next_control_size(state, direction);
-                                    debug!(
-                                        "control write: frame_cmd=0x{:02x} wire_size={}",
-                                        packet.first().unwrap_or(&0),
-                                        size
-                                    );
-                                    if let Err(e) = stream.prepare_control_record(packet, size) {
-                                        return Err(e.to_string());
-                                    }
+                            Err(e) => {
+                                let msg = e.to_string();
+                                for responder in responders.drain(..) {
+                                    let _ = responder.send(Err(msg.clone()));
                                 }
-                                Ok(())
-                            });
+                                let _ = request.response_tx.send(Err(msg));
+                                break;
+                            }
+                        }
+                    }
 
-                        match prepare_result {
-                            Err(msg) => {
+                    let prepare_result: Result<(), String> =
+                        write_half.with_stream(|stream| {
+                            let state = stream.control_state();
+                            for packet in &request.packets {
+                                let size = stream.next_control_size(state, direction);
+                                debug!(
+                                    "control write: frame_cmd=0x{:02x} wire_size={}",
+                                    packet.first().unwrap_or(&0),
+                                    size
+                                );
+                                if let Err(e) = stream.prepare_control_record(packet, size) {
+                                    return Err(e.to_string());
+                                }
+                            }
+                            Ok(())
+                        });
+
+                    match prepare_result {
+                        Err(msg) => {
+                            let _ = request.response_tx.send(Err(msg.clone()));
+                            break;
+                        }
+                        Ok(()) => {
+                            if let Err(e) = write_half.flush().await {
+                                let msg = e.to_string();
                                 let _ = request.response_tx.send(Err(msg.clone()));
                                 break;
                             }
-                            Ok(()) => {
-                                if let Err(e) = write_half.flush().await {
-                                    let msg = e.to_string();
-                                    let _ = request.response_tx.send(Err(msg.clone()));
-                                    break;
-                                }
-                                activity.record_write_activity();
-                                let _ = request.response_tx.send(Ok(()));
-                            }
+                            activity.record_write_activity();
+                            let _ = request.response_tx.send(Ok(()));
                         }
-                        continue;
+                    }
+                }
+                maybe_bulk = bulk_rx.recv() => {
+                    let Some(request) = maybe_bulk else { break; };
+
+                    if close_requested.load(Ordering::Relaxed) {
+                        let msg = "session writer closed".to_string();
+                        for responder in responders {
+                            let _ = responder.send(Err(msg.clone()));
+                        }
+                        let _ = request.response_tx.send(Err(msg));
+                        break;
                     }
 
                     for packet in &request.packets {
@@ -1200,7 +1291,9 @@ impl SessionWriter {
                     }
                     responders.push(request.response_tx);
 
-                    if request.flush == FlushBehavior::Immediate {
+                    if request.flush == FlushBehavior::Immediate
+                        || pending.len() >= MAX_PENDING_FLUSH_SIZE
+                    {
                         match Self::emit_pending(&mut pending, &mut write_half, &activity).await {
                             Ok(()) => {
                                 for responder in responders.drain(..) {
