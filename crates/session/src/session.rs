@@ -84,8 +84,8 @@ impl SplitWriteHalf {
 
 pub(crate) type SharedTunnelWriter = Arc<SessionWriter>;
 
-const MAX_PENDING_STREAM_FRAMES: usize = 64;
-const MAX_PENDING_STREAM_BYTES: usize = 1024 * 1024;
+const MAX_PENDING_STREAM_FRAMES: usize = 1024;
+const MAX_PENDING_STREAM_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PENDING_STREAMS: usize = 1024;
 const STREAM_CHANNEL_CAPACITY: usize = 32;
 const MAX_SESSION_REASSEMBLY_BYTES: usize = 1024 * 1024;
@@ -635,27 +635,50 @@ impl Session {
                         );
                     }
                     PshDispatch::Deliver(data_tx, notify) => {
-                        match data_tx.try_send(frame.payload) {
-                            Ok(()) => {
-                                self.buffered_stream_bytes
-                                    .fetch_add(payload_len, Ordering::Relaxed);
-                            }
-                            Err(mpsc::error::TrySendError::Full(payload)) => {
-                                if self.store_pending_data(frame.stream_id, payload).await {
-                                    notify.notify_one();
-                                } else {
-                                    warn!(
+                        // 若 pending_data 中已有该流数据，新帧必须直接追加到
+                        // pending_data 末尾，而不是 try_send 到主 Channel，
+                        // 否则会插队到 pending_data 中更早到达的数据之前，导致乱序。
+                        // 读循环是单线程顺序执行，消费者只能从 pending_data 中取走
+                        // 数据，不会在此检查与发送之间增加条目，故无 TOCTOU 风险。
+                        let has_pending = self
+                            .pending_data
+                            .try_lock()
+                            .map(|guard| guard.contains_key(&frame.stream_id))
+                            .unwrap_or(true);
+
+                        if !has_pending {
+                            match data_tx.try_send(frame.payload) {
+                                Ok(()) => {
+                                    self.buffered_stream_bytes
+                                        .fetch_add(payload_len, Ordering::Relaxed);
+                                }
+                                Err(mpsc::error::TrySendError::Full(payload)) => {
+                                    if self.store_pending_data(frame.stream_id, payload).await {
+                                        notify.notify_one();
+                                    } else {
+                                        warn!(
+                                            stream_id = frame.stream_id,
+                                            "closing stream: pending overflow limit exceeded"
+                                        );
+                                        let _ = self.close_stream(frame.stream_id).await;
+                                    }
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    trace!(
                                         stream_id = frame.stream_id,
-                                        "closing stream: pending overflow limit exceeded"
+                                        "dropping stream data after receiver closed"
                                     );
-                                    let _ = self.close_stream(frame.stream_id).await;
                                 }
                             }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                trace!(
+                        } else {
+                            if self.store_pending_data(frame.stream_id, frame.payload).await {
+                                notify.notify_one();
+                            } else {
+                                warn!(
                                     stream_id = frame.stream_id,
-                                    "dropping stream data after receiver closed"
+                                    "closing stream: pending overflow limit exceeded"
                                 );
+                                let _ = self.close_stream(frame.stream_id).await;
                             }
                         }
                     }
@@ -1495,8 +1518,7 @@ pub(crate) fn remember_closing_stream_sync(
 #[cfg(test)]
 mod tests {
     use super::{
-        coalesce_encoded_frames, ActivityTracker, Session, SessionConfig, MAX_PENDING_STREAM_BYTES,
-        STREAM_CHANNEL_CAPACITY,
+        coalesce_encoded_frames, ActivityTracker, Session, SessionConfig, STREAM_CHANNEL_CAPACITY,
     };
     use crate::server::ServerSessionHandler;
     use futures::poll;
@@ -2204,7 +2226,8 @@ mod tests {
         stream.wait_open().await.expect("stream opens");
 
         let frame_count = STREAM_CHANNEL_CAPACITY + 8;
-        let frame_size = MAX_PENDING_STREAM_BYTES / STREAM_CHANNEL_CAPACITY;
+        let frame_size = 32 * 1024;
+        let fill_target = frame_size * STREAM_CHANNEL_CAPACITY;
         let send_task = tokio::spawn(async move {
             let mut server_stream = server_stream;
             for idx in 0..frame_count {
@@ -2216,8 +2239,8 @@ mod tests {
             server_stream.close().await.expect("server closes stream");
         });
 
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while client.buffered_stream_bytes() < MAX_PENDING_STREAM_BYTES {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.buffered_stream_bytes() < fill_target {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })

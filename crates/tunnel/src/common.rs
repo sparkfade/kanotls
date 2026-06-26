@@ -428,29 +428,16 @@ impl AsyncRead for SnowyStream {
                                 }
                             }
                             Err(e) => {
-                                let alert = [0x02u8, 0x14u8, INNER_CONTENT_TYPE_ALERT];
-                                let mut ct_buf = [0u8; 3 + AEAD_TAG_LEN];
-                                if let Ok(ct_len) = this.noise.write_message(&alert, &mut ct_buf) {
-                                    let current_len = this.write_buffer.len();
-                                    this.write_buffer
-                                        .resize(current_len + TLS_RECORD_HEADER_LEN + ct_len, 0);
-                                    this.write_buffer[current_len] = 0x17;
-                                    this.write_buffer[current_len + 1] = 0x03;
-                                    this.write_buffer[current_len + 2] = 0x03;
-                                    this.write_buffer[current_len + 3..current_len + 5]
-                                        .copy_from_slice(&(ct_len as u16).to_be_bytes());
-                                    this.write_buffer[current_len + 5..current_len + 5 + ct_len]
-                                        .copy_from_slice(&ct_buf[..ct_len]);
-                                    this.write_buffer
-                                        .truncate(current_len + TLS_RECORD_HEADER_LEN + ct_len);
-                                }
-                                {
-                                    let linger = socket2::SockRef::from(&this.socket);
-                                    let _ = linger.set_linger(Some(std::time::Duration::ZERO));
-                                }
+                                // AEAD 失败后 Session framing 已失同步 (TCP 字节流无
+                                // sync marker),任何"跳帧恢复"在多路复用与流密码语义
+                                // 下都不可行;也不发 Noise fatal alert —— 经加密的
+                                // 0x17 record 在外层具有非典型 TTL、尺寸与时序特征,
+                                // 反而暴露"密码学异常处置"语义信号给被动观察者。
+                                // 正确策略:静默进入 Closed,由 Session read loop 观测
+                                // Err 自动 force_close,连接池 (500ms 监控) Fail-Fast
+                                // 检测并补涓,浏览器上层透明重试。
                                 this.close_notify_written = true;
                                 this.state = StreamState::Closed;
-                                let _ = try_flush_write_buffer(this, cx);
                                 return Poll::Ready(Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     format!("noise decrypt: {}", e),

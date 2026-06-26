@@ -2287,6 +2287,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aead_failure_silently_closes_without_emitting_alert() {
+        use crate::common::{AEAD_TAG_LEN, TLS_RECORD_HEADER_LEN};
+        use std::time::Duration;
+
+        let (mut client_noise, server_noise) = established_noise_pair();
+        let (client_tcp, server_tcp) = connected_tcp_pair().await;
+
+        // 1) 构造一条合法 0x17 application_data record。
+        let payload = b"plaintext to be corrupted";
+        let mut record = build_tls_app_record(&mut client_noise, payload);
+        assert!(record.len() > TLS_RECORD_HEADER_LEN + AEAD_TAG_LEN);
+
+        // 2) 篡改密文最后 1 个字节 (AEAD tag 末位) —— 模拟偶发比特翻转 / 中间人篡改。
+        let last = record.len() - 1;
+        record[last] ^= 0xff;
+
+        // 3) 通过 raw TcpStream 注入到 server 端,确保不会被 client 端 SnowyStream 加密封装。
+        let mut injector = client_tcp;
+        injector.write_all(&record).await.unwrap();
+        injector.flush().await.unwrap();
+
+        // 4) Server 端 SnowyStream 第一次 read 必须返回 InvalidData (AEAD 失败)。
+        let mut server_stream =
+            SnowyStream::new_with_permit_and_pre_read_tls(server_tcp, server_noise, None, vec![]);
+        let mut buf = vec![0u8; 256];
+        let first = tokio::time::timeout(Duration::from_secs(3), server_stream.read(&mut buf))
+            .await
+            .expect("server read should not hang on corrupted AEAD");
+        assert!(first.is_err(), "first read after AEAD corruption must error");
+        let err = first.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "AEAD failure must surface as InvalidData"
+        );
+        assert!(
+            err.to_string().contains("noise decrypt"),
+            "error message should mention noise decrypt, got: {}",
+            err
+        );
+
+        // 5) 关键不变量:server 端不得向 client 回写任何字节 (无 Noise fatal alert,
+        //    无 close_notify, 无 RST 之外的任何应用层语义信号)。
+        //    给对端 100ms 读取窗口,任何静默关闭下"对端可读字节数"应当始终为 0。
+        let mut probe = [0u8; 64];
+        let probe_result =
+            tokio::time::timeout(Duration::from_millis(100), injector.read(&mut probe)).await;
+        match probe_result {
+            Err(_) => {
+                // 100ms 内未收到任何字节 —— 期望路径
+            }
+            Ok(Ok(0)) => {
+                // FIN 优雅关闭,0 字节应用数据 —— 也接受
+            }
+            Ok(Ok(n)) => panic!(
+                "server emitted {} bytes after AEAD failure (expected silent close/no alert): {:?}",
+                n, &probe[..n]
+            ),
+            Ok(Err(e)) => panic!("unexpected error on probe read: {}", e),
+        }
+
+        // 6) 第二次 read 应返回 0 (Ok(0) 表示已进入 Closed 状态 / EOF),不 hang。
+        let second = tokio::time::timeout(Duration::from_secs(2), server_stream.read(&mut buf))
+            .await
+            .expect("second read after AEAD failure must not hang");
+        match second {
+            Ok(0) => {}
+            Ok(n) => panic!("second read returned {} bytes, expected EOF (0)", n),
+            Err(e) => panic!("second read should return EOF (Ok(0)), got error: {}", e),
+        }
+    }
+
+    #[tokio::test]
     async fn shutdown_with_pending_bulk_does_not_corrupt_sequence() {
         let (client_noise, server_noise) = established_noise_pair();
         let (client_tcp, server_tcp) = connected_tcp_pair().await;
