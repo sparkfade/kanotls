@@ -1,5 +1,7 @@
 use crate::frame::{Frame, CMD_SYNACK};
-use crate::session::{PendingAcceptFlushResult, Session, SessionConfig, StreamHandle, TrafficClass};
+use crate::session::{
+    PendingAcceptFlushResult, Session, SessionConfig, StreamHandle, TrafficClass,
+};
 use kanotls_tunnel::SnowyStream;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -170,11 +172,11 @@ impl ServerStream {
             return None;
         }
         let data = queue.remove(0);
-        let _ = self.buffered_stream_bytes.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |v| Some(v.saturating_sub(data.len())),
-        );
+        let _ =
+            self.buffered_stream_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(data.len()))
+                });
         if queue.is_empty() {
             pending.remove(&self.sid);
         }
@@ -202,7 +204,9 @@ impl ServerStream {
 
     pub async fn send_synack(&self) -> Result<(), anyhow::Error> {
         let synack_frame = Frame::new(CMD_SYNACK, self.sid, vec![]);
-        self.session.write_frame(&synack_frame, TrafficClass::Control).await
+        self.session
+            .write_frame(&synack_frame, TrafficClass::Control)
+            .await
     }
 
     pub async fn close(&mut self) -> Result<(), anyhow::Error> {

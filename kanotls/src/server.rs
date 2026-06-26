@@ -1,9 +1,9 @@
+use anyhow::Context;
 use kanotls_config::server::load_server_config;
 use kanotls_config::{find_routing_rule, ServerConfig};
 use kanotls_proto::socks5::{
     socks5_handshake, socks5_send_connect, socks5_send_udp_associate, Socks5Target,
 };
-use anyhow::Context;
 use kanotls_proto::target::{is_blocked_destination, parse_authority_target};
 use kanotls_proto::uot::{
     decode_server_udp, decode_socks5_udp, encode_server_udp, encode_socks5_udp,
@@ -56,10 +56,7 @@ pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
 
     let inbound = &config.inbounds[0];
     let selected_outbound = resolve_server_outbound(&config, inbound.tag.as_deref())?;
-    info!(
-        "server outbound: {}",
-        selected_outbound
-    );
+    info!("server outbound: {}", selected_outbound);
     let camouflage_host = &inbound.settings.camouflage.host;
     let camouflage_port = inbound.settings.camouflage.port;
 
@@ -73,10 +70,7 @@ pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
 
     let listen_addr = format!("{}:{}", inbound.listen, inbound.port);
     let listener = TcpListener::bind(&listen_addr).await?;
-    info!(
-        "server listening on {}",
-        listen_addr
-    );
+    info!("server listening on {}", listen_addr);
 
     let password = inbound.settings.password.clone();
     let camouflage_host = camouflage_host.to_string();
@@ -92,11 +86,8 @@ pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
         .as_ref()
         .map(|s| s.idle_timeout_secs)
         .unwrap_or(45);
-    let session_config = SessionConfig::with_limits(
-        false,
-        max_streams_per_session,
-        idle_timeout_secs,
-    );
+    let session_config =
+        SessionConfig::with_limits(false, max_streams_per_session, idle_timeout_secs);
 
     let shutdown = tokio::sync::watch::channel(false);
     let mut shutdown_rx = shutdown.1.clone();
@@ -250,14 +241,17 @@ fn resolve_server_outbound(
         .outbounds
         .iter()
         .find(|ob| ob.tag.as_deref() == Some(tag))
-        .ok_or_else(|| anyhow::anyhow!("outbound tag '{}' not found in configured outbounds", tag))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("outbound tag '{}' not found in configured outbounds", tag)
+        })?;
 
     match outbound.protocol.as_str() {
         "direct" => Ok(ServerOutbound::Direct),
         "socks5" => {
-            let s = outbound.settings.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("socks5 outbound requires settings")
-            })?;
+            let s = outbound
+                .settings
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("socks5 outbound requires settings"))?;
             let host = s
                 .get("address")
                 .and_then(|v| v.as_str())
@@ -291,7 +285,9 @@ impl std::fmt::Display for ServerOutbound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ServerOutbound::Direct => write!(f, "direct"),
-            ServerOutbound::Socks5 { address, username, .. } => {
+            ServerOutbound::Socks5 {
+                address, username, ..
+            } => {
                 if let Some(user) = username {
                     write!(f, "socks5://{}@{}", user, address)
                 } else {
@@ -400,15 +396,9 @@ async fn handle_server_stream_inner(
                 )
                 .await
                 .map_err(|_| {
-                    anyhow::anyhow!(
-                        "socks5 CONNECT to {} via {} timed out",
-                        target,
-                        address
-                    )
+                    anyhow::anyhow!("socks5 CONNECT to {} via {} timed out", target, address)
                 })?
-                .with_context(|| {
-                    format!("socks5 CONNECT to {} via {} failed", target, address)
-                })?;
+                .with_context(|| format!("socks5 CONNECT to {} via {} failed", target, address))?;
                 remote.set_nodelay(true)?;
                 stream.send_synack().await?;
                 relay_tcp_server(stream, &mut remote).await?;
@@ -421,9 +411,7 @@ async fn handle_server_stream_inner(
                     TcpStream::connect(remote_addr),
                 )
                 .await
-                .map_err(|_| {
-                    anyhow::anyhow!("direct connect to {} timed out", remote_addr)
-                })??;
+                .map_err(|_| anyhow::anyhow!("direct connect to {} timed out", remote_addr))??;
                 remote.set_nodelay(true)?;
                 stream.send_synack().await?;
                 relay_tcp_server(stream, &mut remote).await?;
@@ -576,12 +564,7 @@ async fn relay_udp_via_socks5(
         socks5_send_udp_associate(&mut tcp_control),
     )
     .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "socks5 UDP ASSOCIATE to {} timed out",
-            socks5_addr
-        )
-    })??;
+    .map_err(|_| anyhow::anyhow!("socks5 UDP ASSOCIATE to {} timed out", socks5_addr))??;
     debug!(
         "udp via socks5: relay address {} (control {})",
         relay_addr, socks5_addr

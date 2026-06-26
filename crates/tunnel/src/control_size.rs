@@ -2,7 +2,9 @@ use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use std::f64::consts::PI;
 
-use crate::common::{AEAD_TAG_LEN, BLOCK_LEN_PREFIX_SIZE, INNER_CONTENT_TYPE_LEN, TLS_RECORD_HEADER_LEN};
+use crate::common::{
+    AEAD_TAG_LEN, BLOCK_LEN_PREFIX_SIZE, INNER_CONTENT_TYPE_LEN, TLS_RECORD_HEADER_LEN,
+};
 
 const CONTROL_TLS_OVERHEAD: usize = TLS_RECORD_HEADER_LEN + AEAD_TAG_LEN + INNER_CONTENT_TYPE_LEN;
 
@@ -204,7 +206,11 @@ mod tests {
         for _ in 0..500 {
             let size = next_control_size(ConnectionState::Handshake, FlowDirection::C2S, &mut rng);
             assert!(size >= SETTINGS_ACK_WIRE, "size {} too small", size);
-            assert!(size <= 800 + BLOCK_LEN_PREFIX_SIZE + CONTROL_TLS_OVERHEAD, "size {} too large", size);
+            assert!(
+                size <= 800 + BLOCK_LEN_PREFIX_SIZE + CONTROL_TLS_OVERHEAD,
+                "size {} too large",
+                size
+            );
         }
     }
 
@@ -214,7 +220,11 @@ mod tests {
         for _ in 0..500 {
             let size = next_control_size(ConnectionState::Transport, FlowDirection::S2C, &mut rng);
             assert!(size >= SETTINGS_ACK_WIRE, "size {} too small", size);
-            assert!(size <= 800 + BLOCK_LEN_PREFIX_SIZE + CONTROL_TLS_OVERHEAD, "size {} too large", size);
+            assert!(
+                size <= 800 + BLOCK_LEN_PREFIX_SIZE + CONTROL_TLS_OVERHEAD,
+                "size {} too large",
+                size
+            );
         }
     }
 
@@ -242,11 +252,26 @@ mod tests {
 
     #[test]
     fn connection_state_from_count() {
-        assert_eq!(ConnectionState::from_control_count(0), ConnectionState::Handshake);
-        assert_eq!(ConnectionState::from_control_count(3), ConnectionState::Handshake);
-        assert_eq!(ConnectionState::from_control_count(5), ConnectionState::Handshake);
-        assert_eq!(ConnectionState::from_control_count(6), ConnectionState::Transport);
-        assert_eq!(ConnectionState::from_control_count(100), ConnectionState::Transport);
+        assert_eq!(
+            ConnectionState::from_control_count(0),
+            ConnectionState::Handshake
+        );
+        assert_eq!(
+            ConnectionState::from_control_count(3),
+            ConnectionState::Handshake
+        );
+        assert_eq!(
+            ConnectionState::from_control_count(5),
+            ConnectionState::Handshake
+        );
+        assert_eq!(
+            ConnectionState::from_control_count(6),
+            ConnectionState::Transport
+        );
+        assert_eq!(
+            ConnectionState::from_control_count(100),
+            ConnectionState::Transport
+        );
     }
 
     #[test]
@@ -255,7 +280,10 @@ mod tests {
         for _ in 0..2000 {
             let size = next_control_size(ConnectionState::Handshake, FlowDirection::C2S, &mut rng);
             assert_ne!(size, PING_WIRE, "handshake produced PING wire size");
-            assert_ne!(size, MERGED_PING_WU_WIRE, "handshake produced PING+WU wire size");
+            assert_ne!(
+                size, MERGED_PING_WU_WIRE,
+                "handshake produced PING+WU wire size"
+            );
         }
     }
 
@@ -264,10 +292,22 @@ mod tests {
         let mut rng = rand::thread_rng();
         for _ in 0..2000 {
             let size = next_control_size(ConnectionState::Transport, FlowDirection::S2C, &mut rng);
-            assert_ne!(size, SETTINGS_SMALL_WIRE, "transport produced SETTINGS small size");
-            assert_ne!(size, SETTINGS_LARGE_WIRE, "transport produced SETTINGS large size");
-            assert_ne!(size, MERGED_SETTINGS_WU_SMALL_WIRE, "transport produced SETTINGS+WU small size");
-            assert_ne!(size, MERGED_SETTINGS_WU_LARGE_WIRE, "transport produced SETTINGS+WU large size");
+            assert_ne!(
+                size, SETTINGS_SMALL_WIRE,
+                "transport produced SETTINGS small size"
+            );
+            assert_ne!(
+                size, SETTINGS_LARGE_WIRE,
+                "transport produced SETTINGS large size"
+            );
+            assert_ne!(
+                size, MERGED_SETTINGS_WU_SMALL_WIRE,
+                "transport produced SETTINGS+WU small size"
+            );
+            assert_ne!(
+                size, MERGED_SETTINGS_WU_LARGE_WIRE,
+                "transport produced SETTINGS+WU large size"
+            );
         }
     }
 }
