@@ -5,7 +5,9 @@ use kanotls_proto::socks5::{
     parse_socks5_inbound, relay_socks5_connect, write_socks5_connect_success,
     write_socks5_udp_success, Socks5Request,
 };
-use kanotls_session::{ClientPool, ClientPoolConnectOptions, PoolBehaviorConfig, SessionConfig, Stream};
+use kanotls_session::{
+    ClientPool, ClientPoolConnectOptions, PoolBehaviorConfig, SessionConfig, Stream,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -53,7 +55,8 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
     if let Some(path_str) = tpl_path.cloned() {
         let watcher_bytes = custom_template_bytes.clone();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(TEMPLATE_RELOAD_INTERVAL_SECS));
+            let mut ticker =
+                tokio::time::interval(Duration::from_secs(TEMPLATE_RELOAD_INTERVAL_SECS));
             ticker.tick().await;
             let mut last_mtime = std::time::SystemTime::UNIX_EPOCH;
             loop {
@@ -62,7 +65,9 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
                     Ok(meta) => match meta.modified() {
                         Ok(mtime) if mtime > last_mtime => {
                             last_mtime = mtime;
-                            match kanotls_tunnel::templates::load_and_validate_custom_template(&path_str) {
+                            match kanotls_tunnel::templates::load_and_validate_custom_template(
+                                &path_str,
+                            ) {
                                 Ok(bytes) => {
                                     *watcher_bytes.write().await = Some(bytes);
                                     kanotls_tunnel::invalidate_client_hello_template_cache();
@@ -97,11 +102,7 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
         .clamp(MIN_CLIENT_IDLE_TIMEOUT_SECS, MAX_CLIENT_IDLE_TIMEOUT_SECS);
     let install_salt: [u8; 16] = rand::random();
     let pool = Arc::new(ClientPool::new(
-        SessionConfig::with_limits(
-            true,
-            max_streams_per_session,
-            idle_timeout_secs,
-        ),
+        SessionConfig::with_limits(true, max_streams_per_session, idle_timeout_secs),
         ClientPoolConnectOptions {
             server_addr: server_addr.clone(),
             sni: sni.clone(),
@@ -158,12 +159,8 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
                         tokio::spawn(async move {
                             let _permit = permit;
                             let result = match p.as_str() {
-                                "socks5" | "socks" => {
-                                    handle_socks5_connection(local, &pool).await
-                                }
-                                "http" => {
-                                    handle_http_connection(local, &pool).await
-                                }
+                                "socks5" | "socks" => handle_socks5_connection(local, &pool).await,
+                                "http" => handle_http_connection(local, &pool).await,
                                 _ => {
                                     error!("unsupported protocol: {}", p);
                                     return;

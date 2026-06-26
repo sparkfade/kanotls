@@ -7,8 +7,7 @@ use tracing::debug;
 use crate::common::{
     self, apply_tcp_keepalive, build_h2_ghost_plaintext, SnowyStream, AEAD_TAG_LEN,
     FLIGHT3_CCS_RECORD, FLIGHT3_FINISHED_PLAINTEXT_LEN, FLIGHT3_FINISHED_RECORD_LEN,
-    HANDSHAKE_CONTROL_LEN,
-    HANDSHAKE_CONTROL_MAGIC, TLS_RECORD_HEADER_LEN,
+    HANDSHAKE_CONTROL_LEN, HANDSHAKE_CONTROL_MAGIC, TLS_RECORD_HEADER_LEN,
 };
 use crate::template::{get_or_build_client_hello_template, ConnectionCounter};
 use crate::utils::{
@@ -58,7 +57,12 @@ pub async fn client_tunnel(
     client_noise_tag.copy_from_slice(&psk_e[32..48]);
 
     let outer_fingerprint = resolve_outer_client_fingerprint(fingerprint);
-    let template = get_or_build_client_hello_template(sni, outer_fingerprint, custom_template_bytes, insecure)?;
+    let template = get_or_build_client_hello_template(
+        sni,
+        outer_fingerprint,
+        custom_template_bytes,
+        insecure,
+    )?;
     let ch_buf = template.instantiate(&derived_psk, psk_e, counter)?;
     debug!("Instantiated ClientHello template with Noise authentication");
 
@@ -129,7 +133,10 @@ pub async fn client_tunnel(
                                 && &e_ee[..HANDSHAKE_CONTROL_MAGIC.len()] == HANDSHAKE_CONTROL_MAGIC
                             {
                                 ghost_count = u16::from_be_bytes([e_ee[4], e_ee[5]]) as usize;
-                                debug!("Received Noise response (e, ee), len: {}, ghost_count: {}", len, ghost_count);
+                                debug!(
+                                    "Received Noise response (e, ee), len: {}, ghost_count: {}",
+                                    len, ghost_count
+                                );
                             }
                             break;
                         }
@@ -159,16 +166,20 @@ pub async fn client_tunnel(
         };
         let mut drain_state = TlsRecordReadState::new();
         for i in 0..ghost_count {
-            let (typ, rec_len) = read_tls_record_bounded(
-                &mut tcp, &mut rx_buf, drain_limits, &mut drain_state,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("ghost drain record {}: {}", i, e))?;
+            let (typ, rec_len) =
+                read_tls_record_bounded(&mut tcp, &mut rx_buf, drain_limits, &mut drain_state)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("ghost drain record {}: {}", i, e))?;
 
             if typ != 0x17 {
                 anyhow::bail!("expected 0x17 ghost record {}, got type {:#x}", i, typ);
             }
-            debug!("drained ghost 0x17 record {}/{} ({} bytes)", i + 1, ghost_count, rec_len);
+            debug!(
+                "drained ghost 0x17 record {}/{} ({} bytes)",
+                i + 1,
+                ghost_count,
+                rec_len
+            );
         }
     }
 

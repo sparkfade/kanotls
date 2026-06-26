@@ -1,9 +1,9 @@
-use crate::model::{Outbound, ServerConfig, ServerInbound, SessionConfig};
-use crate::shared::{validate_dns_hostname, validate_log_config, validate_routing_rules};
+use crate::model::{Outbound, ServerConfig, ServerInbound};
+use crate::shared::{
+    is_placeholder_password, validate_dns_hostname, validate_log_config, validate_routing_rules,
+    validate_session_config,
+};
 use anyhow::{bail, Result};
-
-const MAX_STREAMS_PER_SESSION_LIMIT: usize = 4096;
-const MAX_IDLE_TIMEOUT_SECS: u64 = 3600;
 
 pub fn load_server_config(path: &str) -> Result<ServerConfig> {
     let content = std::fs::read_to_string(path)?;
@@ -97,35 +97,6 @@ fn validate_server_inbound(inbound: &ServerInbound, idx: usize, config_path: &st
     Ok(())
 }
 
-fn validate_session_config(prefix: &str, session: &SessionConfig) -> Result<()> {
-    if session.max_streams_per_session == 0
-        || session.max_streams_per_session > MAX_STREAMS_PER_SESSION_LIMIT
-    {
-        bail!(
-            "{}: session.max_streams_per_session must be in 1..={}",
-            prefix,
-            MAX_STREAMS_PER_SESSION_LIMIT
-        );
-    }
-    if session.idle_timeout_secs == 0 || session.idle_timeout_secs > MAX_IDLE_TIMEOUT_SECS {
-        bail!(
-            "{}: session.idle_timeout_secs must be in 1..={}",
-            prefix,
-            MAX_IDLE_TIMEOUT_SECS
-        );
-    }
-    Ok(())
-}
-
-fn is_placeholder_password(pw: &str) -> bool {
-    let lower = pw.to_ascii_lowercase();
-    lower.contains("change_me")
-        || lower.contains("placeholder")
-        || lower.contains("replace_me")
-        || lower.contains("your_password_here")
-        || lower.contains("fill_me")
-}
-
 fn validate_server_outbound(outbound: &Outbound, idx: usize) -> Result<()> {
     let prefix = format!("outbounds[{}]", idx);
     match outbound.protocol.as_str() {
@@ -141,18 +112,13 @@ fn validate_server_outbound(outbound: &Outbound, idx: usize) -> Result<()> {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "{}: socks5 requires non-empty settings.address",
-                        prefix
-                    )
+                    anyhow::anyhow!("{}: socks5 requires non-empty settings.address", prefix)
                 })?;
 
             let port = s
                 .get("port")
                 .and_then(|v| v.as_u64())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("{}: socks5 requires settings.port", prefix)
-                })?;
+                .ok_or_else(|| anyhow::anyhow!("{}: socks5 requires settings.port", prefix))?;
             if !(1..=65535).contains(&port) {
                 bail!(
                     "{}: socks5 settings.port must be in 1..=65535 (got {})",

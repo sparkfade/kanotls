@@ -173,4 +173,3 @@ pub struct Outbound {
     pub protocol: String,
     pub settings: Option<serde_json::Value>,
 }
-

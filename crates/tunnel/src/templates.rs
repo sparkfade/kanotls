@@ -1,8 +1,13 @@
 const MAX_TEMPLATE_FILE_SIZE: u64 = 64 * 1024;
 
 pub fn load_and_validate_custom_template(path: &str) -> anyhow::Result<Vec<u8>> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| anyhow::anyhow!("Failed to read ClientHello template metadata ({}): {}", path, e))?;
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to read ClientHello template metadata ({}): {}",
+            path,
+            e
+        )
+    })?;
     if metadata.len() > MAX_TEMPLATE_FILE_SIZE {
         anyhow::bail!(
             "Template file too large: {} bytes (max {})",
@@ -21,7 +26,10 @@ pub(crate) fn parse_template_hex_string(raw_str: &str) -> anyhow::Result<Vec<u8>
     let cleaned = clean_template_hex(raw_str);
 
     if !cleaned.len().is_multiple_of(2) {
-        anyhow::bail!("Invalid hex format: odd length after cleaning ({} bytes)", cleaned.len());
+        anyhow::bail!(
+            "Invalid hex format: odd length after cleaning ({} bytes)",
+            cleaned.len()
+        );
     }
 
     let bytes = hex::decode(&cleaned)

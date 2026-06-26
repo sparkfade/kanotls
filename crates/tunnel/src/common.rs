@@ -32,7 +32,8 @@ pub const INNER_CONTENT_TYPE_ALERT: u8 = 0x15;
 // + 1 byte Inner Content Type = 16385. Ciphertext = 16385 + 16 AEAD tag = 16401.
 // Wire = 5 header + 16401 ciphertext = 16406 — matches real Firefox TLS 1.3.
 pub const BLOCK_PLAINTEXT_SIZE: usize = 16384 + INNER_CONTENT_TYPE_LEN;
-const BLOCK_DATA_CAPACITY: usize = BLOCK_PLAINTEXT_SIZE - BLOCK_LEN_PREFIX_SIZE - INNER_CONTENT_TYPE_LEN;
+const BLOCK_DATA_CAPACITY: usize =
+    BLOCK_PLAINTEXT_SIZE - BLOCK_LEN_PREFIX_SIZE - INNER_CONTENT_TYPE_LEN;
 pub const NOISE_RESPONSE_OVERHEAD_LEN: usize = 48;
 pub const HANDSHAKE_CONTROL_MAGIC: &[u8; 4] = b"KTL1";
 pub const HANDSHAKE_CONTROL_LEN: usize = 6;
@@ -51,7 +52,12 @@ struct H2GhostVariant {
     plaintext_len: usize,
 }
 
-fn make_h2_ghost_variant(settings: &[u8], wu: &[u8], trailer: u8, plaintext_len: usize) -> H2GhostVariant {
+fn make_h2_ghost_variant(
+    settings: &[u8],
+    wu: &[u8],
+    trailer: u8,
+    plaintext_len: usize,
+) -> H2GhostVariant {
     let mut buf = vec![0u8; plaintext_len];
     buf[..24].copy_from_slice(H2_PREFACE);
     let delta = 24 + settings.len();
@@ -60,50 +66,52 @@ fn make_h2_ghost_variant(settings: &[u8], wu: &[u8], trailer: u8, plaintext_len:
     let tail = delta + wu.len();
     buf[tail] = trailer;
     let leaked: &'static [u8] = Box::leak(buf.into_boxed_slice());
-    H2GhostVariant { plaintext: leaked, plaintext_len }
+    H2GhostVariant {
+        plaintext: leaked,
+        plaintext_len,
+    }
 }
 
 lazy_static! {
     static ref H2_GHOST_VARIANTS: Vec<H2GhostVariant> = vec![
-        make_h2_ghost_variant(&[
-            0x00, 0x00, 0x12, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
-            0x00, 0x03, 0x00, 0x00, 0x03, 0xE8,
-            0x00, 0x04, 0x00, 0x00, 0x60, 0x00,
-        ], &[
-            0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x7F, 0x00, 0x00, 0x01,
-        ], 0x17, 65),
-        make_h2_ghost_variant(&[
-            0x00, 0x00, 0x18, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
-            0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x03, 0x00, 0x00, 0x03, 0xE8,
-            0x00, 0x04, 0x00, 0x00, 0x60, 0x00,
-        ], &[
-            0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x7F, 0x00, 0x00, 0x01,
-        ], 0x17, 71),
-        make_h2_ghost_variant(&[
-            0x00, 0x00, 0x12, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x03, 0x00, 0x00, 0x03, 0xE8,
-            0x00, 0x04, 0x00, 0x00, 0x60, 0x00,
-            0x00, 0x06, 0x00, 0x04, 0x00, 0x00,
-        ], &[
-            0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xBF, 0x00, 0x00, 0x01,
-        ], 0x1e, 65),
-        make_h2_ghost_variant(&[
-            0x00, 0x00, 0x1E, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
-            0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x03, 0x00, 0x00, 0x03, 0xE8,
-            0x00, 0x04, 0x00, 0x00, 0x60, 0x00,
-            0x00, 0x05, 0x00, 0x00, 0x40, 0x00,
-        ], &[
-            0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x7F, 0x00, 0x00, 0x01,
-        ], 0x17, 77),
+        make_h2_ghost_variant(
+            &[
+                0x00, 0x00, 0x12, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+                0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0xE8, 0x00, 0x04, 0x00, 0x00, 0x60, 0x00,
+            ],
+            &[0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F, 0x00, 0x00, 0x01,],
+            0x17,
+            65
+        ),
+        make_h2_ghost_variant(
+            &[
+                0x00, 0x00, 0x18, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+                0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0xE8, 0x00,
+                0x04, 0x00, 0x00, 0x60, 0x00,
+            ],
+            &[0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F, 0x00, 0x00, 0x01,],
+            0x17,
+            71
+        ),
+        make_h2_ghost_variant(
+            &[
+                0x00, 0x00, 0x12, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+                0xE8, 0x00, 0x04, 0x00, 0x00, 0x60, 0x00, 0x00, 0x06, 0x00, 0x04, 0x00, 0x00,
+            ],
+            &[0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x01,],
+            0x1e,
+            65
+        ),
+        make_h2_ghost_variant(
+            &[
+                0x00, 0x00, 0x1E, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+                0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0xE8, 0x00,
+                0x04, 0x00, 0x00, 0x60, 0x00, 0x00, 0x05, 0x00, 0x00, 0x40, 0x00,
+            ],
+            &[0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F, 0x00, 0x00, 0x01,],
+            0x17,
+            77
+        ),
     ];
 }
 
@@ -151,7 +159,10 @@ pub fn apply_tcp_keepalive(tcp: &TcpStream) -> io::Result<()> {
         keepalive = keepalive.with_retries(3 + rng.gen_range(0..=1));
     }
     if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
-        warn!("failed to apply kernel TCP Keep-Alive: {}. Long connections may drop.", e);
+        warn!(
+            "failed to apply kernel TCP Keep-Alive: {}. Long connections may drop.",
+            e
+        );
     }
     Ok(())
 }
@@ -208,7 +219,9 @@ impl SnowyStream {
             close_notify_written: false,
             read_buf_inner: pre_read,
             read_offset: 0,
-            write_buffer: Vec::with_capacity(TLS_RECORD_HEADER_LEN + BLOCK_PLAINTEXT_SIZE + AEAD_TAG_LEN),
+            write_buffer: Vec::with_capacity(
+                TLS_RECORD_HEADER_LEN + BLOCK_PLAINTEXT_SIZE + AEAD_TAG_LEN,
+            ),
             write_offset: 0,
             tls_rx_buf: BytesMut::with_capacity(MAX_TLS_RECORD_PAYLOAD_LEN + TLS_RECORD_HEADER_LEN),
             tls_rx_offset: 0,
@@ -234,10 +247,13 @@ impl SnowyStream {
             close_notify_written: false,
             read_buf_inner: Vec::with_capacity(BLOCK_DATA_CAPACITY),
             read_offset: 0,
-            write_buffer: Vec::with_capacity(TLS_RECORD_HEADER_LEN + BLOCK_PLAINTEXT_SIZE + AEAD_TAG_LEN),
+            write_buffer: Vec::with_capacity(
+                TLS_RECORD_HEADER_LEN + BLOCK_PLAINTEXT_SIZE + AEAD_TAG_LEN,
+            ),
             write_offset: 0,
             tls_rx_buf: {
-                let mut buf = BytesMut::with_capacity(MAX_TLS_RECORD_PAYLOAD_LEN + TLS_RECORD_HEADER_LEN);
+                let mut buf =
+                    BytesMut::with_capacity(MAX_TLS_RECORD_PAYLOAD_LEN + TLS_RECORD_HEADER_LEN);
                 buf.extend_from_slice(&pre_read_tls);
                 buf
             },
@@ -273,14 +289,26 @@ impl SnowyStream {
             let data_len = self.tx_agg_buf.len().min(BLOCK_DATA_CAPACITY);
             {
                 let data = &self.tx_agg_buf[..data_len];
-                encrypt_padded_block(&mut self.noise, &mut self.write_buffer, &mut self.encrypt_buf, data, data_len)?;
+                encrypt_padded_block(
+                    &mut self.noise,
+                    &mut self.write_buffer,
+                    &mut self.encrypt_buf,
+                    data,
+                    data_len,
+                )?;
             }
             self.tx_agg_buf.drain(..data_len);
             if !self.tx_agg_buf.is_empty() {
                 let data_len = self.tx_agg_buf.len().min(BLOCK_DATA_CAPACITY);
                 {
                     let data = &self.tx_agg_buf[..data_len];
-                    encrypt_padded_block(&mut self.noise, &mut self.write_buffer, &mut self.encrypt_buf, data, data_len)?;
+                    encrypt_padded_block(
+                        &mut self.noise,
+                        &mut self.write_buffer,
+                        &mut self.encrypt_buf,
+                        data,
+                        data_len,
+                    )?;
                 }
                 self.tx_agg_buf.drain(..data_len);
             }
@@ -291,7 +319,13 @@ impl SnowyStream {
             .max(payload.len() + BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN)
             .min(BLOCK_PLAINTEXT_SIZE);
 
-        encrypt_variable_block(&mut self.noise, &mut self.write_buffer, &mut self.encrypt_buf, payload, target_plaintext_len)
+        encrypt_variable_block(
+            &mut self.noise,
+            &mut self.write_buffer,
+            &mut self.encrypt_buf,
+            payload,
+            target_plaintext_len,
+        )
     }
 }
 
@@ -313,9 +347,7 @@ fn parse_tls_record(buf: &[u8]) -> io::Result<Option<(usize, u8)>> {
     }
     debug!(
         "parse_tls_record: type=0x{:02x} payload_len={} total={}",
-        frame_type,
-        length,
-        total
+        frame_type, length, total
     );
     Ok(Some((total, frame_type)))
 }
@@ -391,8 +423,11 @@ impl AsyncRead for SnowyStream {
                                     return Poll::Ready(Ok(()));
                                 }
 
-                                let prefix_data_len = if len >= BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN {
-                                    u16::from_be_bytes([this.decrypt_buf[0], this.decrypt_buf[1]]) as usize
+                                let prefix_data_len = if len
+                                    >= BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN
+                                {
+                                    u16::from_be_bytes([this.decrypt_buf[0], this.decrypt_buf[1]])
+                                        as usize
                                 } else {
                                     0
                                 };
@@ -403,17 +438,16 @@ impl AsyncRead for SnowyStream {
                                     consumed
                                 );
                                 if len >= BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN {
-                                    let data_len =
-                                        u16::from_be_bytes([
-                                            this.decrypt_buf[0],
-                                            this.decrypt_buf[1],
-                                        ]) as usize;
-                                    let data_len = data_len.min(len - BLOCK_LEN_PREFIX_SIZE - INNER_CONTENT_TYPE_LEN);
-                                    this.read_buf_inner
-                                        .extend_from_slice(
-                                            &this.decrypt_buf[BLOCK_LEN_PREFIX_SIZE
-                                                ..BLOCK_LEN_PREFIX_SIZE + data_len],
-                                        );
+                                    let data_len = u16::from_be_bytes([
+                                        this.decrypt_buf[0],
+                                        this.decrypt_buf[1],
+                                    ]) as usize;
+                                    let data_len = data_len
+                                        .min(len - BLOCK_LEN_PREFIX_SIZE - INNER_CONTENT_TYPE_LEN);
+                                    this.read_buf_inner.extend_from_slice(
+                                        &this.decrypt_buf[BLOCK_LEN_PREFIX_SIZE
+                                            ..BLOCK_LEN_PREFIX_SIZE + data_len],
+                                    );
                                 } else if len > 0 {
                                     this.read_buf_inner
                                         .extend_from_slice(&this.decrypt_buf[..len]);
@@ -441,7 +475,7 @@ impl AsyncRead for SnowyStream {
                                 return Poll::Ready(Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     format!("noise decrypt: {}", e),
-                                )))
+                                )));
                             }
                         }
                     } else if frame_type == 0x15 {
@@ -516,7 +550,12 @@ impl AsyncWrite for SnowyStream {
         while this.tx_agg_buf.len() >= BLOCK_DATA_CAPACITY {
             {
                 let data = &this.tx_agg_buf[..BLOCK_DATA_CAPACITY];
-                encrypt_full_block(&mut this.noise, &mut this.write_buffer, &mut this.encrypt_buf, data)?;
+                encrypt_full_block(
+                    &mut this.noise,
+                    &mut this.write_buffer,
+                    &mut this.encrypt_buf,
+                    data,
+                )?;
             }
             this.tx_agg_buf.drain(..BLOCK_DATA_CAPACITY);
         }
@@ -540,7 +579,13 @@ impl AsyncWrite for SnowyStream {
                 let data_len = this.tx_agg_buf.len().min(BLOCK_DATA_CAPACITY);
                 {
                     let data = &this.tx_agg_buf[..data_len];
-                    encrypt_padded_block(&mut this.noise, &mut this.write_buffer, &mut this.encrypt_buf, data, data_len)?;
+                    encrypt_padded_block(
+                        &mut this.noise,
+                        &mut this.write_buffer,
+                        &mut this.encrypt_buf,
+                        data,
+                        data_len,
+                    )?;
                 }
                 this.tx_agg_buf.drain(..data_len);
             }
@@ -592,7 +637,9 @@ impl AsyncWrite for SnowyStream {
 
 fn try_flush_write_buffer(stream: &mut SnowyStream, cx: &mut Context<'_>) -> io::Result<()> {
     while stream.write_offset < stream.write_buffer.len() {
-        match Pin::new(&mut stream.socket).poll_write(cx, &stream.write_buffer[stream.write_offset..]) {
+        match Pin::new(&mut stream.socket)
+            .poll_write(cx, &stream.write_buffer[stream.write_offset..])
+        {
             Poll::Ready(Ok(n)) => {
                 if n == 0 {
                     return Err(io::Error::new(io::ErrorKind::WriteZero, "write zero"));
@@ -616,8 +663,7 @@ fn encrypt_full_block(
     data: &[u8],
 ) -> io::Result<()> {
     let block = encrypt_buf.as_mut_slice();
-    block[..BLOCK_LEN_PREFIX_SIZE]
-        .copy_from_slice(&(data.len() as u16).to_be_bytes());
+    block[..BLOCK_LEN_PREFIX_SIZE].copy_from_slice(&(data.len() as u16).to_be_bytes());
     block[BLOCK_LEN_PREFIX_SIZE..BLOCK_LEN_PREFIX_SIZE + data.len()].copy_from_slice(data);
     block[BLOCK_PLAINTEXT_SIZE - 1] = INNER_CONTENT_TYPE_APP_DATA;
 
@@ -628,7 +674,10 @@ fn encrypt_full_block(
     write_buffer.resize(current_len + record_len, 0);
 
     let actual_ct = noise
-        .write_message(block, &mut write_buffer[current_len + TLS_RECORD_HEADER_LEN..])
+        .write_message(
+            block,
+            &mut write_buffer[current_len + TLS_RECORD_HEADER_LEN..],
+        )
         .map_err(|e| io::Error::other(format!("noise encrypt: {}", e)))?;
 
     write_buffer[current_len] = 0x17;
@@ -650,7 +699,11 @@ fn encrypt_padded_block(
 ) -> io::Result<()> {
     use rand::Rng;
 
-    let min_wire = TLS_RECORD_HEADER_LEN + AEAD_TAG_LEN + BLOCK_LEN_PREFIX_SIZE + data_len + INNER_CONTENT_TYPE_LEN;
+    let min_wire = TLS_RECORD_HEADER_LEN
+        + AEAD_TAG_LEN
+        + BLOCK_LEN_PREFIX_SIZE
+        + data_len
+        + INNER_CONTENT_TYPE_LEN;
     let max_wire = TLS_RECORD_HEADER_LEN + AEAD_TAG_LEN + BLOCK_PLAINTEXT_SIZE;
     let max_padding = max_wire.saturating_sub(min_wire);
 
@@ -671,10 +724,17 @@ fn encrypt_padded_block(
 
     let target = min_wire + padding;
     let target_plaintext_len = target.saturating_sub(TLS_RECORD_HEADER_LEN + AEAD_TAG_LEN);
-    encrypt_variable_block(noise, write_buffer, encrypt_buf, payload, target_plaintext_len)
+    encrypt_variable_block(
+        noise,
+        write_buffer,
+        encrypt_buf,
+        payload,
+        target_plaintext_len,
+    )
 }
 
-pub const MIN_CONTROL_WIRE_LEN: usize = TLS_RECORD_HEADER_LEN + BLOCK_LEN_PREFIX_SIZE + AEAD_TAG_LEN;
+pub const MIN_CONTROL_WIRE_LEN: usize =
+    TLS_RECORD_HEADER_LEN + BLOCK_LEN_PREFIX_SIZE + AEAD_TAG_LEN;
 
 fn encrypt_variable_block(
     noise: &mut TransportState,

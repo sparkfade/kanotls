@@ -45,8 +45,6 @@ impl Default for ConnectionCounter {
     }
 }
 
-
-
 #[derive(Debug)]
 pub struct ClientHelloTemplate {
     bytes: Vec<u8>,
@@ -177,7 +175,8 @@ pub fn get_or_build_client_hello_template(
         }
     }
 
-    let templates = build_client_hello_template_pool(sni, fingerprint, custom_template_bytes, insecure)?;
+    let templates =
+        build_client_hello_template_pool(sni, fingerprint, custom_template_bytes, insecure)?;
     let template = select_template(&templates, &key)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("template pool is empty"))?;
@@ -232,12 +231,11 @@ fn build_client_hello_template_pool(
     let custom_bytes = custom_template_bytes.map(|b| b.to_vec());
 
     let mut bytes = match preset {
-        FingerprintPreset::Firefox => custom_bytes.unwrap_or_else(|| {
-            templates::FIREFOX_BOOTSTRAP_CLIENT_HELLO.to_vec()
-        }),
-        FingerprintPreset::PythonOpenSsl => custom_bytes.unwrap_or_else(|| {
-            templates::PYTHON_OPENSSL_BOOTSTRAP_CLIENT_HELLO.to_vec()
-        }),
+        FingerprintPreset::Firefox => {
+            custom_bytes.unwrap_or_else(|| templates::FIREFOX_BOOTSTRAP_CLIENT_HELLO.to_vec())
+        }
+        FingerprintPreset::PythonOpenSsl => custom_bytes
+            .unwrap_or_else(|| templates::PYTHON_OPENSSL_BOOTSTRAP_CLIENT_HELLO.to_vec()),
         FingerprintPreset::Rustls => build_rustls_template_bytes(sni, fingerprint, insecure)?,
     };
 
@@ -309,7 +307,9 @@ pub fn invalidate_client_hello_template_cache() {
             );
         }
         Err(_) => {
-            tracing::warn!("ClientHello template cache poisoned, unable to invalidate for hot-reload");
+            tracing::warn!(
+                "ClientHello template cache poisoned, unable to invalidate for hot-reload"
+            );
         }
     }
 }
@@ -417,10 +417,6 @@ fn rotate_grease_extensions(
     Ok(())
 }
 
-
-
-
-
 struct ExtensionLocation {
     data_range: Range<usize>,
 }
@@ -475,8 +471,6 @@ fn adjust_handshake_lengths(
     write_u16(bytes, extensions_len_range.clone(), new_extensions_len)?;
     Ok(())
 }
-
-
 
 fn build_rustls_template_bytes(
     sni: &str,
@@ -725,8 +719,7 @@ mod tests {
     use crate::templates::FIREFOX_BOOTSTRAP_CLIENT_HELLO;
     use crate::utils::{
         client_hello_key_share_range, client_hello_random_and_session_id_ranges, constant_time_eq,
-        derive_counter_mac, derive_counter_mask, mask_mac_flags,
-        unmask_noise_ephemeral_key,
+        derive_counter_mac, derive_counter_mask, mask_mac_flags, unmask_noise_ephemeral_key,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -821,7 +814,8 @@ mod tests {
         let original = crate::templates::FIREFOX_BOOTSTRAP_CLIENT_HELLO.to_vec();
         let original_extensions = extension_types(&original);
         let original_has_padding = original_extensions.contains(&0x0015);
-        let template = get_or_build_client_hello_template(SNI, Some("firefox"), None, true).unwrap();
+        let template =
+            get_or_build_client_hello_template(SNI, Some("firefox"), None, true).unwrap();
 
         let mut instantiated_extension_lists = BTreeSet::new();
         let mut instantiated_ja3_extensions = BTreeSet::new();
@@ -1264,9 +1258,13 @@ mod tests {
 
     #[test]
     fn python_openssl_template_preserves_captured_record_length() {
-        let template =
-            get_or_build_client_hello_template("www.bilibili.com", Some("python-openssl"), None, true)
-                .unwrap();
+        let template = get_or_build_client_hello_template(
+            "www.bilibili.com",
+            Some("python-openssl"),
+            None,
+            true,
+        )
+        .unwrap();
         let derived_psk = common::derive_psk(b"python-openssl-jitter-psk");
         let mut noise_init = [0u8; 48];
         noise_init[..32].fill(7);
@@ -1305,9 +1303,18 @@ mod tests {
         let (random_range2, _) = client_hello_random_and_session_id_ranges(&ch2).unwrap();
         let ks_range2 = client_hello_key_share_range(&ch2).unwrap();
 
-        assert!(!constant_time_eq(&ch1[ks_range1.clone()], &ch1[random_range1.clone()]));
-        assert!(!constant_time_eq(&ch2[ks_range2.clone()], &ch2[random_range2.clone()]));
-        assert!(!constant_time_eq(&ch1[ks_range1.clone()], &noise_init[..32]));
+        assert!(!constant_time_eq(
+            &ch1[ks_range1.clone()],
+            &ch1[random_range1.clone()]
+        ));
+        assert!(!constant_time_eq(
+            &ch2[ks_range2.clone()],
+            &ch2[random_range2.clone()]
+        ));
+        assert!(!constant_time_eq(
+            &ch1[ks_range1.clone()],
+            &noise_init[..32]
+        ));
         assert!(!constant_time_eq(&ch2[ks_range2], &noise_init[..32]));
         assert!(!constant_time_eq(&ch1[ks_range1], &ch2[random_range2]));
     }
@@ -1325,8 +1332,12 @@ mod tests {
 
         let template =
             get_or_build_client_hello_template("example.com", Some("firefox"), None, true).unwrap();
-        let ch1 = template.instantiate(&derived_psk, &noise_init, 100).unwrap();
-        let ch2 = template.instantiate(&derived_psk, &noise_init, 200).unwrap();
+        let ch1 = template
+            .instantiate(&derived_psk, &noise_init, 100)
+            .unwrap();
+        let ch2 = template
+            .instantiate(&derived_psk, &noise_init, 200)
+            .unwrap();
 
         let (_, sid_range1) = client_hello_random_and_session_id_ranges(&ch1).unwrap();
         let (_, sid_range2) = client_hello_random_and_session_id_ranges(&ch2).unwrap();
@@ -1340,7 +1351,9 @@ mod tests {
         let v1 = u64::from_be_bytes(val1);
         let v2 = u64::from_be_bytes(val2);
         let diff = v2.abs_diff(v1);
-        assert_ne!(diff, 100, "session_id leaked absolute counter difference directly");
+        assert_ne!(
+            diff, 100,
+            "session_id leaked absolute counter difference directly"
+        );
     }
-
 }
