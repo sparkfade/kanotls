@@ -475,7 +475,11 @@ pub fn mask_noise_ephemeral_key(key: &[u8; 32], derived_psk: &[u8], noise_tag: &
 }
 
 /// Unmask a Noise ephemeral key from the XOR-masked bytes in the ClientHello random field.
-pub fn unmask_noise_ephemeral_key(masked: &[u8; 32], derived_psk: &[u8], noise_tag: &[u8]) -> [u8; 32] {
+pub fn unmask_noise_ephemeral_key(
+    masked: &[u8; 32],
+    derived_psk: &[u8],
+    noise_tag: &[u8],
+) -> [u8; 32] {
     let mask = derive_noise_e_mask(derived_psk, noise_tag);
     xor_32_bytes(masked, &mask)
 }

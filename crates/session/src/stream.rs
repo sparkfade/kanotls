@@ -231,7 +231,9 @@ impl Stream {
             let payload = Frame::encode_psh(self.stream_id, chunk)?;
             packets.push(payload);
         }
-        self.writer.write_packets(packets, flush, TrafficClass::Bulk).await
+        self.writer
+            .write_packets(packets, flush, TrafficClass::Bulk)
+            .await
     }
 
     async fn write_pending_open_with_data(&mut self, data: &[u8]) -> Result<(), anyhow::Error> {
@@ -279,11 +281,7 @@ impl Stream {
         self.finish_pending_open_submission().await
     }
 
-    async fn write_gather_open(
-        &mut self,
-        target: &[u8],
-        data: &[u8],
-    ) -> Result<(), anyhow::Error> {
+    async fn write_gather_open(&mut self, target: &[u8], data: &[u8]) -> Result<(), anyhow::Error> {
         let Some(mut frames) = self.deferred_open_frames() else {
             self.finish_pending_open_submission().await?;
             let mut combined_frames = Vec::new();
@@ -296,7 +294,10 @@ impl Stream {
                 }
             }
             let packets = self.coalesce_and_pad(&combined_frames)?;
-            return self.writer.write_packets(packets, FlushBehavior::Immediate, TrafficClass::Bulk).await;
+            return self
+                .writer
+                .write_packets(packets, FlushBehavior::Immediate, TrafficClass::Bulk)
+                .await;
         };
 
         let mut settings_guard =
@@ -315,7 +316,9 @@ impl Stream {
         }
         let packets = self.coalesce_and_pad(&frames)?;
 
-        let pending_write = self.submit_packets_or_fail(packets, TrafficClass::Control).await?;
+        let pending_write = self
+            .submit_packets_or_fail(packets, TrafficClass::Control)
+            .await?;
 
         settings_guard.commit();
         self.open_state = StreamOpenState::Submitted {
@@ -337,7 +340,9 @@ impl Stream {
         }
         let packets = self.coalesce_and_pad(&frames)?;
 
-        let pending_write = self.submit_packets_or_fail(packets, TrafficClass::Control).await?;
+        let pending_write = self
+            .submit_packets_or_fail(packets, TrafficClass::Control)
+            .await?;
 
         settings_guard.commit();
         self.open_state = StreamOpenState::Submitted {
@@ -424,11 +429,7 @@ impl Stream {
 
         self.finish_pending_open_submission().await?;
 
-        let result = send_fin_frame(
-            self.stream_id,
-            self.writer.clone(),
-        )
-        .await;
+        let result = send_fin_frame(self.stream_id, self.writer.clone()).await;
 
         if result.is_ok() {
             self.write_closed = true;
@@ -499,8 +500,7 @@ impl Drop for Stream {
         remember_closing_stream_sync(stream_id, &closing_streams);
         let fin_queued = !write_closed
             && !wait_for_pending_open
-            && try_send_fin_frame(stream_id, &writer)
-                .is_ok();
+            && try_send_fin_frame(stream_id, &writer).is_ok();
         if let Ok(mut streams) = self.streams.try_write() {
             if let Some(handle) = streams.get_mut(&stream_id) {
                 handle.read_closed = true;
@@ -611,11 +611,7 @@ impl Stream {
                 Err(_) => {
                     self.synack_rx = None;
                     remember_closing_stream_sync(self.stream_id, &self.closing_streams);
-                    let _ = send_fin_frame(
-                        self.stream_id,
-                        self.writer.clone(),
-                    )
-                    .await;
+                    let _ = send_fin_frame(self.stream_id, self.writer.clone()).await;
                     self.streams.write().await.remove(&self.stream_id);
                     self.clear_pending_client_state().await;
                     return Err(self
@@ -687,7 +683,11 @@ pub(crate) async fn send_fin_frame(
 ) -> Result<(), anyhow::Error> {
     let payload = Frame::fin(stream_id).encode()?;
     writer
-        .write_packets(vec![payload], FlushBehavior::Immediate, TrafficClass::Control)
+        .write_packets(
+            vec![payload],
+            FlushBehavior::Immediate,
+            TrafficClass::Control,
+        )
         .await
 }
 
@@ -696,7 +696,9 @@ pub(crate) fn try_send_fin_frame(
     writer: &SharedTunnelWriter,
 ) -> Result<(), anyhow::Error> {
     let payload = Frame::fin(stream_id).encode()?;
-    writer.try_write_packets(vec![payload], FlushBehavior::Immediate, TrafficClass::Control)
+    writer.try_write_packets(
+        vec![payload],
+        FlushBehavior::Immediate,
+        TrafficClass::Control,
+    )
 }
-
-

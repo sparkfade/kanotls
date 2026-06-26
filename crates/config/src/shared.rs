@@ -1,5 +1,37 @@
 use anyhow::{bail, Result};
 
+const MAX_STREAMS_PER_SESSION_LIMIT: usize = 4096;
+const MAX_IDLE_TIMEOUT_SECS: u64 = 3600;
+
+pub fn validate_session_config(prefix: &str, session: &crate::model::SessionConfig) -> Result<()> {
+    if session.max_streams_per_session == 0
+        || session.max_streams_per_session > MAX_STREAMS_PER_SESSION_LIMIT
+    {
+        bail!(
+            "{}: session.max_streams_per_session must be in 1..={}",
+            prefix,
+            MAX_STREAMS_PER_SESSION_LIMIT
+        );
+    }
+    if session.idle_timeout_secs == 0 || session.idle_timeout_secs > MAX_IDLE_TIMEOUT_SECS {
+        bail!(
+            "{}: session.idle_timeout_secs must be in 1..={}",
+            prefix,
+            MAX_IDLE_TIMEOUT_SECS
+        );
+    }
+    Ok(())
+}
+
+pub fn is_placeholder_password(pw: &str) -> bool {
+    let lower = pw.to_ascii_lowercase();
+    lower.contains("change_me")
+        || lower.contains("placeholder")
+        || lower.contains("replace_me")
+        || lower.contains("your_password_here")
+        || lower.contains("fill_me")
+}
+
 pub fn validate_log_config(log: &crate::model::LogConfig) -> Result<()> {
     if let Some(level) = log.level.as_deref() {
         match level.trim().to_ascii_lowercase().as_str() {

@@ -14,10 +14,8 @@ pub use stream::Stream;
 mod tests {
     use super::*;
 
-    const _RELAY_CHUNK_SIZE_CHECK: () =
-        assert!(RELAY_CHUNK_SIZE <= 2 * frame::MAX_PAYLOAD_LEN);
+    const _RELAY_CHUNK_SIZE_CHECK: () = assert!(RELAY_CHUNK_SIZE <= 2 * frame::MAX_PAYLOAD_LEN);
 
     #[test]
-    fn relay_chunk_size_fits_protocol_frame_limit() {
-    }
+    fn relay_chunk_size_fits_protocol_frame_limit() {}
 }

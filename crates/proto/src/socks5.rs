@@ -140,19 +140,31 @@ pub async fn socks5_handshake(
 
     match auth {
         None => {
-            stream.write_all(&[SOCKS_VERSION, 1, METHOD_NO_AUTH]).await?;
+            stream
+                .write_all(&[SOCKS_VERSION, 1, METHOD_NO_AUTH])
+                .await?;
             let mut resp = [0u8; 2];
             stream.read_exact(&mut resp).await?;
             if resp[0] != SOCKS_VERSION || resp[1] != METHOD_NO_AUTH {
-                anyhow::bail!("socks5 proxy rejected no-auth method: {:02x} {:02x}", resp[0], resp[1]);
+                anyhow::bail!(
+                    "socks5 proxy rejected no-auth method: {:02x} {:02x}",
+                    resp[0],
+                    resp[1]
+                );
             }
         }
         Some((username, password)) => {
-            stream.write_all(&[SOCKS_VERSION, 1, METHOD_USER_PASS]).await?;
+            stream
+                .write_all(&[SOCKS_VERSION, 1, METHOD_USER_PASS])
+                .await?;
             let mut resp = [0u8; 2];
             stream.read_exact(&mut resp).await?;
             if resp[0] != SOCKS_VERSION || resp[1] != METHOD_USER_PASS {
-                anyhow::bail!("socks5 proxy does not support user/pass auth: {:02x} {:02x}", resp[0], resp[1]);
+                anyhow::bail!(
+                    "socks5 proxy does not support user/pass auth: {:02x} {:02x}",
+                    resp[0],
+                    resp[1]
+                );
             }
 
             if username.len() > 255 {
@@ -288,9 +300,16 @@ pub async fn socks5_send_udp_associate(
     stream: &mut tokio::net::TcpStream,
 ) -> Result<SocketAddr, anyhow::Error> {
     let assoc_req: [u8; 10] = [
-        SOCKS_VERSION, CMD_UDP_ASSOCIATE, 0x00, 0x01,
-        0, 0, 0, 0,
-        0, 0,
+        SOCKS_VERSION,
+        CMD_UDP_ASSOCIATE,
+        0x00,
+        0x01,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
     ];
     stream.write_all(&assoc_req).await?;
 

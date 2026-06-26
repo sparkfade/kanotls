@@ -44,13 +44,13 @@ struct PoolBehaviorContext {
 }
 
 #[derive(Clone)]
-    struct ResolvedPoolBehavior {
-        seed: u64,
-        target_pool_size: usize,
-        initial_connection_count: usize,
-        min_active_connections: usize,
-        spawn_cluster_len: u64,
-    }
+struct ResolvedPoolBehavior {
+    seed: u64,
+    target_pool_size: usize,
+    initial_connection_count: usize,
+    min_active_connections: usize,
+    spawn_cluster_len: u64,
+}
 
 #[derive(Clone)]
 pub struct PoolBehaviorConfig {
@@ -885,11 +885,7 @@ impl TunnelConnector for TunnelSessionConnector {
             )
             .await?;
 
-            let session = Arc::new(Session::new(
-                tunnel,
-                session_config,
-                None,
-            ));
+            let session = Arc::new(Session::new(tunnel, session_config, None));
             let read_loop = session.clone();
             tokio::spawn(async move {
                 let _ = read_loop.run_read_loop().await;
