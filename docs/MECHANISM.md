@@ -126,7 +126,6 @@ Every record on the wire after the TLS handshake is a 0x17 (Application Data) re
 | Flight3 Finished ghost | 37 | 53 | **58** | — |
 | Flight3 H2 ghost | 65 / 71 / 77 | 81 / 87 / 93 | **86 / 92 / 98** | context-hash selects variant |
 | Close notify alert | 3 (`[01 00 15]`) | 19 | **24** | — |
-| bad_record_mac alert | 2 (`[02 14]`) | 18 | **23** | — |
 | Ghost record (server) | size from camouflage cache | size + 16 | **5 + cache_size** | first 16B = fake ticket header |
 
 Tail bulk records use jittered padding — 80% carry at most 32 bytes of padding (exponential distribution), while 20% are padded to the full block size of 16406 bytes.
@@ -167,13 +166,14 @@ The session read loop (`run_read_loop`) uses a pinned `tokio::time::sleep` timer
 
 ### 5.1 Decryption Failure
 
-When a received 0x17 record fails Noise AEAD decryption (`read_message` returns `Err`), the tunnel does NOT send a normal `close_notify`. Instead:
+When a received 0x17 record fails Noise AEAD decryption (`read_message` returns `Err`), the tunnel does NOT send any alert. Instead:
 
-1. A TLS 1.3 fatal alert `bad_record_mac` (0x02, 0x14) is constructed and Noise-encrypted.
-2. The alert is wrapped as a 0x17 record and queued in the write buffer.
-3. `SO_LINGER` is set to 0 on the TCP socket (forces RST on close).
-4. `close_notify_written` is set to `true` and state to `Closed` (prevents the normal `close_notify` from ever being sent).
-5. An IO error is returned, triggering session teardown and TCP RST.
+1. `close_notify_written` is immediately set to `true`, preventing the normal `close_notify` from ever being sent.
+2. An `InvalidData` IO error is returned.
+3. The session read loop receives the error and tears down the TCP connection.
+4. No bytes are written back to the peer — the connection is silently closed.
+
+The peer observes either TCP FIN or RST (OS-dependent), with no TLS-layer alert payload, preventing active probing that relies on distinguishing alert types.
 
 ### 5.2 Pre-Auth Fallback
 
@@ -251,6 +251,6 @@ A custom ClientHello hex file can override the Firefox/Python-OpenSSL templates 
                         └─────────────┬───────────────────────┘
                                  Yes  │
                                       ▼
-                        bad_record_mac fatal alert
-                        + SO_LINGER=0 + TCP RST
+                        Silent close — no alert sent.
+                        TCP FIN or RST (OS-dependent).
 ```

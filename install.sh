@@ -4,7 +4,7 @@ set -euo pipefail
 # ============================================================
 # Constants
 # ============================================================
-GITHUB_REPO="LYCaikano/kanotls"
+GITHUB_REPO="sparkfade/kanotls"
 GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}"
 GITHUB_DOWNLOAD="https://github.com/${GITHUB_REPO}/releases/download"
 GITHUB_RAW="https://raw.githubusercontent.com/${GITHUB_REPO}"

@@ -17,7 +17,7 @@ UDP:           SOCKS5 UDP ASSOCIATE carried as UDP-over-TCP stream data
 
 kanotls uses a separate Noise channel for endpoint authentication and payload confidentiality. The Noise ephemeral public key is embedded in the ClientHello `random` field via PSK-derived XOR masking; the `key_share` extension carries an **independent** TLS-layer X25519 ephemeral key to complete the visible handshake with the reference endpoint, eliminating statistical correlation between the two fields. The server replays cached reference-endpoint record shapes — it contacts the live camouflage endpoint only on first boot and during periodic background refresh.
 
-Authentication and replay failures are handled by a shaped path with bounded pre-auth fallback for well-formed requests. Read-stage (post-authentication) failures fail closed without fallback. Fallback connections carry explicit abuse limits (concurrency caps, per-IP limits, connect timeouts, IP reputation cooldown). AEAD decryption failures emit a `bad_record_mac` fatal alert and trigger TCP RST — they never leak a clean `close_notify`.
+Authentication and replay failures are handled by a shaped path with bounded pre-auth fallback for well-formed requests. Read-stage (post-authentication) failures fail closed without fallback. Fallback connections carry explicit abuse limits (concurrency caps, per-IP limits, connect timeouts, IP reputation cooldown). AEAD decryption failures silently close the connection — no alert is sent, no `close_notify` leaks.
 
 Detailed mechanism reference: [docs/MECHANISM.md](docs/MECHANISM.md)
 
@@ -68,7 +68,7 @@ Start with `kanotls --config config.json`. Role auto-detection: `"protocol": "tu
         },
         "session": {
           "max_streams_per_session": 256,
-          "idle_timeout_secs": 300
+          "idle_timeout_secs": 60
         }
       }
     }
@@ -154,7 +154,7 @@ Start with `kanotls --config config.json`. Role auto-detection: `"protocol": "tu
 ## One-Click Server Deployment (Linux)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LYCaikano/kanotls/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/sparkfade/kanotls/main/install.sh | sudo bash
 ```
 
 The script downloads the latest pre-built binary from GitHub Releases, installs it to `/usr/local/bin/kanotls`, creates `/etc/kanotls/` with a config skeleton, and installs the systemd unit.
