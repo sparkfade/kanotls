@@ -16,7 +16,7 @@
         },
         "session": {
           "max_streams_per_session": 256,
-          "idle_timeout_secs": 300
+          "idle_timeout_secs": 60
         }
       }
     }

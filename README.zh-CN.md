@@ -17,7 +17,7 @@ UDP:           SOCKS5 UDP ASSOCIATE 通过 UDP-over-TCP stream data 承载
 
 kanotls 使用独立 Noise 通道完成端点认证和载荷加密。Noise 临时公钥通过 PSK 派生掩码嵌入 ClientHello 的 `random` 字段；`key_share` 扩展承载**独立的** TLS 层 X25519 临时密钥用于与参考站点完成可见握手，消除了两字段间的统计关联。服务端回放缓存的参考端点 record 形态——仅在首次启动和定期后台刷新时才实际连接伪装端点。
 
-认证与重放失败走受限的 pre-auth 回落路径。读取阶段（认证后）失败走 fail-closed 永不回落。回落连接带有显式防滥用限制（并发上限、每 IP 限制、连接超时、IP 信誉冷却）。AEAD 解密失败发送 `bad_record_mac` 致命告警并触发 TCP RST——不以干净的 `close_notify` 告警泄露。
+认证与重放失败走受限的 pre-auth 回落路径。读取阶段（认证后）失败走 fail-closed 永不回落。回落连接带有显式防滥用限制（并发上限、每 IP 限制、连接超时、IP 信誉冷却）。AEAD 解密失败静默关闭连接——不发送告警，不以 `close_notify` 泄露。
 
 详细机制参考：[docs/MECHANISM.zh-CN.md](docs/MECHANISM.zh-CN.md)
 
@@ -68,7 +68,7 @@ cargo build --release
         },
         "session": {
           "max_streams_per_session": 256,
-          "idle_timeout_secs": 300
+          "idle_timeout_secs": 60
         }
       }
     }
@@ -154,7 +154,7 @@ cargo build --release
 ## 服务端一键部署（Linux）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LYCaikano/kanotls/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/sparkfade/kanotls/main/install.sh | sudo bash
 ```
 
 脚本会从 GitHub Releases 下载最新预编译二进制，安装至 `/usr/local/bin/kanotls`，创建 `/etc/kanotls/` 并写入骨架配置，安装 systemd 单元文件。
