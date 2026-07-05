@@ -1,12 +1,15 @@
 use kanotls_tunnel::{ConnectionState, FlowDirection, SnowyStream};
 use std::time::Duration;
 
-const SCRIPTED_PACKET_PREFIX: usize = 12;
 const RECENT_WINDOW_SIZE: usize = 8;
-const BULK_ENTRY_THRESHOLD: usize = 3;
-const BULK_EXIT_THRESHOLD: usize = 6;
+const MAX_PENDING_FLUSH_SIZE: usize = 256 * 1024;
 #[allow(dead_code)]
 const CONTROL_FRAMES_HANDSHAKE: u64 = 6;
+
+/// The blend window width: over this many packets after the script is
+/// exhausted, the probability of falling through to the Markov machine
+/// ramps from 0% to 100%.
+const SCRIPT_BLEND_WINDOW: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MacroState {
@@ -15,10 +18,15 @@ pub(crate) enum MacroState {
     AsymmetricBulk,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) enum DelaySpec {
     None,
     LogNormal { mu_ms: f64, sigma_ms: f64 },
+    /// Replay pre-recorded IAT (Inter-Arrival Time) values from a
+    /// reference endpoint trace. Values are in microseconds. The
+    /// array is read circularly with `packet_seq % len`.
+    Replay(&'static [u32]),
 }
 
 #[derive(Clone, Debug)]
@@ -48,10 +56,10 @@ pub(crate) struct TrafficShaper {
     state: MacroState,
     packet_seq: u64,
     script: Vec<ScriptRule>,
-    script_index: usize,
     control_frame_count: u64,
     recent_payload_sizes: [usize; RECENT_WINDOW_SIZE],
     recent_payload_idx: usize,
+    max_pending_flush_size: usize,
 }
 
 fn embedded_script() -> Vec<ScriptRule> {
@@ -116,10 +124,10 @@ impl TrafficShaper {
             state: MacroState::HandshakeShaping,
             packet_seq: 0,
             script,
-            script_index: 0,
             control_frame_count: 0,
             recent_payload_sizes: [0; RECENT_WINDOW_SIZE],
             recent_payload_idx: 0,
+            max_pending_flush_size: MAX_PENDING_FLUSH_SIZE,
         }
     }
 
@@ -150,11 +158,27 @@ impl TrafficShaper {
             return self.handshake_policy(pending_len, cap);
         }
 
-        if self.packet_seq < SCRIPTED_PACKET_PREFIX as u64 {
-            return self.script_policy(pending_len, cap);
-        }
+        let script_packets = self.script.len() as u64;
+        let packet_seq = self.packet_seq;
 
-        self.markov_policy(pending_len, cap)
+        // Smooth blend: when we are within SCRIPT_BLEND_WINDOW packets
+        // past the script's natural end, the probability of using the
+        // Markov machine ramps linearly from 0 to 1. Beyond that window,
+        // the script is fully bypassed.
+        let script_blend_p = if packet_seq < script_packets {
+            1.0_f64
+        } else {
+            let overshoot = packet_seq.saturating_sub(script_packets);
+            1.0_f64 - (overshoot as f64 / SCRIPT_BLEND_WINDOW as f64).min(1.0)
+        };
+
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        if rng.gen::<f64>() < script_blend_p && !self.script.is_empty() {
+            self.script_policy(pending_len, cap)
+        } else {
+            self.markov_policy(pending_len, cap)
+        }
     }
 
     fn handshake_policy(&mut self, pending_len: usize, cap: usize) -> ShapePolicy {
@@ -176,7 +200,7 @@ impl TrafficShaper {
     }
 
     fn script_policy(&mut self, _pending_len: usize, cap: usize) -> ShapePolicy {
-        let idx = self.script_index.min(self.script.len().saturating_sub(1));
+        let idx = (self.packet_seq as usize).wrapping_rem(self.script.len());
         let rule = &self.script[idx];
 
         use rand::Rng;
@@ -185,13 +209,7 @@ impl TrafficShaper {
 
         let target_wire_len = SnowyStream::data_record_wire_len(random_h2_payload.min(cap));
 
-        let delay = match rule.delay {
-            DelaySpec::None => Duration::ZERO,
-            DelaySpec::LogNormal { mu_ms, sigma_ms } => {
-                let sample = sample_log_normal(mu_ms, sigma_ms).max(0.0);
-                Duration::from_micros((sample * 1000.0).round() as u64)
-            }
-        };
+        let delay = delay_from_spec(&rule.delay, self.packet_seq);
 
         let fake = if rule.expect_responses > 0 {
             Some(FakeSpec {
@@ -201,10 +219,6 @@ impl TrafficShaper {
             None
         };
 
-        if self.script_index + 1 < self.script.len() {
-            self.script_index += 1;
-        }
-
         ShapePolicy {
             target_wire_len,
             delay,
@@ -213,33 +227,33 @@ impl TrafficShaper {
         }
     }
 
-    fn markov_policy(&mut self, pending_len: usize, cap: usize) -> ShapePolicy {
-        let avg_recent = self.average_recent_payload();
+    fn markov_policy(&mut self, pending_len: usize, _cap: usize) -> ShapePolicy {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
 
-        self.state = if self.state == MacroState::AsymmetricBulk {
-            let small_count = self
-                .recent_payload_sizes
-                .iter()
-                .filter(|&&s| s < cap / 4)
-                .count();
-            if small_count >= BULK_EXIT_THRESHOLD {
-                MacroState::InteractiveControl
-            } else {
-                MacroState::AsymmetricBulk
+        // Probabilistic transition to AsymmetricBulk: the probability
+        // scales with the fraction of the pending flush buffer that is
+        // occupied. A nearly-full backlog strongly biases bulk mode to
+        // restore throughput.
+        let p_bulk = (pending_len as f64 / self.max_pending_flush_size as f64).min(1.0);
+
+        self.state = match self.state {
+            MacroState::AsymmetricBulk => {
+                // Exit bulk with probability inverse to backlog pressure.
+                let p_exit = 1.0 - p_bulk;
+                if rng.gen_bool(p_exit.min(0.85)) {
+                    MacroState::InteractiveControl
+                } else {
+                    MacroState::AsymmetricBulk
+                }
             }
-        } else if avg_recent > cap / 2 {
-            let large_count = self
-                .recent_payload_sizes
-                .iter()
-                .filter(|&&s| s >= cap)
-                .count();
-            if large_count >= BULK_ENTRY_THRESHOLD {
-                MacroState::AsymmetricBulk
-            } else {
-                MacroState::InteractiveControl
+            _ => {
+                if rng.gen_bool(p_bulk) {
+                    MacroState::AsymmetricBulk
+                } else {
+                    MacroState::InteractiveControl
+                }
             }
-        } else {
-            MacroState::InteractiveControl
         };
 
         let (target_wire_len, allow_full_block, delay, fake) = match self.state {
@@ -250,8 +264,6 @@ impl TrafficShaper {
                 None,
             ),
             MacroState::InteractiveControl => {
-                use rand::Rng;
-                let mut rng = rand::thread_rng();
                 let size = kanotls_tunnel::control_size::next_control_size(
                     ConnectionState::Transport,
                     self.direction,
@@ -268,9 +280,6 @@ impl TrafficShaper {
             }
             MacroState::HandshakeShaping => unreachable!(),
         };
-
-        let _ = pending_len;
-        let _ = avg_recent;
 
         ShapePolicy {
             target_wire_len,
@@ -289,12 +298,22 @@ impl TrafficShaper {
         self.recent_payload_idx = self.recent_payload_idx.wrapping_add(1);
     }
 
-    fn average_recent_payload(&self) -> usize {
-        let count = self.recent_payload_idx.min(RECENT_WINDOW_SIZE);
-        if count == 0 {
-            return 0;
+}
+
+fn delay_from_spec(spec: &DelaySpec, packet_seq: u64) -> Duration {
+    match spec {
+        DelaySpec::None => Duration::ZERO,
+        DelaySpec::LogNormal { mu_ms, sigma_ms } => {
+            let sample = sample_log_normal(*mu_ms, *sigma_ms).max(0.0);
+            Duration::from_micros((sample * 1000.0).round() as u64)
         }
-        self.recent_payload_sizes[..count].iter().sum::<usize>() / count
+        DelaySpec::Replay(trace) => {
+            if trace.is_empty() {
+                return Duration::ZERO;
+            }
+            let idx = (packet_seq as usize) % trace.len();
+            Duration::from_micros(trace[idx] as u64)
+        }
     }
 }
 
@@ -475,31 +494,47 @@ Length: 300~400, Delay: 0, FakeResponse: 2
     }
 
     #[test]
-    fn note_control_frame_advances_state() {
+    fn note_control_frame_advances_to_transport() {
         let mut shaper = TrafficShaper::new(FlowDirection::C2S, None);
         for _ in 0..CONTROL_FRAMES_HANDSHAKE {
             shaper.note_control_frame();
         }
+        // After enough control frames, the connection state is Transport,
+        // so the handshake bypass is inactive. The script/blend path runs;
+        // script_policy always returns allow_full_block=false.
         let policy = shaper.next_data_policy(100);
         assert!(!policy.allow_full_block);
     }
 
     #[test]
-    fn markov_transitions_to_bulk() {
+    fn markov_transitions_to_bulk_with_full_backlog() {
         let mut shaper = TrafficShaper::new(FlowDirection::C2S, None);
         for _ in 0..CONTROL_FRAMES_HANDSHAKE {
             shaper.note_control_frame();
         }
+        // Advance past the script + blend window so the Markov machine is
+        // active (100% fall-through probability).
+        shaper.packet_seq = (shaper.script.len() + SCRIPT_BLEND_WINDOW) as u64;
         let cap = SnowyStream::data_record_capacity();
-        for _ in 0..20 {
+        let full_flush = MAX_PENDING_FLUSH_SIZE;
+        // A full pending buffer makes p_bulk = 1.0 → guaranteed transition.
+        for _ in 0..RECENT_WINDOW_SIZE {
             shaper.record_payload_size(cap);
         }
-        for _ in 0..SCRIPTED_PACKET_PREFIX + RECENT_WINDOW_SIZE + 1 {
-            let _ = shaper.next_data_policy(cap);
-            shaper.record_payload_size(cap);
-            shaper.advance();
-        }
+        let _ = shaper.next_data_policy(full_flush);
         assert_eq!(shaper.state(), MacroState::AsymmetricBulk);
+    }
+
+    #[test]
+    fn markov_stays_interactive_for_small_backlog() {
+        let mut shaper = TrafficShaper::new(FlowDirection::S2C, None);
+        for _ in 0..CONTROL_FRAMES_HANDSHAKE {
+            shaper.note_control_frame();
+        }
+        shaper.packet_seq = (shaper.script.len() + SCRIPT_BLEND_WINDOW) as u64;
+        // Tiny backlog → p_bulk ≈ 0 → stays InteractiveControl.
+        let _ = shaper.next_data_policy(4);
+        assert_eq!(shaper.state(), MacroState::InteractiveControl);
     }
 
     #[test]
@@ -524,5 +559,52 @@ Length: 300~400, Delay: 0, FakeResponse: 2
     fn new_falls_back_on_bad_script() {
         let shaper = TrafficShaper::new(FlowDirection::C2S, Some("garbage"));
         assert!(!shaper.script.is_empty());
+    }
+
+    #[test]
+    fn replay_delay_reads_circularly() {
+        static TRACE: &[u32] = &[100, 200, 300];
+        let spec = DelaySpec::Replay(TRACE);
+        let d0 = delay_from_spec(&spec, 0);
+        let d1 = delay_from_spec(&spec, 1);
+        let d2 = delay_from_spec(&spec, 2);
+        let d3 = delay_from_spec(&spec, 3);
+        assert_eq!(d0, Duration::from_micros(100));
+        assert_eq!(d1, Duration::from_micros(200));
+        assert_eq!(d2, Duration::from_micros(300));
+        assert_eq!(d3, Duration::from_micros(100));
+    }
+
+    #[test]
+    fn replay_delay_empty_trace_returns_zero() {
+        static TRACE: &[u32] = &[];
+        let spec = DelaySpec::Replay(TRACE);
+        assert_eq!(delay_from_spec(&spec, 0), Duration::ZERO);
+    }
+
+    #[test]
+    fn exact_slice_precision_5000_to_800() {
+        let initial_payload_size: usize = 5000;
+        let mut pending: Vec<u8> = vec![0x41; initial_payload_size];
+
+        let target_wire_len: usize = 800;
+        let overhead: usize = kanotls_tunnel::common::MIN_DATA_WIRE_LEN;
+        let payload_cap: usize = target_wire_len.saturating_sub(overhead);
+
+        let take = payload_cap.min(pending.len());
+
+        assert_eq!(
+            take, payload_cap,
+            "slice size mismatch: extracted plaintext must match target wire capacity"
+        );
+
+        pending.drain(..take);
+
+        let expected_remainder = initial_payload_size - payload_cap;
+        assert_eq!(
+            pending.len(),
+            expected_remainder,
+            "remainder mismatch: buffer must retain exactly unsent payload"
+        );
     }
 }

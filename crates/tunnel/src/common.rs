@@ -573,81 +573,31 @@ impl AsyncRead for SnowyStream {
 }
 
 impl AsyncWrite for SnowyStream {
+    /// The bulk AsyncWrite path is permanently sealed. The shaped session
+    /// writer drives `prepare_data_record` / `prepare_control_record` via
+    /// `with_stream`; no autonomous chunking or encryption is performed
+    /// through this trait. Any attempt to write bulk data through
+    /// `poll_write` returns `Unsupported` to guarantee that no bytes
+    /// bypass the TrafficShaper and re-introduce passive-size fingerprints.
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         if !self.state.writable() {
             return Poll::Ready(Ok(0));
         }
-        let this = self.get_mut();
-
-        try_flush_write_buffer(this, cx)?;
-
-        if !this.write_buffer.is_empty() {
-            return Poll::Pending;
-        }
-
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-
-        this.tx_agg_buf.extend_from_slice(buf);
-
-        // Generic AsyncWrite fallback path (not used by the shaped session
-        // writer, which drives `prepare_data_record` directly). Chunking at
-        // BLOCK_DATA_CAPACITY here is a hard record-capacity constraint, not a
-        // shaping decision; each chunk is emitted through the unified
-        // `encrypt_variable_block` primitive.
-        while this.tx_agg_buf.len() >= BLOCK_DATA_CAPACITY {
-            {
-                let data = &this.tx_agg_buf[..BLOCK_DATA_CAPACITY];
-                encrypt_variable_block(
-                    &mut this.noise,
-                    &mut this.write_buffer,
-                    &mut this.encrypt_buf,
-                    data,
-                    BLOCK_PLAINTEXT_SIZE,
-                    PadFill::Entropy,
-                )?;
-            }
-            this.tx_agg_buf.drain(..BLOCK_DATA_CAPACITY);
-        }
-
-        try_flush_write_buffer(this, cx)?;
-
-        Poll::Ready(Ok(buf.len()))
+        Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bulk AsyncWrite path retired; use prepare_data_record / prepare_control_record via with_stream",
+        )))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-
-        try_flush_write_buffer(this, cx)?;
-
-        if !this.write_buffer.is_empty() {
-            return Poll::Pending;
-        }
-
-        if !this.tx_agg_buf.is_empty() {
-            while !this.tx_agg_buf.is_empty() {
-                let data_len = this.tx_agg_buf.len().min(BLOCK_DATA_CAPACITY);
-                let target_plaintext_len =
-                    data_len + BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN;
-                {
-                    let data = &this.tx_agg_buf[..data_len];
-                    encrypt_variable_block(
-                        &mut this.noise,
-                        &mut this.write_buffer,
-                        &mut this.encrypt_buf,
-                        data,
-                        target_plaintext_len,
-                        PadFill::Entropy,
-                    )?;
-                }
-                this.tx_agg_buf.drain(..data_len);
-            }
-        }
 
         try_flush_write_buffer(this, cx)?;
 

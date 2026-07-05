@@ -523,6 +523,16 @@ mod tests {
         record
     }
 
+    fn write_bulk_via_shaper(stream: &mut SnowyStream, payload: &[u8]) {
+        let cap = SnowyStream::data_record_capacity();
+        let target_wire = SnowyStream::max_data_record_wire_len();
+        for chunk in payload.chunks(cap) {
+            stream
+                .prepare_data_record(chunk, target_wire)
+                .expect("prepare_data_record succeeded");
+        }
+    }
+
     fn build_client_flight3_and_upload(
         noise: &mut snow::TransportState,
         upload_payload: &[u8],
@@ -625,7 +635,7 @@ mod tests {
         let mut client_stream = SnowyStream::new(client_tcp, client_noise);
 
         let writer = tokio::spawn(async move {
-            client_stream.write_all(payload).await.unwrap();
+            write_bulk_via_shaper(&mut client_stream, payload);
             client_stream.flush().await.unwrap();
             client_stream.shutdown().await.unwrap();
         });
@@ -740,7 +750,7 @@ mod tests {
         let mut client_stream = SnowyStream::new(client_tcp, client_noise);
 
         let writer = tokio::spawn(async move {
-            client_stream.write_all(&bulk).await.unwrap();
+            write_bulk_via_shaper(&mut client_stream, &bulk);
             client_stream.shutdown().await.unwrap();
         });
 
