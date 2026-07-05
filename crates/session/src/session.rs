@@ -1,8 +1,9 @@
 use crate::frame::{
-    coalesce_encoded_frames, Frame, CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, CMD_SYNACK,
-    MAX_PAYLOAD_LEN,
+    coalesce_encoded_frames, Frame, CMD_FIN, CMD_PADDING, CMD_PSH, CMD_SETTINGS, CMD_SYN,
+    CMD_SYNACK, MAX_PAYLOAD_LEN,
 };
 use crate::stream::{Stream, StreamInit, StreamOpenState, StreamParts};
+use crate::shaper::TrafficShaper;
 use bytes::BytesMut;
 use kanotls_tunnel::{FlowDirection, SnowyStream};
 use std::collections::{HashMap, HashSet};
@@ -166,6 +167,7 @@ pub struct SessionConfig {
     pub is_client: bool,
     pub max_streams_per_session: usize,
     pub idle_timeout_secs: u64,
+    pub traffic_script: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -228,6 +230,7 @@ impl Session {
             close_notify.clone(),
             activity.clone(),
             config.is_client,
+            config.traffic_script.as_deref(),
         ));
         let idle_timeout_with_jitter_secs = {
             let base = config.idle_timeout_secs.max(1);
@@ -843,6 +846,36 @@ impl Session {
                     String::from_utf8_lossy(&frame.payload)
                 );
             }
+            CMD_PADDING => {
+                let flag = frame.payload.first().copied().unwrap_or(0);
+                if flag == 0 {
+                    let m = frame.payload.get(1).copied().unwrap_or(1).max(1);
+                    let total_junk = frame.payload.len().saturating_sub(2).max(32);
+                    for i in 0..m {
+                        let step = (i as usize).saturating_mul(41) % 192;
+                        let junk_len = total_junk.min(48 + step);
+                        let reply = Frame::padding_reply(junk_len);
+                        let encoded = match reply.encode() {
+                            Ok(e) => e,
+                            Err(e) => {
+                                warn!("failed to encode CMD_PADDING reply: {}", e);
+                                break;
+                            }
+                        };
+                        if let Err(e) = self
+                            .write_encoded_payload(
+                                &encoded,
+                                FlushBehavior::Immediate,
+                                TrafficClass::Control,
+                            )
+                            .await
+                        {
+                            warn!("failed to send CMD_PADDING reply: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
             _ => {
                 warn!("unknown frame cmd: {}", frame.cmd);
             }
@@ -1130,6 +1163,7 @@ impl SessionWriter {
         close_notify: Arc<Notify>,
         activity: Arc<ActivityTracker>,
         is_client: bool,
+        traffic_script: Option<&str>,
     ) -> Self {
         let direction = if is_client {
             FlowDirection::C2S
@@ -1141,6 +1175,8 @@ impl SessionWriter {
         let run_close_requested = close_requested.clone();
         let run_close_notify = close_notify.clone();
         let run_activity = activity.clone();
+        let run_direction = direction;
+        let script_owned = traffic_script.map(|s| s.to_string());
         tokio::spawn(async move {
             Self::run(
                 write_half,
@@ -1149,7 +1185,8 @@ impl SessionWriter {
                 run_close_requested,
                 run_close_notify,
                 run_activity,
-                direction,
+                run_direction,
+                script_owned,
             )
             .await;
         });
@@ -1236,9 +1273,11 @@ impl SessionWriter {
         close_notify: Arc<Notify>,
         activity: Arc<ActivityTracker>,
         direction: FlowDirection,
+        traffic_script: Option<String>,
     ) {
         let mut pending: Vec<u8> = Vec::with_capacity(65536);
         let mut responders: Vec<oneshot::Sender<Result<(), String>>> = Vec::new();
+        let mut shaper = TrafficShaper::new(direction, traffic_script.as_deref());
 
         loop {
             if close_requested.load(Ordering::Relaxed) {
@@ -1264,8 +1303,9 @@ impl SessionWriter {
                     }
 
                     if !pending.is_empty() {
-                        match Self::emit_pending(&mut pending, &mut write_half, &activity).await {
-                            Ok(()) => {
+                        match Self::drive_shaper(&mut pending, &mut shaper, &mut write_half, &activity).await {
+                            Ok(fake_frames) => {
+                                let _ = Self::emit_fake_frames(&mut write_half, direction, &fake_frames).await;
                                 for responder in responders.drain(..) {
                                     let _ = responder.send(Ok(()));
                                 }
@@ -1294,6 +1334,7 @@ impl SessionWriter {
                                 if let Err(e) = stream.prepare_control_record(packet, size) {
                                     return Err(e.to_string());
                                 }
+                                shaper.note_control_frame();
                             }
                             Ok(())
                         });
@@ -1334,8 +1375,9 @@ impl SessionWriter {
                     if request.flush == FlushBehavior::Immediate
                         || pending.len() >= MAX_PENDING_FLUSH_SIZE
                     {
-                        match Self::emit_pending(&mut pending, &mut write_half, &activity).await {
-                            Ok(()) => {
+                        match Self::drive_shaper(&mut pending, &mut shaper, &mut write_half, &activity).await {
+                            Ok(fake_frames) => {
+                                let _ = Self::emit_fake_frames(&mut write_half, direction, &fake_frames).await;
                                 for responder in responders.drain(..) {
                                     let _ = responder.send(Ok(()));
                                 }
@@ -1351,12 +1393,17 @@ impl SessionWriter {
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(LAZY_FLUSH_MS)), if !pending.is_empty() => {
-                    if let Err(e) = Self::emit_pending(&mut pending, &mut write_half, &activity).await {
-                        let msg = e.to_string();
-                        for responder in responders.drain(..) {
-                            let _ = responder.send(Err(msg.clone()));
+                    match Self::drive_shaper(&mut pending, &mut shaper, &mut write_half, &activity).await {
+                        Ok(fake_frames) => {
+                            let _ = Self::emit_fake_frames(&mut write_half, direction, &fake_frames).await;
                         }
-                        break;
+                        Err(e) => {
+                            let msg = e.to_string();
+                            for responder in responders.drain(..) {
+                                let _ = responder.send(Err(msg.clone()));
+                            }
+                            break;
+                        }
                     }
                     for responder in responders.drain(..) {
                         let _ = responder.send(Ok(()));
@@ -1366,23 +1413,94 @@ impl SessionWriter {
         }
 
         if !pending.is_empty() {
-            let _ = Self::emit_pending(&mut pending, &mut write_half, &activity).await;
+            let _ = Self::drive_shaper(&mut pending, &mut shaper, &mut write_half, &activity).await;
         }
         let _ = write_half.shutdown().await;
     }
 
-    async fn emit_pending(
+    /// Drain the plaintext backlog into individually-sized 0x17 records, each
+    /// with an on-wire length dictated by the `TrafficShaper`. Unlike the old
+    /// `write_all(pending)` dump, plaintext length never maps to wire size:
+    /// oversized backlogs are sliced, sub-target backlogs are emitted at their
+    /// shaper-chosen size. Each record is flushed before the next is prepared,
+    /// bounding the encrypt buffer to a single record for memory safety.
+    ///
+    /// Returns any CMD_PADDING fake-response frames queued by script rules;
+    /// the caller must emit them on the control path before responding to
+    /// callers.
+    async fn drive_shaper(
         pending: &mut Vec<u8>,
+        shaper: &mut TrafficShaper,
         write_half: &mut SplitWriteHalf,
         activity: &ActivityTracker,
-    ) -> std::io::Result<()> {
-        if !pending.is_empty() {
-            write_half.write_all(pending).await?;
-            pending.clear();
+    ) -> std::io::Result<Vec<Vec<u8>>> {
+        let mut fake_frames = Vec::new();
+        let mut consumed = 0usize;
+
+        loop {
+            if consumed >= pending.len() {
+                break;
+            }
+            let remaining = pending.len() - consumed;
+            let policy = shaper.next_data_policy(remaining);
+            let overhead = kanotls_tunnel::common::MIN_DATA_WIRE_LEN;
+            let payload_cap = policy
+                .target_wire_len
+                .saturating_sub(overhead)
+                .min(SnowyStream::data_record_capacity());
+            let take = payload_cap.min(remaining);
+
+            let prepared = {
+                let slice = &pending[consumed..consumed + take];
+                write_half.with_stream(|stream| {
+                    stream.prepare_data_record(slice, policy.target_wire_len)
+                })
+            };
+            prepared?;
+
+            consumed += take;
+            shaper.record_payload_size(take);
+            shaper.advance();
+
+            write_half.flush().await?;
+
+            if let Some(fake) = &policy.fake {
+                let frame = Frame::padding_request(fake.responses);
+                fake_frames.push(
+                    frame
+                        .encode()
+                        .map_err(|e| std::io::Error::other(format!("fake frame encode: {}", e)))?,
+                );
+            }
+
+            if policy.delay > Duration::ZERO {
+                tokio::time::sleep(policy.delay).await;
+            }
         }
-        write_half.flush().await?;
+
+        pending.clear();
         activity.record_write_activity();
-        Ok(())
+        Ok(fake_frames)
+    }
+
+    /// Emit fake-response control frames generated by the shaper.
+    async fn emit_fake_frames(
+        write_half: &mut SplitWriteHalf,
+        direction: FlowDirection,
+        frames: &[Vec<u8>],
+    ) -> std::io::Result<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        write_half.with_stream(|stream| {
+            let state = stream.control_state();
+            for packet in frames {
+                let size = stream.next_control_size(state, direction);
+                stream.prepare_control_record(packet, size)?;
+            }
+            std::io::Result::Ok(())
+        })?;
+        write_half.flush().await
     }
 }
 

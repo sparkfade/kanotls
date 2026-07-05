@@ -32,6 +32,10 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
 
     validate_client_routing_runtime(&config)?;
 
+    // Eagerly materialize the shared high-entropy noise pool so the first
+    // shaped record does not pay the 8 MiB CSPRNG fill on the hot path.
+    kanotls_tunnel::init_entropy_pool();
+
     let outbound = &config.outbounds[0];
     let server_addr = format!("{}:{}", outbound.settings.server, outbound.settings.port);
     let sni = outbound.settings.tls.sni.clone();
@@ -101,8 +105,13 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
         .unwrap_or(45)
         .clamp(MIN_CLIENT_IDLE_TIMEOUT_SECS, MAX_CLIENT_IDLE_TIMEOUT_SECS);
     let install_salt: [u8; 16] = rand::random();
+    let traffic_script = outbound
+        .settings
+        .session
+        .as_ref()
+        .and_then(|s| s.traffic_script.clone());
     let pool = Arc::new(ClientPool::new(
-        SessionConfig::with_limits(true, max_streams_per_session, idle_timeout_secs),
+        SessionConfig::with_script(true, max_streams_per_session, idle_timeout_secs, traffic_script),
         ClientPoolConnectOptions {
             server_addr: server_addr.clone(),
             sni: sni.clone(),

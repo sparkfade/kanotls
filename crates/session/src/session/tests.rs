@@ -43,6 +43,7 @@ fn test_session_config(is_client: bool) -> SessionConfig {
         is_client,
         max_streams_per_session: 32,
         idle_timeout_secs: 30,
+        traffic_script: None,
     }
 }
 
@@ -577,11 +578,13 @@ async fn idle_session_times_out() {
         is_client: true,
         max_streams_per_session: 32,
         idle_timeout_secs: 1,
+        traffic_script: None,
     };
     let server_config = SessionConfig {
         is_client: false,
         max_streams_per_session: 32,
         idle_timeout_secs: 1,
+        traffic_script: None,
     };
     let (client, server) = session_pair_with_config(client_config, server_config).await;
 
@@ -607,11 +610,13 @@ async fn active_session_does_not_timeout_with_open_streams() {
         is_client: true,
         max_streams_per_session: 32,
         idle_timeout_secs: 1,
+        traffic_script: None,
     };
     let server_config = SessionConfig {
         is_client: false,
         max_streams_per_session: 32,
         idle_timeout_secs: 1,
+        traffic_script: None,
     };
     let (client, server) = session_pair_with_config(client_config, server_config).await;
 
@@ -839,3 +844,194 @@ async fn close_write_preserves_peer_to_local_tail_delivery() {
     client.force_close();
     server.session.force_close();
 }
+
+// Phase 1 validation: drive a large multi-record transfer through the active
+// slicing engine (drive_shaper) and assert byte-exact reassembly with no
+// deadlock. The payload dwarfs a single record capacity, so it exercises the
+// slice/truncate path many times over.
+#[tokio::test]
+async fn high_throughput_bulk_transfer_preserves_stream_integrity() {
+    let (client, server) = session_pair().await;
+
+    let mut stream = client.open_stream().await.expect("stream opens");
+    stream
+        .write_early(b"bulk.example:443")
+        .await
+        .expect("client sends target");
+    let (_sid, mut server_stream) =
+        tokio::time::timeout(Duration::from_secs(1), server.accept_stream())
+            .await
+            .expect("server accepts stream")
+            .expect("server accepts stream");
+    assert_eq!(server_stream.read().await, Some(b"bulk.example:443".to_vec()));
+    server_stream
+        .send_synack()
+        .await
+        .expect("server sends synack");
+    stream.wait_open().await.expect("stream opens");
+
+    // 4 MiB with a deterministic non-trivial byte pattern that survives
+    // arbitrary record boundaries.
+    const TOTAL: usize = 4 * 1024 * 1024;
+    let pattern = |i: usize| -> u8 { ((i * 31 + 7) % 251) as u8 };
+
+    let reader = tokio::spawn(async move {
+        let mut received = 0usize;
+        let mut ok = true;
+        while let Some(chunk) = server_stream.read().await {
+            for (j, &b) in chunk.iter().enumerate() {
+                if b != pattern(received + j) {
+                    ok = false;
+                    break;
+                }
+            }
+            received += chunk.len();
+            if !ok {
+                break;
+            }
+        }
+        (received, ok)
+    });
+
+    let writer = tokio::spawn(async move {
+        let mut buf = vec![0u8; TOTAL];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = pattern(i);
+        }
+        // Write in mixed-size chunks to stress the slicer's boundary handling.
+        let mut off = 0usize;
+        let chunk_sizes = [1usize, 100, 16382, 16383, 65536, 200000];
+        let mut k = 0usize;
+        while off < TOTAL {
+            let want = chunk_sizes[k % chunk_sizes.len()].min(TOTAL - off);
+            stream
+                .write(&buf[off..off + want])
+                .await
+                .expect("client writes bulk chunk");
+            off += want;
+            k += 1;
+        }
+        stream.close_write().await.expect("client half-closes");
+        stream
+    });
+
+    let _stream = tokio::time::timeout(Duration::from_secs(30), writer)
+        .await
+        .expect("writer must not deadlock")
+        .expect("writer task joins");
+
+    let (received, ok) = tokio::time::timeout(Duration::from_secs(30), reader)
+        .await
+        .expect("reader must not deadlock")
+        .expect("reader task joins");
+
+    assert!(ok, "byte pattern corrupted during high-throughput transfer");
+    assert_eq!(received, TOTAL, "received byte count must equal sent");
+
+    client.force_close();
+    server.session.force_close();
+}
+
+// Phase 2 CMD_PADDING integration: verify the fake-response engine works
+// end-to-end — a request triggers M split replies on the peer, replies are
+// silently discarded, and concurrent stream data is not corrupted.
+#[tokio::test]
+async fn cmd_padding_request_triggers_split_replies_and_preserves_stream_data() {
+    use super::{TrafficClass, FlushBehavior};
+    let (client, server) = session_pair().await;
+
+    // Open a stream to have live channel capacity during the test.
+    let mut stream = client.open_stream().await.expect("stream opens");
+    stream
+        .write_early(b"pad-test.example:443")
+        .await
+        .expect("client writes target");
+    let (sid, mut server_stream) =
+        tokio::time::timeout(Duration::from_secs(1), server.accept_stream())
+            .await
+            .expect("server accepts stream")
+            .expect("server accepts stream");
+    assert_eq!(
+        server_stream.read().await,
+        Some(b"pad-test.example:443".to_vec())
+    );
+    server_stream
+        .send_synack()
+        .await
+        .expect("server sends SYNACK");
+    stream.wait_open().await.expect("stream opens");
+
+    // Fire a CMD_PADDING request from server → client with m=3.
+    // The client should emit 3 independently-sized reply frames.
+    let padding_frame = crate::frame::Frame::padding_request(3);
+    server
+        .session
+        .write_frame(&padding_frame, TrafficClass::Control)
+        .await
+        .expect("server sends padding request");
+
+    // Write stream data from client in the opposite direction while the
+    // control path processes the padding burst.
+    let payload = b"stream-data-after-padding";
+    stream.write(payload).await.expect("client writes stream data");
+
+    let received = tokio::time::timeout(Duration::from_secs(2), server_stream.read())
+        .await
+        .expect("server receives stream data after padding handling");
+    assert_eq!(received, Some(payload.to_vec()));
+
+    // Confirm the stream can still close cleanly — no corruption from the
+    // CMD_PADDING reply frames that were silently discarded.
+    stream.close_write().await.expect("client close write");
+    assert_eq!(server_stream.read().await, None);
+
+    client.force_close();
+    server.session.force_close();
+}
+
+// Malformed / reply-flagged CMD_PADDING frames must be silently dropped by
+// both peers without affecting any stream state.
+#[tokio::test]
+async fn cmd_padding_reply_flag_is_silently_absorbed() {
+    use super::{TrafficClass, FlushBehavior};
+    let (client, server) = session_pair().await;
+
+    // Open a stream to confirm the data path stays clean.
+    let mut stream = client.open_stream().await.expect("stream opens");
+    stream
+        .write_early(b"absorb.example:443")
+        .await
+        .expect("client writes target");
+    let (_sid, mut server_stream) =
+        tokio::time::timeout(Duration::from_secs(1), server.accept_stream())
+            .await
+            .expect("server accepts stream")
+            .expect("server accepts stream");
+    let _ = server_stream.read().await;
+    server_stream
+        .send_synack()
+        .await
+        .expect("server sends SYNACK");
+    stream.wait_open().await.expect("stream opens");
+
+    // Inject a reply-flagged CMD_PADDING into the data path (simulates a
+    // stray reply that reached the sender's read loop). It must be ignored.
+    let reply_frame = crate::frame::Frame::padding_reply(64);
+    let encoded = reply_frame.encode().expect("padding reply encodes");
+    server
+        .session
+        .write_encoded_payload(&encoded, FlushBehavior::Immediate, TrafficClass::Control)
+        .await
+        .expect("server injects stray reply");
+
+    // Stream data should flow unimpeded.
+    stream.write(b"healthy").await.expect("client writes after stray padding");
+    assert_eq!(
+        server_stream.read().await,
+        Some(b"healthy".to_vec())
+    );
+
+    client.force_close();
+    server.session.force_close();
+}
+

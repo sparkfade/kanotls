@@ -148,6 +148,8 @@ pub struct SessionConfig {
     pub max_streams_per_session: usize,
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
+    #[serde(default)]
+    pub traffic_script: Option<String>,
 }
 
 fn default_max_streams_per_session() -> usize {
@@ -163,6 +165,7 @@ impl Default for SessionConfig {
         Self {
             max_streams_per_session: default_max_streams_per_session(),
             idle_timeout_secs: default_idle_timeout(),
+            traffic_script: None,
         }
     }
 }

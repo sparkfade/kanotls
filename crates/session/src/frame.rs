@@ -8,6 +8,7 @@ pub const CMD_PSH: u8 = 0x02;
 pub const CMD_FIN: u8 = 0x03;
 pub const CMD_SETTINGS: u8 = 0x04;
 pub const CMD_SYNACK: u8 = 0x07;
+pub const CMD_PADDING: u8 = 0x08;
 
 #[derive(Debug, Clone)]
 pub struct Frame {
@@ -39,6 +40,27 @@ impl Frame {
 
     pub fn fin(stream_id: u32) -> Self {
         Self::new(CMD_FIN, stream_id, vec![])
+    }
+
+    /// Build a CMD_PADDING request frame. `m` dictates how many reply chunks
+    /// the receiver must emit. Junk payload is filled from the entropy pool.
+    pub fn padding_request(m: u8) -> Self {
+        let junk_len = 32 + (m as usize).saturating_mul(16).min(192);
+        let mut payload = vec![0u8; junk_len + 2];
+        payload[0] = 0u8;
+        payload[1] = m;
+        kanotls_tunnel::fill_from_pool(&mut payload[2..]);
+        Self::new(CMD_PADDING, 0, payload)
+    }
+
+    /// Build a CMD_PADDING reply frame. Junk payload from the entropy pool.
+    pub fn padding_reply(junk_len: usize) -> Self {
+        let len = junk_len.max(16);
+        let mut payload = vec![0u8; len + 2];
+        payload[0] = 1u8;
+        payload[1] = 0u8;
+        kanotls_tunnel::fill_from_pool(&mut payload[2..]);
+        Self::new(CMD_PADDING, 0, payload)
     }
 
     pub fn encode(&self) -> anyhow::Result<Vec<u8>> {

@@ -1,11 +1,10 @@
 use lazy_static::lazy_static;
 use lru::LruCache;
 use rand::Rng;
-use rand::RngCore;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -44,18 +43,6 @@ pub(super) const TLS12_DOWNGRADE_SENTINEL: [u8; 8] =
     [0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x01];
 pub(super) const TLS11_DOWNGRADE_SENTINEL: [u8; 8] =
     [0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x00];
-
-pub(super) const ENTROPY_POOL_SIZE: usize = 8 * 1024 * 1024;
-
-pub(super) static ENTROPY_POOL: OnceLock<Vec<u8>> = OnceLock::new();
-
-pub fn init_entropy_pool() {
-    ENTROPY_POOL.get_or_init(|| {
-        let mut pool = vec![0u8; ENTROPY_POOL_SIZE];
-        rand::thread_rng().fill_bytes(&mut pool);
-        pool
-    });
-}
 
 lazy_static! {
     pub(super) static ref CAMOUFLAGE_PROFILES: tokio::sync::Mutex<LruCache<String, CamouflageProfilePool>> =
@@ -681,7 +668,7 @@ pub(super) async fn establish_synthetic_camouflage_tunnel(
     }
     patch_server_hello_random(&mut patched_server_records);
 
-    let pool = ENTROPY_POOL.get().expect("entropy pool not initialized");
+    let pool = crate::entropy::entropy_pool();
     let pool_len = pool.len();
     let mut entropy_offset = rand::thread_rng().gen_range(0..pool_len);
 
