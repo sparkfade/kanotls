@@ -937,7 +937,7 @@ async fn high_throughput_bulk_transfer_preserves_stream_integrity() {
 // silently discarded, and concurrent stream data is not corrupted.
 #[tokio::test]
 async fn cmd_padding_request_triggers_split_replies_and_preserves_stream_data() {
-    use super::{TrafficClass, FlushBehavior};
+    use super::TrafficClass;
     let (client, server) = session_pair().await;
 
     // Open a stream to have live channel capacity during the test.
@@ -946,7 +946,7 @@ async fn cmd_padding_request_triggers_split_replies_and_preserves_stream_data() 
         .write_early(b"pad-test.example:443")
         .await
         .expect("client writes target");
-    let (sid, mut server_stream) =
+    let (_sid, mut server_stream) =
         tokio::time::timeout(Duration::from_secs(1), server.accept_stream())
             .await
             .expect("server accepts stream")

@@ -1265,6 +1265,7 @@ impl SessionWriter {
         .map_err(|err| anyhow::anyhow!("failed to queue session write: {}", err))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         mut write_half: SplitWriteHalf,
         mut control_rx: mpsc::Receiver<WriteRequest>,
@@ -1276,7 +1277,9 @@ impl SessionWriter {
         traffic_script: Option<String>,
     ) {
         let mut pending: Vec<u8> = Vec::with_capacity(65536);
-        let mut responders: Vec<oneshot::Sender<Result<(), String>>> = Vec::new();
+        let mut responders: Vec<(usize, oneshot::Sender<Result<(), String>>)> = Vec::new();
+        let mut total_queued: usize = 0;
+        let mut total_emitted: usize = 0;
         let mut shaper = TrafficShaper::new(direction, traffic_script.as_deref());
 
         loop {
@@ -1295,7 +1298,7 @@ impl SessionWriter {
 
                     if close_requested.load(Ordering::Relaxed) {
                         let msg = "session writer closed".to_string();
-                        for responder in responders {
+                        for (_, responder) in responders.drain(..) {
                             let _ = responder.send(Err(msg.clone()));
                         }
                         let _ = request.response_tx.send(Err(msg));
@@ -1304,15 +1307,17 @@ impl SessionWriter {
 
                     if !pending.is_empty() {
                         match Self::drive_shaper(&mut pending, &mut shaper, &mut write_half, &activity).await {
-                            Ok(fake_frames) => {
+                            Ok((fake_frames, consumed)) => {
+                                total_emitted += consumed;
                                 let _ = Self::emit_fake_frames(&mut write_half, direction, &fake_frames).await;
-                                for responder in responders.drain(..) {
-                                    let _ = responder.send(Ok(()));
+                                while !responders.is_empty() && responders[0].0 <= total_emitted {
+                                    let (_, tx) = responders.remove(0);
+                                    let _ = tx.send(Ok(()));
                                 }
                             }
                             Err(e) => {
                                 let msg = e.to_string();
-                                for responder in responders.drain(..) {
+                                for (_, responder) in responders.drain(..) {
                                     let _ = responder.send(Err(msg.clone()));
                                 }
                                 let _ = request.response_tx.send(Err(msg));
@@ -1360,31 +1365,35 @@ impl SessionWriter {
 
                     if close_requested.load(Ordering::Relaxed) {
                         let msg = "session writer closed".to_string();
-                        for responder in responders {
+                        for (_, responder) in responders.drain(..) {
                             let _ = responder.send(Err(msg.clone()));
                         }
                         let _ = request.response_tx.send(Err(msg));
                         break;
                     }
 
+                    let bytes_added: usize = request.packets.iter().map(|p| p.len()).sum();
                     for packet in &request.packets {
                         pending.extend_from_slice(packet);
                     }
-                    responders.push(request.response_tx);
+                    total_queued += bytes_added;
+                    responders.push((total_queued, request.response_tx));
 
                     if request.flush == FlushBehavior::Immediate
                         || pending.len() >= MAX_PENDING_FLUSH_SIZE
                     {
                         match Self::drive_shaper(&mut pending, &mut shaper, &mut write_half, &activity).await {
-                            Ok(fake_frames) => {
+                            Ok((fake_frames, consumed)) => {
+                                total_emitted += consumed;
                                 let _ = Self::emit_fake_frames(&mut write_half, direction, &fake_frames).await;
-                                for responder in responders.drain(..) {
-                                    let _ = responder.send(Ok(()));
+                                while !responders.is_empty() && responders[0].0 <= total_emitted {
+                                    let (_, tx) = responders.remove(0);
+                                    let _ = tx.send(Ok(()));
                                 }
                             }
                             Err(e) => {
                                 let msg = e.to_string();
-                                for responder in responders.drain(..) {
+                                for (_, responder) in responders.drain(..) {
                                     let _ = responder.send(Err(msg.clone()));
                                 }
                                 break;
@@ -1394,19 +1403,21 @@ impl SessionWriter {
                 }
                 _ = tokio::time::sleep(Duration::from_millis(LAZY_FLUSH_MS)), if !pending.is_empty() => {
                     match Self::drive_shaper(&mut pending, &mut shaper, &mut write_half, &activity).await {
-                        Ok(fake_frames) => {
+                        Ok((fake_frames, consumed)) => {
+                            total_emitted += consumed;
                             let _ = Self::emit_fake_frames(&mut write_half, direction, &fake_frames).await;
                         }
                         Err(e) => {
                             let msg = e.to_string();
-                            for responder in responders.drain(..) {
+                            for (_, responder) in responders.drain(..) {
                                 let _ = responder.send(Err(msg.clone()));
                             }
                             break;
                         }
                     }
-                    for responder in responders.drain(..) {
-                        let _ = responder.send(Ok(()));
+                    while !responders.is_empty() && responders[0].0 <= total_emitted {
+                        let (_, tx) = responders.remove(0);
+                        let _ = tx.send(Ok(()));
                     }
                 }
             }
@@ -1414,6 +1425,9 @@ impl SessionWriter {
 
         if !pending.is_empty() {
             let _ = Self::drive_shaper(&mut pending, &mut shaper, &mut write_half, &activity).await;
+            for (_, tx) in responders.drain(..) {
+                let _ = tx.send(Ok(()));
+            }
         }
         let _ = write_half.shutdown().await;
     }
@@ -1433,7 +1447,7 @@ impl SessionWriter {
         shaper: &mut TrafficShaper,
         write_half: &mut SplitWriteHalf,
         activity: &ActivityTracker,
-    ) -> std::io::Result<Vec<Vec<u8>>> {
+    ) -> std::io::Result<(Vec<Vec<u8>>, usize)> {
         let mut fake_frames = Vec::new();
         let mut consumed = 0usize;
 
@@ -1478,9 +1492,10 @@ impl SessionWriter {
             }
         }
 
+        let total_consumed = consumed;
         pending.clear();
         activity.record_write_activity();
-        Ok(fake_frames)
+        Ok((fake_frames, total_consumed))
     }
 
     /// Emit fake-response control frames generated by the shaper.
