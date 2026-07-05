@@ -81,54 +81,109 @@ A daemon per (host, port) pair refreshes the profile every 300–3000 seconds (r
 
 ---
 
-## 3. Data-Stream Bimodal Distribution
+## 3. Active Traffic Shaping
 
-### 3.1 Bulk Class
+### 3.1 Design Rationale
 
-Large data writes (> 16382 bytes of application payload) are split into full TLS records:
-
-- **Plaintext**: `[length_prefix(2B, BE) | data(16382B) | inner_content_type(1B, 0x17)]` = 16385 bytes
-- **Ciphertext** (ChaChaPoly): 16385 + 16 = 16401 bytes
-- **Wire record**: 5 (header) + 16401 = **16406 bytes**
-
-When `poll_flush()` drains remaining data (0 < n ≤ 16382 bytes), `encrypt_padded_block()` applies **jittered padding**: with 80% probability, exponential-distribution padding (λ = 0.050295, CDF(32) ≈ 0.80) capped at 32 bytes is used; with 20% probability, the block is padded to the full 16385-byte plaintext. This produces a natural spread of tail record wire sizes (n + 24 to 16406) that avoids the identifiable exact-truncation or fixed-full-block signatures.
+The original bimodal distribution (§3.1–3.4 in v1.0) passively split application payloads at `BLOCK_DATA_CAPACITY` (16382) boundaries and applied probabilistic tail padding. This mapped the inner-TLS plaintext size directly onto the wire record length, exposing structural signatures (e.g., a 5000-byte certificate would produce 16382 + 16382 + 1236 = three records whose sizes leak the inner handshake shape). v1.1 replaces this with a **top-down active TrafficShaper** that dictates every record's on-wire length independently of the application payload — plaintext length never maps to wire length.
 
 ### 3.2 Control Class
 
-Micro-frames (CMD_SYN, CMD_FIN) use `encrypt_variable_block()`. Control record wire sizes are determined by a **state-aware sampler** in `control_size`:
+Protocol frames (CMD_SYN, CMD_FIN, CMD_SETTINGS, CMD_SYNACK, CMD_PADDING) use `encrypt_variable_block(PadFill::Zero)`. Their wire sizes are determined by a **state-aware sampler** in `control_size`:
 
 - **Handshake state** (first 6 control frames): 7 discrete sizes (33, 37, 46, 51, 64, 69, 82) mimicking HTTP/2 SETTINGS, SETTINGS_ACK, WINDOW_UPDATE, and merged variants. 5% of frames additionally sample from a truncated-normal HEADERS frame distribution (C2S: μ=450, σ=120, [250, 800]; S2C: μ=200, σ=50, [100, 400]).
 - **Transport state** (6+ control frames): 5 discrete sizes (33, 37, 41, 46, 54) mimicking PING, WINDOW_UPDATE, SETTINGS_ACK, and merged variants (no SETTINGS sizes). 10% of frames sample from the same HEADERS frame distribution.
 
-`FlowDirection` (C2S vs S2C) selects the parameters for the HEADERS-frame truncated-normal sampler, producing directionally distinct distributions.
+Each control record increments the TrafficShaper's internal control-frame counter (`note_control_frame()`), which governs the handshake-to-transport transition used by the shaper's Markov machine (§3.4).
 
-Control records take priority: any accumulated bulk data in `tx_agg_buf` is flushed first (as exact-size padded blocks), then the control record is emitted.
+### 3.3 TrafficShaper Architecture
 
-### 3.3 Entropy Sources
+The `TrafficShaper` (per-connection, owned by `SessionWriter::run`) intercepts all application-data (PSH) writes. Instead of the old `write_half.write_all(pending)` that dumped the full plaintext backlog through `SnowyStream::poll_write`'s passive chunking, a new `drive_shaper` loop operates:
 
-| Padding location | Source |
-|---|---|
-| Ghost record payloads (server) | `ENTROPY_POOL` — 8 MiB pre-seeded `thread_rng` bytes, circular read |
-| Ghost record structure header | Hardcoded 16-byte fake ticket header `[0x22, 0x00, ...]` |
-| `encrypt_variable_block()` tail | Zero bytes, with last byte = `0x17` (inner content type) |
-| `encrypt_full_block()` tail | Last byte = `0x17` (inner content type), no other unused space |
+1. **Policy query**: `shaper.next_data_policy(pending_len)` returns a `ShapePolicy { target_wire_len, delay, fake, allow_full_block }`.
+2. **Slice / truncate**: if `pending` exceeds the payload capacity implied by `target_wire_len`, only that many bytes are taken; the remainder stays in `pending` for subsequent iterations. E.g. 5000 bytes of backlog against an 800-byte target → one 800-byte record emitted, 4200 bytes retained.
+3. **Precise pad**: if `pending` is smaller than the target capacity, the record is emitted at the exact `target_wire_len` with noise-pool padding.
+4. **Encrypt**: `SnowyStream::prepare_data_record(slice, target_wire_len, PadFill::Entropy)` encrypts exactly one record whose on-wire size equals `target_wire_len`.
+5. **Flush** + **delay** + **advance**: the record is flushed, `tokio::time::sleep(delay)` injected if non-zero, then the shaper's packet sequence number and Markov state advance.
+6. **Fake response**: if the policy carries `fake`, a `CMD_PADDING` request frame is queued on the control path before the next slice.
 
-### 3.4 Post-Handshake Wire Record Size Reference
+This erases the passive trace: the same application write produces different record boundaries depending solely on the shaper's policy, not on the inner payload structure.
 
-Every record on the wire after the TLS handshake is a 0x17 (Application Data) record with a 5-byte header (`| 0x17 | 0x03 | 0x03 | len(u16 BE) |`) followed by Noise-encrypted ciphertext. Internally, each plaintext carries a 2-byte length prefix, the payload bytes, optional zero padding, and a 1-byte inner content type (`0x17` for app data, `0x15` for alert) — matching the TLS 1.3 `TLSInnerPlaintext` structure.
+### 3.4 Markov Macro-State Machine
 
-| Record Type | Plaintext Formula | Ciphertext (= plain + 16) | Wire Size (= 5 + cipher) | Example (n bytes data) |
-|---|---|---|---|---|
-| Full bulk block | `2 + 16382 + 1 = 16385` | 16401 | **16406** | n = 16382 → 16406 |
-| Tail bulk (jittered) | `2 + n + 1` + padding to 16385 | plain + 16 | **n + 24** to **16406** | n = 866 → ~890–16406 |
-| Control frame | `2 + payload` + zero-pad + 1B ICT to target | target + 16 | discrete 33-82 or 124-824 (see §3.2) | CMD_SYN (7B): 69 |
-| Flight3 CCS | — | — | **6** (unencrypted) | — |
-| Flight3 Finished ghost | 37 | 53 | **58** | — |
-| Flight3 H2 ghost | 65 / 71 / 77 | 81 / 87 / 93 | **86 / 92 / 98** | context-hash selects variant |
-| Close notify alert | 3 (`[01 00 15]`) | 19 | **24** | — |
-| Ghost record (server) | size from camouflage cache | size + 16 | **5 + cache_size** | first 16B = fake ticket header |
+The shaper maintains three macro-states that govern sizing policy over the connection's full lifecycle (no hard "first-N-packet" cliff):
 
-Tail bulk records use jittered padding — 80% carry at most 32 bytes of padding (exponential distribution), while 20% are padded to the full block size of 16406 bytes.
+| State | Sizing | Delay | Description |
+|---|---|---|---|
+| `HandshakeShaping` | Min-size (exact payload fit) | None | Active during the Noise handshake phase; tight coupling to avoid interference with auth framing. |
+| `InteractiveControl` | Sampled from HTTP/2 discrete + HEADERS distributions (reuses `control_size`) | 15% chance Log-Normal IAT | Mimics web-application request/response patterns with variable-sized records. |
+| `AsymmetricBulk` | Full MTU-anchored records (`max_data_record_wire_len` ≈ 16406) | None | Sustained high-throughput transfers; removes fragmentation caps to anchor sizes to realistic web-framing boundaries. |
+
+**Transition logic**: state is re-evaluated per emitted packet using a sliding window of recent payload sizes (`RECENT_WINDOW_SIZE = 8`):
+- `InteractiveControl → AsymmetricBulk`: at least `BULK_ENTRY_THRESHOLD` (3) of the last 8 payloads are full-capacity — indicating a sustained large transfer.
+- `AsymmetricBulk → InteractiveControl`: at least `BULK_EXIT_THRESHOLD` (6) of the last 8 payloads are small — transfer is winding down.
+- `HandshakeShaping →`: After ≥6 control frames (handshake complete), the shaper enters `InteractiveControl` (if scripted prefix still active, script rules govern instead).
+
+### 3.5 Restls-Style Script Engine
+
+The script engine provides deterministic control over the first 12 post-handshake data packets (`SCRIPTED_PACKET_PREFIX`). Each rule defines:
+
+```
+ScriptRule { len_lo, len_hi, delay: DelaySpec, expect_responses: u8 }
+```
+
+- `len_lo..=len_hi`: the record's **application-content size** (used to compute `target_wire_len`), sampled uniformly — **decoupled from the real pending payload size**.
+- `delay` (`DelaySpec::None` or `DelaySpec::LogNormal{mu,sigma}`): inter-record delay sampled from a fitted log-normal distribution.
+- `expect_responses`: if >0, a `CMD_PADDING` request frame is emitted after this data record, demanding M split replies from the peer.
+
+Scripts are sourced from an embedded default (6 rules), overridable via the `traffic_script` config field (§8). The script parser supports comments (`#`) and blank lines. Config validation parse-checks each line at startup and emits a non-fatal warning on malformed rules (the embedded default is used as fallback).
+
+Format example:
+```
+Length: 200~250, Delay: 0, FakeResponse: 0
+Length: 300~400, Delay: 1.5~0.5, FakeResponse: 2
+```
+
+### 3.6 IAT Delay Modeling
+
+Inter-record delays use a **log-normal distribution** sourced via Box-Muller normal sampling (`sample_log_normal(mu, sigma)` → `Duration::from_micros`). This fits the right-skewed, positive-definite distribution of real TCP inter-arrival times better than uniform or exponential jitter. The Markov InteractiveControl state applies a 15% delay probability; the script engine applies delays per-rule. AsymmetricBulk state uses zero delay (back-to-back emission) to preserve throughput.
+
+### 3.7 Noise Pool (Entropy Alignment)
+
+All padding bytes in shaped data records and `CMD_PADDING` junk payloads are sourced from a single **8 MiB CSPRNG-seeded entropy pool** (`crates/tunnel/src/entropy.rs`, `ENTROPY_POOL`). The pool is:
+- Pre-generated from `rand::thread_rng()` (a CSPRNG) on startup (both client and server).
+- Read **circularly** via a global atomic cursor — no state beyond position; no distribution shaping or entropy modeling.
+- **Cryptographically isomorphic** to genuine AEAD ciphertext (~8 bits/byte unstructured entropy), so padded regions are statistically indistinguishable from real encrypted records in the observer's view.
+
+`encrypt_variable_block(pad_fill: PadFill)` selects the fill source: `PadFill::Zero` for the control path, `PadFill::Entropy` for the shaped data path. This replaces the legacy zero-fill and `rand::thread_rng()` inline padding.
+
+### 3.8 Fake Response Engine (CMD_PADDING)
+
+`CMD_PADDING` (opcode 0x08) is a session-level control frame that carries:
+
+```
+| flag(1B) | m(1B) | junk(noise-pool) |
+  flag = 0 → request    1 → reply
+```
+
+- **Request** (`flag=0`): emitted by the sender on the **Control** queue (priority) when a script rule or policy specifies `expect_responses = M`. Junk bytes from the noise pool.
+- **Reply** (`flag=1`): the receiver, upon decoding a request, immediately emits `M` **independently split** reply frames (each a separate noise-pool-filled control record of varied size) back to the sender. This deliberately breaks the one-request/one-response symmetry of the application data layer.
+- Reply frames are never delivered to streams — discarded silently at the frame handler level (count as read activity for idle-timeout purposes).
+- The noise pool fills both request and reply junk, keeping all padding bytes isomorphic to ciphertext.
+
+### 3.9 Wire Record Size Reference
+
+Every post-handshake record is a 0x17 record with a 5-byte header (`| 0x17 | 0x03 | 0x03 | len(u16 BE) |`) followed by Noise-encrypted ciphertext. Each plaintext carries: `[length_prefix(2B, BE) | payload | padding(noise-pool) | inner_content_type(1B, 0x17)]`.
+
+| Record Type | Wire Size (= 5 + cipher) | Sizing Control | Padding Source |
+|---|---|---|---|
+| Shaped data record | **shaper-dictated** (24–16406) | `TrafficShaper::next_data_policy` → `prepare_data_record(target_wire_len, Entropy)` | Noise pool |
+| Control frame | discrete (33–82) or headed (124–824) → §3.2 | `control_size::next_control_size` → `prepare_control_record(payload, size)` | Zero |
+| Flight3 CCS | **6** (unencrypted) | Hardcoded | — |
+| Flight3 Finished ghost | **58** | 37 + 16 AEAD + 5 header | — |
+| Flight3 H2 ghost | **86 / 92 / 98** | context-hash selects variant | — |
+| Close notify alert | **24** (3 + 16 + 5) | Hardcoded `[01 00 15]` | — |
+| Ghost record (server) | **5 + cache_size** | camouflage cache | Noise pool (legacy ENTROPY_POOL) |
 
 ---
 
@@ -149,6 +204,7 @@ Tail bulk records use jittered padding — 80% carry at most 32 bytes of padding
 | FIN | 0x03 | Close stream (half-close) |
 | SETTINGS | 0x04 | Session capability negotiation |
 | SYNACK | 0x07 | Stream open acknowledgment |
+| PADDING | 0x08 | Fake-response engine (§3.8); request/reply noise-pool frames |
 
 ### 4.2 Pipelined Stream Open
 
@@ -251,6 +307,30 @@ A custom ClientHello hex file can override the Firefox/Python-OpenSSL templates 
                         └─────────────┬───────────────────────┘
                                  Yes  │
                                       ▼
-                        Silent close — no alert sent.
-                        TCP FIN or RST (OS-dependent).
+                         Silent close — no alert sent.
+                         TCP FIN or RST (OS-dependent).
 ```
+
+---
+
+## 8. Session Configuration
+
+The `session` block (optional, under `settings` in both client outbounds and server inbounds) controls per-session behavior:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `max_streams_per_session` | usize | 256 | Maximum concurrent multiplexed streams per tunnel session. |
+| `idle_timeout_secs` | u64 | 45 | Session idle teardown timeout (with ±10% jitter). |
+| `traffic_script` | optional string | (embedded default) | Restls-style script controlling the first 12 post-handshake data packets (§3.5). Example: `"Length: 200~250, Delay: 0, FakeResponse: 0\nLength: 300~400, Delay: 2.0~0.5, FakeResponse: 1"`. Malformed rules trigger a non-fatal startup warning; the embedded default is used as fallback. |
+
+The embedded default script:
+```
+Length: 200~250, Delay: 0, FakeResponse: 0
+Length: 180~220, Delay: 1.5~0.6, FakeResponse: 0
+Length: 250~350, Delay: 0, FakeResponse: 1
+Length: 300~400, Delay: 2.0~0.5, FakeResponse: 0
+Length: 200~300, Delay: 0, FakeResponse: 1
+Length: 400~600, Delay: 3.0~0.7, FakeResponse: 0
+```
+
+After the scripted prefix is exhausted, the TrafficShaper's Markov state machine (§3.4) governs sizing and delay for the remainder of the connection lifecycle. No configuration surface exists for the Markov transition parameters — they are derived from the sliding window of recent payload sizes and are directionally symmetric.

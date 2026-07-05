@@ -937,6 +937,21 @@ impl SessionConfig {
             is_client,
             max_streams_per_session,
             idle_timeout_secs,
+            traffic_script: None,
+        }
+    }
+
+    pub fn with_script(
+        is_client: bool,
+        max_streams_per_session: usize,
+        idle_timeout_secs: u64,
+        traffic_script: Option<String>,
+    ) -> Self {
+        Self {
+            is_client,
+            max_streams_per_session,
+            idle_timeout_secs,
+            traffic_script,
         }
     }
 }
@@ -947,6 +962,7 @@ impl Clone for SessionConfig {
             is_client: self.is_client,
             max_streams_per_session: self.max_streams_per_session,
             idle_timeout_secs: self.idle_timeout_secs,
+            traffic_script: self.traffic_script.clone(),
         }
     }
 }

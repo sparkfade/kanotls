@@ -2,6 +2,7 @@ pub mod client_pool;
 pub mod frame;
 pub mod server;
 pub mod session;
+pub mod shaper;
 pub mod stream;
 
 pub const RELAY_CHUNK_SIZE: usize = 64 * 1024;

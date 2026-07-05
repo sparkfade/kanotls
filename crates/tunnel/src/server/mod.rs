@@ -3,7 +3,7 @@ mod camouflage;
 mod fallback;
 mod replay;
 
-pub use camouflage::{init_entropy_pool, validate_camouflage_endpoint};
+pub use camouflage::validate_camouflage_endpoint;
 
 use auth::*;
 use camouflage::*;
