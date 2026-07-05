@@ -20,6 +20,81 @@ pub fn validate_session_config(prefix: &str, session: &crate::model::SessionConf
             MAX_IDLE_TIMEOUT_SECS
         );
     }
+    if let Some(ref script) = session.traffic_script {
+        validate_traffic_script(prefix, script);
+    }
+    Ok(())
+}
+
+fn validate_traffic_script(prefix: &str, script: &str) {
+    for (idx, line) in script.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Err(e) = validate_script_line(line) {
+            tracing::warn!(
+                "{}: traffic_script line {} is malformed ({}); the embedded default script will be used instead",
+                prefix,
+                idx + 1,
+                e
+            );
+        }
+    }
+}
+
+fn validate_script_line(line: &str) -> Result<(), String> {
+    let mut has_length = false;
+    for part in line.split(',') {
+        let part = part.trim();
+        if part.starts_with("Length:") {
+            let rest = part.strip_prefix("Length:").unwrap().trim();
+            if let Some((lo, hi)) = rest.split_once('~') {
+                let lo: usize = lo
+                    .trim()
+                    .parse()
+                    .map_err(|e| format!("bad Length lo: {}", e))?;
+                let hi: usize = hi
+                    .trim()
+                    .parse()
+                    .map_err(|e| format!("bad Length hi: {}", e))?;
+                if lo > hi {
+                    return Err(format!("len_lo {} > len_hi {}", lo, hi));
+                }
+                if lo == 0 {
+                    return Err("Length lo must be > 0".to_string());
+                }
+                has_length = true;
+            } else {
+                let _: usize = rest.parse().map_err(|e| format!("bad Length: {}", e))?;
+                has_length = true;
+            }
+        } else if part.starts_with("Delay:") {
+            let rest = part.strip_prefix("Delay:").unwrap().trim();
+            if rest != "0" {
+                if let Some((mu, sigma)) = rest.split_once('~') {
+                    let _: f64 = mu
+                        .trim()
+                        .parse()
+                        .map_err(|e| format!("bad Delay mu: {}", e))?;
+                    let _: f64 = sigma
+                        .trim()
+                        .parse()
+                        .map_err(|e| format!("bad Delay sigma: {}", e))?;
+                } else {
+                    let _: u64 = rest.parse().map_err(|e| format!("bad Delay: {}", e))?;
+                }
+            }
+        } else if part.starts_with("FakeResponse:") {
+            let rest = part.strip_prefix("FakeResponse:").unwrap().trim();
+            let _: u8 = rest
+                .parse()
+                .map_err(|e| format!("bad FakeResponse: {}", e))?;
+        }
+    }
+    if !has_length {
+        return Err("missing Length field".to_string());
+    }
     Ok(())
 }
 

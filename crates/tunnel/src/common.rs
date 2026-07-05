@@ -285,34 +285,7 @@ impl SnowyStream {
         target_wire_len: usize,
     ) -> io::Result<()> {
         self.control_frame_count = self.control_frame_count.saturating_add(1);
-        if !self.tx_agg_buf.is_empty() {
-            let data_len = self.tx_agg_buf.len().min(BLOCK_DATA_CAPACITY);
-            {
-                let data = &self.tx_agg_buf[..data_len];
-                encrypt_padded_block(
-                    &mut self.noise,
-                    &mut self.write_buffer,
-                    &mut self.encrypt_buf,
-                    data,
-                    data_len,
-                )?;
-            }
-            self.tx_agg_buf.drain(..data_len);
-            if !self.tx_agg_buf.is_empty() {
-                let data_len = self.tx_agg_buf.len().min(BLOCK_DATA_CAPACITY);
-                {
-                    let data = &self.tx_agg_buf[..data_len];
-                    encrypt_padded_block(
-                        &mut self.noise,
-                        &mut self.write_buffer,
-                        &mut self.encrypt_buf,
-                        data,
-                        data_len,
-                    )?;
-                }
-                self.tx_agg_buf.drain(..data_len);
-            }
-        }
+        self.drain_tx_agg_buf_exact()?;
 
         let target_plaintext_len = target_wire_len
             .saturating_sub(TLS_RECORD_HEADER_LEN + AEAD_TAG_LEN)
@@ -325,7 +298,82 @@ impl SnowyStream {
             &mut self.encrypt_buf,
             payload,
             target_plaintext_len,
+            PadFill::Zero,
         )
+    }
+
+    /// Encrypt exactly one 0x17 application-data record whose on-wire size is
+    /// strictly `target_wire_len` (clamped to the valid record range), padded
+    /// with high-entropy noise-pool bytes. This is the single sizing-controlled
+    /// interface for the bulk data path: the upper-layer TrafficShaper dictates
+    /// every record's wire length, so plaintext length never maps to wire size.
+    ///
+    /// `payload` must not exceed `BLOCK_DATA_CAPACITY`; the caller (the slicer)
+    /// is responsible for chunking larger buffers.
+    pub fn prepare_data_record(
+        &mut self,
+        payload: &[u8],
+        target_wire_len: usize,
+    ) -> io::Result<()> {
+        debug_assert!(payload.len() <= BLOCK_DATA_CAPACITY);
+        let target_plaintext_len = target_wire_len
+            .saturating_sub(TLS_RECORD_HEADER_LEN + AEAD_TAG_LEN)
+            .max(payload.len() + BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN)
+            .min(BLOCK_PLAINTEXT_SIZE);
+
+        encrypt_variable_block(
+            &mut self.noise,
+            &mut self.write_buffer,
+            &mut self.encrypt_buf,
+            payload,
+            target_plaintext_len,
+            PadFill::Entropy,
+        )
+    }
+
+    /// The maximum application-payload capacity of a single wire record. The
+    /// slicer must never hand `prepare_data_record` more than this many bytes.
+    pub const fn data_record_capacity() -> usize {
+        BLOCK_DATA_CAPACITY
+    }
+
+    /// Exact on-wire size of a shaped data record carrying `payload_len` bytes
+    /// with no extra padding. `payload_len` must be `<= data_record_capacity()`.
+    pub const fn data_record_wire_len(payload_len: usize) -> usize {
+        TLS_RECORD_HEADER_LEN
+            + BLOCK_LEN_PREFIX_SIZE
+            + payload_len
+            + INNER_CONTENT_TYPE_LEN
+            + AEAD_TAG_LEN
+    }
+
+    /// On-wire size of a full (MTU/MSS-anchored) data record.
+    pub const fn max_data_record_wire_len() -> usize {
+        TLS_RECORD_HEADER_LEN + BLOCK_PLAINTEXT_SIZE + AEAD_TAG_LEN
+    }
+
+    /// Drain any bytes accumulated by the generic `AsyncWrite` path into
+    /// exact-size records. On the shaped session path `tx_agg_buf` is always
+    /// empty, so this is a defensive no-op there.
+    fn drain_tx_agg_buf_exact(&mut self) -> io::Result<()> {
+        while !self.tx_agg_buf.is_empty() {
+            let data_len = self.tx_agg_buf.len().min(BLOCK_DATA_CAPACITY);
+            let target_plaintext_len =
+                data_len + BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN;
+            {
+                let data = &self.tx_agg_buf[..data_len];
+                encrypt_variable_block(
+                    &mut self.noise,
+                    &mut self.write_buffer,
+                    &mut self.encrypt_buf,
+                    data,
+                    target_plaintext_len,
+                    PadFill::Entropy,
+                )?;
+            }
+            self.tx_agg_buf.drain(..data_len);
+        }
+        Ok(())
     }
 }
 
@@ -547,14 +595,21 @@ impl AsyncWrite for SnowyStream {
 
         this.tx_agg_buf.extend_from_slice(buf);
 
+        // Generic AsyncWrite fallback path (not used by the shaped session
+        // writer, which drives `prepare_data_record` directly). Chunking at
+        // BLOCK_DATA_CAPACITY here is a hard record-capacity constraint, not a
+        // shaping decision; each chunk is emitted through the unified
+        // `encrypt_variable_block` primitive.
         while this.tx_agg_buf.len() >= BLOCK_DATA_CAPACITY {
             {
                 let data = &this.tx_agg_buf[..BLOCK_DATA_CAPACITY];
-                encrypt_full_block(
+                encrypt_variable_block(
                     &mut this.noise,
                     &mut this.write_buffer,
                     &mut this.encrypt_buf,
                     data,
+                    BLOCK_PLAINTEXT_SIZE,
+                    PadFill::Entropy,
                 )?;
             }
             this.tx_agg_buf.drain(..BLOCK_DATA_CAPACITY);
@@ -577,14 +632,17 @@ impl AsyncWrite for SnowyStream {
         if !this.tx_agg_buf.is_empty() {
             while !this.tx_agg_buf.is_empty() {
                 let data_len = this.tx_agg_buf.len().min(BLOCK_DATA_CAPACITY);
+                let target_plaintext_len =
+                    data_len + BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN;
                 {
                     let data = &this.tx_agg_buf[..data_len];
-                    encrypt_padded_block(
+                    encrypt_variable_block(
                         &mut this.noise,
                         &mut this.write_buffer,
                         &mut this.encrypt_buf,
                         data,
-                        data_len,
+                        target_plaintext_len,
+                        PadFill::Entropy,
                     )?;
                 }
                 this.tx_agg_buf.drain(..data_len);
@@ -656,85 +714,27 @@ fn try_flush_write_buffer(stream: &mut SnowyStream, cx: &mut Context<'_>) -> io:
     Ok(())
 }
 
-fn encrypt_full_block(
-    noise: &mut TransportState,
-    write_buffer: &mut Vec<u8>,
-    encrypt_buf: &mut Box<[u8; BLOCK_PLAINTEXT_SIZE]>,
-    data: &[u8],
-) -> io::Result<()> {
-    let block = encrypt_buf.as_mut_slice();
-    block[..BLOCK_LEN_PREFIX_SIZE].copy_from_slice(&(data.len() as u16).to_be_bytes());
-    block[BLOCK_LEN_PREFIX_SIZE..BLOCK_LEN_PREFIX_SIZE + data.len()].copy_from_slice(data);
-    block[BLOCK_PLAINTEXT_SIZE - 1] = INNER_CONTENT_TYPE_APP_DATA;
-
-    let ct_len = BLOCK_PLAINTEXT_SIZE + AEAD_TAG_LEN;
-    let record_len = TLS_RECORD_HEADER_LEN + ct_len;
-
-    let current_len = write_buffer.len();
-    write_buffer.resize(current_len + record_len, 0);
-
-    let actual_ct = noise
-        .write_message(
-            block,
-            &mut write_buffer[current_len + TLS_RECORD_HEADER_LEN..],
-        )
-        .map_err(|e| io::Error::other(format!("noise encrypt: {}", e)))?;
-
-    write_buffer[current_len] = 0x17;
-    write_buffer[current_len + 1] = 0x03;
-    write_buffer[current_len + 2] = 0x03;
-    write_buffer[current_len + 3..current_len + 5]
-        .copy_from_slice(&(actual_ct as u16).to_be_bytes());
-    write_buffer.truncate(current_len + TLS_RECORD_HEADER_LEN + actual_ct);
-
-    Ok(())
-}
-
-fn encrypt_padded_block(
-    noise: &mut TransportState,
-    write_buffer: &mut Vec<u8>,
-    encrypt_buf: &mut Box<[u8; BLOCK_PLAINTEXT_SIZE]>,
-    payload: &[u8],
-    data_len: usize,
-) -> io::Result<()> {
-    use rand::Rng;
-
-    let min_wire = TLS_RECORD_HEADER_LEN
-        + AEAD_TAG_LEN
-        + BLOCK_LEN_PREFIX_SIZE
-        + data_len
-        + INNER_CONTENT_TYPE_LEN;
-    let max_wire = TLS_RECORD_HEADER_LEN + AEAD_TAG_LEN + BLOCK_PLAINTEXT_SIZE;
-    let max_padding = max_wire.saturating_sub(min_wire);
-
-    let mut rng = rand::thread_rng();
-    let padding = if max_padding > 0 {
-        if rng.gen::<f64>() < 0.80 {
-            let lambda: f64 = 0.050295;
-            let u: f64 = rng.gen();
-            let u_safe = if u > 0.0 { u } else { 1.0 - u };
-            let raw: f64 = -u_safe.ln() / lambda;
-            (raw.round() as usize).min(32).min(max_padding)
-        } else {
-            max_padding
-        }
-    } else {
-        0
-    };
-
-    let target = min_wire + padding;
-    let target_plaintext_len = target.saturating_sub(TLS_RECORD_HEADER_LEN + AEAD_TAG_LEN);
-    encrypt_variable_block(
-        noise,
-        write_buffer,
-        encrypt_buf,
-        payload,
-        target_plaintext_len,
-    )
+/// Source of the padding bytes that fill the gap between the real payload and
+/// the caller-requested record size.
+#[derive(Clone, Copy, Debug)]
+pub enum PadFill {
+    /// Zero-fill (used by the control path, which is already size-shaped).
+    Zero,
+    /// Fill from the shared cryptographically isomorphic high-entropy noise
+    /// pool. Bytes are statistically indistinguishable from real AEAD
+    /// ciphertext, so padded records leak no structure.
+    Entropy,
 }
 
 pub const MIN_CONTROL_WIRE_LEN: usize =
     TLS_RECORD_HEADER_LEN + BLOCK_LEN_PREFIX_SIZE + AEAD_TAG_LEN;
+
+/// Minimum on-wire size of a shaped 0x17 data record carrying zero payload
+/// bytes (2-byte length prefix + 1-byte inner content type).
+pub const MIN_DATA_WIRE_LEN: usize = TLS_RECORD_HEADER_LEN
+    + BLOCK_LEN_PREFIX_SIZE
+    + INNER_CONTENT_TYPE_LEN
+    + AEAD_TAG_LEN;
 
 fn encrypt_variable_block(
     noise: &mut TransportState,
@@ -742,6 +742,7 @@ fn encrypt_variable_block(
     encrypt_buf: &mut Box<[u8; BLOCK_PLAINTEXT_SIZE]>,
     payload: &[u8],
     target_plaintext_len: usize,
+    pad_fill: PadFill,
 ) -> io::Result<()> {
     assert!(target_plaintext_len >= payload.len() + BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN);
     assert!(target_plaintext_len <= BLOCK_PLAINTEXT_SIZE);
@@ -751,7 +752,10 @@ fn encrypt_variable_block(
         let pad_start = BLOCK_LEN_PREFIX_SIZE + payload.len();
         let pad_end = target_plaintext_len - 1;
         if pad_end > pad_start {
-            block[pad_start..pad_end].fill(0);
+            match pad_fill {
+                PadFill::Zero => block[pad_start..pad_end].fill(0),
+                PadFill::Entropy => crate::entropy::fill_from_pool(&mut block[pad_start..pad_end]),
+            }
         }
         block[..BLOCK_LEN_PREFIX_SIZE].copy_from_slice(&(payload.len() as u16).to_be_bytes());
         block[BLOCK_LEN_PREFIX_SIZE..BLOCK_LEN_PREFIX_SIZE + payload.len()]
