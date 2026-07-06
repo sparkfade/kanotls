@@ -91,8 +91,12 @@ pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
         .session
         .as_ref()
         .and_then(|s| s.traffic_script.clone());
-    let session_config =
-        SessionConfig::with_script(false, max_streams_per_session, idle_timeout_secs, traffic_script);
+    let session_config = SessionConfig::with_script(
+        false,
+        max_streams_per_session,
+        idle_timeout_secs,
+        traffic_script,
+    );
 
     let shutdown = tokio::sync::watch::channel(false);
     let mut shutdown_rx = shutdown.1.clone();
