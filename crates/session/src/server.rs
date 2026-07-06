@@ -1,9 +1,8 @@
 use crate::frame::{Frame, CMD_SYNACK};
 use crate::session::{
-    PendingAcceptFlushResult, Session, SessionConfig, StreamHandle, TrafficClass,
+    PendingAcceptFlushResult, PendingData, Session, SessionConfig, StreamHandle, TrafficClass,
 };
 use kanotls_tunnel::SnowyStream;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify};
@@ -109,7 +108,7 @@ pub struct ServerStream {
     write_closed: bool,
     closed: bool,
     buffered_stream_bytes: Arc<AtomicUsize>,
-    pending_data: Arc<Mutex<HashMap<u32, Vec<Vec<u8>>>>>,
+    pending_data: Arc<Mutex<PendingData>>,
     pending_notify: Arc<Notify>,
 }
 
@@ -166,19 +165,15 @@ impl ServerStream {
 
     fn try_drain_pending_data(&self) -> Option<Vec<u8>> {
         let mut pending = self.pending_data.try_lock().ok()?;
-        let queue = pending.get_mut(&self.sid)?;
-        if queue.is_empty() {
-            pending.remove(&self.sid);
-            return None;
-        }
-        let data = queue.remove(0);
+        let queue = pending.get_mut(self.sid)?;
+        let data = queue.pop_front()?;
         let _ =
             self.buffered_stream_bytes
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(data.len()))
                 });
         if queue.is_empty() {
-            pending.remove(&self.sid);
+            pending.remove(self.sid);
         }
         Some(data)
     }

@@ -1,7 +1,7 @@
-use crate::frame::{coalesce_encoded_frames, Frame, MAX_PAYLOAD_LEN};
+use crate::frame::{coalesce_encoded_frames_owned, Frame, MAX_PAYLOAD_LEN};
 use crate::session::{
-    remember_closing_stream_sync, FlushBehavior, PendingWrite, SharedTunnelWriter, StreamHandle,
-    TrafficClass,
+    remember_closing_stream_sync, FlushBehavior, PendingData, PendingWrite, SharedTunnelWriter,
+    StreamHandle, TrafficClass,
 };
 use anyhow::Error;
 use std::collections::HashMap;
@@ -62,7 +62,7 @@ pub(crate) struct StreamInit {
     pub writer: SharedTunnelWriter,
     pub streams: Arc<RwLock<HashMap<u32, StreamHandle>>>,
     pub pending_client_settings: Arc<Mutex<Option<Vec<u8>>>>,
-    pub pending_data: Arc<Mutex<HashMap<u32, Vec<Vec<u8>>>>>,
+    pub pending_data: Arc<Mutex<PendingData>>,
     pub pending_fin: Arc<Mutex<std::collections::HashSet<u32>>>,
     pub closing_streams: Arc<Mutex<std::collections::HashSet<u32>>>,
     pub pending_notify: Arc<Notify>,
@@ -79,7 +79,7 @@ pub struct Stream {
     writer: SharedTunnelWriter,
     streams: Arc<RwLock<HashMap<u32, StreamHandle>>>,
     pending_client_settings: PendingClientSettings,
-    pending_data: Arc<Mutex<HashMap<u32, Vec<Vec<u8>>>>>,
+    pending_data: Arc<Mutex<PendingData>>,
     pending_fin: Arc<Mutex<std::collections::HashSet<u32>>>,
     closing_streams: Arc<Mutex<std::collections::HashSet<u32>>>,
     pending_notify: Arc<Notify>,
@@ -251,10 +251,12 @@ impl Stream {
             frames.push(Frame::psh(self.stream_id, Vec::new()).encode()?);
         } else {
             for chunk in data.chunks(MAX_PAYLOAD_LEN) {
-                frames.push(Frame::psh(self.stream_id, chunk.to_vec()).encode()?);
+                let mut f = Vec::with_capacity(Frame::encoded_len(chunk.len()));
+                Frame::encode_psh_into(&mut f, self.stream_id, chunk)?;
+                frames.push(f);
             }
         }
-        let packets = self.coalesce_and_pad(&frames)?;
+        let packets = self.coalesce_and_pad(frames)?;
 
         // SETTINGS/SYN and the target payload must reach the peer before we
         // wait on SYNACK; otherwise the bytes can remain buffered inside the
@@ -286,14 +288,18 @@ impl Stream {
             self.finish_pending_open_submission().await?;
             let mut combined_frames = Vec::new();
             for chunk in target.chunks(MAX_PAYLOAD_LEN) {
-                combined_frames.push(Frame::psh(self.stream_id, chunk.to_vec()).encode()?);
+                let mut f = Vec::with_capacity(Frame::encoded_len(chunk.len()));
+                Frame::encode_psh_into(&mut f, self.stream_id, chunk)?;
+                combined_frames.push(f);
             }
             if !data.is_empty() {
                 for chunk in data.chunks(MAX_PAYLOAD_LEN) {
-                    combined_frames.push(Frame::psh(self.stream_id, chunk.to_vec()).encode()?);
+                    let mut f = Vec::with_capacity(Frame::encoded_len(chunk.len()));
+                    Frame::encode_psh_into(&mut f, self.stream_id, chunk)?;
+                    combined_frames.push(f);
                 }
             }
-            let packets = self.coalesce_and_pad(&combined_frames)?;
+            let packets = self.coalesce_and_pad(combined_frames)?;
             return self
                 .writer
                 .write_packets(packets, FlushBehavior::Immediate, TrafficClass::Bulk)
@@ -307,14 +313,18 @@ impl Stream {
         }
 
         for chunk in target.chunks(MAX_PAYLOAD_LEN) {
-            frames.push(Frame::psh(self.stream_id, chunk.to_vec()).encode()?);
+            let mut f = Vec::with_capacity(Frame::encoded_len(chunk.len()));
+            Frame::encode_psh_into(&mut f, self.stream_id, chunk)?;
+            frames.push(f);
         }
         if !data.is_empty() {
             for chunk in data.chunks(MAX_PAYLOAD_LEN) {
-                frames.push(Frame::psh(self.stream_id, chunk.to_vec()).encode()?);
+                let mut f = Vec::with_capacity(Frame::encoded_len(chunk.len()));
+                Frame::encode_psh_into(&mut f, self.stream_id, chunk)?;
+                frames.push(f);
             }
         }
-        let packets = self.coalesce_and_pad(&frames)?;
+        let packets = self.coalesce_and_pad(frames)?;
 
         let pending_write = self
             .submit_packets_or_fail(packets, TrafficClass::Control)
@@ -338,7 +348,7 @@ impl Stream {
         if let Some(settings) = settings_guard.frame.clone() {
             frames.insert(0, settings);
         }
-        let packets = self.coalesce_and_pad(&frames)?;
+        let packets = self.coalesce_and_pad(frames)?;
 
         let pending_write = self
             .submit_packets_or_fail(packets, TrafficClass::Control)
@@ -372,8 +382,8 @@ impl Stream {
         Ok(())
     }
 
-    fn coalesce_and_pad(&self, frames: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, anyhow::Error> {
-        Ok(coalesce_encoded_frames(frames, MAX_PAYLOAD_LEN))
+    fn coalesce_and_pad(&self, frames: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, anyhow::Error> {
+        Ok(coalesce_encoded_frames_owned(frames, MAX_PAYLOAD_LEN))
     }
 
     async fn submit_packets_or_fail(
@@ -471,7 +481,7 @@ impl Drop for Stream {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
                     streams.write().await.remove(&stream_id);
-                    pending_data.lock().await.remove(&stream_id);
+                    pending_data.lock().await.remove(stream_id);
                     pending_fin.lock().await.remove(&stream_id);
                 });
             } else {
@@ -479,7 +489,7 @@ impl Drop for Stream {
                     streams.remove(&stream_id);
                 }
                 if let Ok(mut pending_data) = self.pending_data.try_lock() {
-                    pending_data.remove(&stream_id);
+                    pending_data.remove(stream_id);
                 }
                 if let Ok(mut pending_fin) = self.pending_fin.try_lock() {
                     pending_fin.remove(&stream_id);
@@ -507,7 +517,7 @@ impl Drop for Stream {
             }
         }
         if let Ok(mut pending_data) = self.pending_data.try_lock() {
-            pending_data.remove(&stream_id);
+            pending_data.remove(stream_id);
         }
         if let Ok(mut pending_fin) = self.pending_fin.try_lock() {
             pending_fin.remove(&stream_id);
@@ -523,7 +533,7 @@ impl Drop for Stream {
                     let _ = send_fin_frame(stream_id, writer).await;
                 }
                 streams.write().await.remove(&stream_id);
-                pending_data.lock().await.remove(&stream_id);
+                pending_data.lock().await.remove(stream_id);
                 pending_fin.lock().await.remove(&stream_id);
             });
         }
@@ -532,22 +542,18 @@ impl Drop for Stream {
 
 impl Stream {
     async fn clear_pending_client_state(&self) {
-        self.pending_data.lock().await.remove(&self.stream_id);
+        self.pending_data.lock().await.remove(self.stream_id);
         self.pending_fin.lock().await.remove(&self.stream_id);
     }
 
     fn try_drain_pending_data(&self) -> Option<Vec<u8>> {
         let mut pending = self.pending_data.try_lock().ok()?;
-        let queue = pending.get_mut(&self.stream_id)?;
-        if queue.is_empty() {
-            pending.remove(&self.stream_id);
-            return None;
-        }
-        let data = queue.remove(0);
+        let queue = pending.get_mut(self.stream_id)?;
+        let data = queue.pop_front()?;
         self.buffered_stream_bytes
             .fetch_sub(data.len(), Ordering::Relaxed);
         if queue.is_empty() {
-            pending.remove(&self.stream_id);
+            pending.remove(self.stream_id);
         }
         Some(data)
     }

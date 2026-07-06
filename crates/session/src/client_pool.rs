@@ -30,9 +30,11 @@ pub struct ClientPoolConnectOptions {
     pub custom_template_bytes: Arc<RwLock<Option<Vec<u8>>>>,
 }
 
-pub struct ClientPool {
-    inner: Arc<PoolInner>,
+pub struct ClientPool<C: TunnelConnector = DefaultConnector> {
+    inner: Arc<PoolInner<C>>,
 }
+
+pub type DefaultClientPool = ClientPool<DefaultConnector>;
 
 #[derive(Clone)]
 struct PoolBehaviorContext {
@@ -156,12 +158,18 @@ struct PoolLifecycle {
     idle_timeout: Duration,
 }
 
-struct PoolInner {
+pub trait TunnelConnector: Send + Sync + 'static {
+    type Session: PoolSession;
+
+    fn connect(&self) -> BoxFuture<'_, Result<Arc<Self::Session>, anyhow::Error>>;
+}
+
+struct PoolInner<C: TunnelConnector> {
     session_config: SessionConfig,
     behavior: PoolBehaviorConfig,
     resolved_behavior: ResolvedPoolBehavior,
-    connector: Arc<dyn TunnelConnector>,
-    connections: RwLock<HashMap<u64, Arc<PooledConnection>>>,
+    connector: Arc<C>,
+    connections: RwLock<HashMap<u64, Arc<PooledConnection<C::Session>>>>,
     next_seq: AtomicU64,
     target_pool_size: usize,
     max_live_connections: usize,
@@ -181,9 +189,9 @@ struct AcquireWaiterGuard<'a> {
     counter: &'a AtomicUsize,
 }
 
-struct PooledConnection {
+struct PooledConnection<S: PoolSession> {
     seq: u64,
-    handle: Arc<dyn PoolSession>,
+    handle: Arc<S>,
     state: AtomicU8,
     soft_ttl: Duration,
     idle_timeout: Duration,
@@ -216,7 +224,7 @@ impl ConnectionState {
     }
 }
 
-trait PoolSession: Send + Sync {
+pub trait PoolSession: Send + Sync {
     fn open_stream(&self) -> BoxFuture<'_, Result<Stream, anyhow::Error>>;
     fn active_streams(&self) -> BoxFuture<'_, usize>;
     fn buffered_stream_bytes(&self) -> usize;
@@ -225,36 +233,16 @@ trait PoolSession: Send + Sync {
     fn force_close(&self);
 }
 
-trait TunnelConnector: Send + Sync {
-    fn connect(&self) -> BoxFuture<'_, Result<Arc<dyn PoolSession>, anyhow::Error>>;
-}
-
-struct TunnelSessionConnector {
+pub struct DefaultConnector {
     session_config: SessionConfig,
     connect_options: ClientPoolConnectOptions,
 }
 
-struct LivePoolSession {
+pub struct LivePoolSession {
     session: Arc<Session>,
 }
 
-impl ClientPool {
-    pub fn new(
-        session_config: SessionConfig,
-        connect_options: ClientPoolConnectOptions,
-        behavior: PoolBehaviorConfig,
-    ) -> Self {
-        Self::new_with_connector(
-            session_config.clone(),
-            behavior,
-            PoolBehaviorContext::from_connect_options(&connect_options),
-            Arc::new(TunnelSessionConnector {
-                session_config,
-                connect_options,
-            }),
-        )
-    }
-
+impl<C: TunnelConnector> ClientPool<C> {
     pub async fn open_stream(&self) -> Result<Stream, anyhow::Error> {
         self.inner.open_stream().await
     }
@@ -270,25 +258,11 @@ impl ClientPool {
         self.inner.schedule_spawns(count, staggered).await;
     }
 
-    #[cfg(test)]
-    fn new_with_behavior_for_test(
-        session_config: SessionConfig,
-        behavior: PoolBehaviorConfig,
-        connector: Arc<dyn TunnelConnector>,
-    ) -> Self {
-        Self::new_with_connector(
-            session_config,
-            behavior,
-            PoolBehaviorContext::for_test(),
-            connector,
-        )
-    }
-
-    fn new_with_connector(
+    fn new_impl(
         session_config: SessionConfig,
         behavior: PoolBehaviorConfig,
         behavior_context: PoolBehaviorContext,
-        connector: Arc<dyn TunnelConnector>,
+        connector: Arc<C>,
     ) -> Self {
         let resolved_behavior = behavior.resolve(&behavior_context);
         let max_live_connections = resolved_behavior
@@ -321,7 +295,25 @@ impl ClientPool {
     }
 }
 
-impl PoolInner {
+impl ClientPool<DefaultConnector> {
+    pub fn new(
+        session_config: SessionConfig,
+        connect_options: ClientPoolConnectOptions,
+        behavior: PoolBehaviorConfig,
+    ) -> Self {
+        Self::new_impl(
+            session_config.clone(),
+            behavior,
+            PoolBehaviorContext::from_connect_options(&connect_options),
+            Arc::new(DefaultConnector {
+                session_config,
+                connect_options,
+            }),
+        )
+    }
+}
+
+impl<C: TunnelConnector> PoolInner<C> {
     async fn open_stream(self: &Arc<Self>) -> Result<Stream, anyhow::Error> {
         self.acquire_waiters.fetch_add(1, Ordering::Relaxed);
         let _waiter_guard = AcquireWaiterGuard {
@@ -519,7 +511,7 @@ impl PoolInner {
         }
     }
 
-    async fn register_connection(self: &Arc<Self>, handle: Arc<dyn PoolSession>) {
+    async fn register_connection(self: &Arc<Self>, handle: Arc<C::Session>) {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let lifecycle = self.behavior.lifecycle(&self.resolved_behavior, seq);
         let connection = Arc::new(PooledConnection {
@@ -605,9 +597,9 @@ impl PoolInner {
         }
     }
 
-    async fn select_active_connection(&self) -> Option<Arc<PooledConnection>> {
+    async fn select_active_connection(&self) -> Option<Arc<PooledConnection<C::Session>>> {
         let entries = self.connection_entries().await;
-        let mut best: Option<(Arc<PooledConnection>, ConnectionScore)> = None;
+        let mut best: Option<(Arc<PooledConnection<C::Session>>, ConnectionScore)> = None;
 
         for entry in entries {
             if entry.state() != ConnectionState::Active
@@ -648,9 +640,6 @@ impl PoolInner {
             return 0;
         }
 
-        // A single outer TLS session can carry many inner streams, so waiter
-        // spikes after a long idle period should not immediately fan out into
-        // the same number of fresh tunnel connections.
         let stream_target = self.streams_per_connection_target();
         let demand_streams = waiters.saturating_add(total_active_streams).max(1);
         let mut desired =
@@ -693,7 +682,7 @@ impl PoolInner {
             .count()
     }
 
-    async fn connection_entries(&self) -> Vec<Arc<PooledConnection>> {
+    async fn connection_entries(&self) -> Vec<Arc<PooledConnection<C::Session>>> {
         self.connections.read().await.values().cloned().collect()
     }
 
@@ -725,7 +714,7 @@ impl PoolInner {
         self.monitor_notify.notify_waiters();
     }
 
-    async fn remove_connection(&self, seq: u64) -> Option<Arc<PooledConnection>> {
+    async fn remove_connection(&self, seq: u64) -> Option<Arc<PooledConnection<C::Session>>> {
         self.connections.write().await.remove(&seq)
     }
 
@@ -755,7 +744,7 @@ impl PoolInner {
     }
 }
 
-impl PooledConnection {
+impl<S: PoolSession> PooledConnection<S> {
     fn score(&self, active_streams: usize, buffered_stream_bytes: usize) -> ConnectionScore {
         ConnectionScore {
             active_streams,
@@ -808,7 +797,10 @@ struct ConnectionScore {
     seq: u64,
 }
 
-async fn run_connection_lifecycle(pool: Weak<PoolInner>, connection: Arc<PooledConnection>) {
+async fn run_connection_lifecycle<S: PoolSession>(
+    pool: Weak<PoolInner<impl TunnelConnector<Session = S>>>,
+    connection: Arc<PooledConnection<S>>,
+) {
     let soft_ttl = tokio::time::sleep(connection.soft_ttl);
     tokio::pin!(soft_ttl);
 
@@ -869,8 +861,10 @@ async fn run_connection_lifecycle(pool: Weak<PoolInner>, connection: Arc<PooledC
     }
 }
 
-impl TunnelConnector for TunnelSessionConnector {
-    fn connect(&self) -> BoxFuture<'_, Result<Arc<dyn PoolSession>, anyhow::Error>> {
+impl TunnelConnector for DefaultConnector {
+    type Session = LivePoolSession;
+
+    fn connect(&self) -> BoxFuture<'_, Result<Arc<LivePoolSession>, anyhow::Error>> {
         let session_config = self.session_config.clone();
         let connect_options = self.connect_options.clone();
         async move {
@@ -891,7 +885,7 @@ impl TunnelConnector for TunnelSessionConnector {
                 let _ = read_loop.run_read_loop().await;
             });
 
-            Ok(Arc::new(LivePoolSession { session }) as Arc<dyn PoolSession>)
+            Ok(Arc::new(LivePoolSession { session }))
         }
         .boxed()
     }
@@ -1089,6 +1083,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    type TestPool = ClientPool<FakeConnector>;
+
     struct FakeConnector {
         calls: AtomicUsize,
         sessions: Mutex<Vec<Arc<FakeSession>>>,
@@ -1135,8 +1131,8 @@ mod tests {
                 .store(buffered_stream_bytes, Ordering::Relaxed);
         }
 
-        fn was_force_closed(&self) -> bool {
-            self.closing.load(Ordering::Relaxed)
+        fn is_force_closed(&self) -> bool {
+            !self.alive.load(Ordering::Relaxed)
         }
     }
 
@@ -1168,14 +1164,31 @@ mod tests {
     }
 
     impl TunnelConnector for FakeConnector {
-        fn connect(&self) -> BoxFuture<'_, Result<Arc<dyn PoolSession>, anyhow::Error>> {
+        type Session = FakeSession;
+
+        fn connect(&self) -> BoxFuture<'_, Result<Arc<FakeSession>, anyhow::Error>> {
             async move {
                 let idx = self.calls.fetch_add(1, Ordering::Relaxed);
                 let session = (self.factory)(idx);
                 self.sessions.lock().await.push(session.clone());
-                Ok(session as Arc<dyn PoolSession>)
+                Ok(session)
             }
             .boxed()
+        }
+    }
+
+    impl TestPool {
+        fn new_with_behavior_for_test(
+            session_config: SessionConfig,
+            behavior: PoolBehaviorConfig,
+            connector: Arc<FakeConnector>,
+        ) -> Self {
+            Self::new_impl(
+                session_config,
+                behavior,
+                PoolBehaviorContext::for_test(),
+                connector,
+            )
         }
     }
 
@@ -1224,7 +1237,7 @@ mod tests {
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 5;
 
-        let pool = ClientPool::new_with_behavior_for_test(
+        let pool = TestPool::new_with_behavior_for_test(
             test_session_config(),
             behavior,
             connector.clone(),
@@ -1257,7 +1270,7 @@ mod tests {
             .get(&1)
             .map(|entry| entry.state());
         assert_eq!(state, None);
-        assert!(session.was_force_closed());
+        assert!(session.is_force_closed());
     }
 
     #[tokio::test]
@@ -1269,7 +1282,7 @@ mod tests {
         behavior.min_active_connections = 0;
         behavior.monitor_interval = Duration::from_millis(10);
 
-        let pool = ClientPool::new_with_behavior_for_test(
+        let pool = TestPool::new_with_behavior_for_test(
             test_session_config(),
             behavior,
             connector.clone(),
@@ -1305,7 +1318,7 @@ mod tests {
             .get(&1)
             .map(|entry| entry.state());
         assert_eq!(state, Some(ConnectionState::Draining));
-        assert!(!session.was_force_closed());
+        assert!(!session.is_force_closed());
 
         session.set_active_streams(0);
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1318,7 +1331,7 @@ mod tests {
             .get(&1)
             .map(|entry| entry.state());
         assert_eq!(state, None);
-        assert!(session.was_force_closed());
+        assert!(session.is_force_closed());
     }
 
     #[tokio::test]
@@ -1332,7 +1345,7 @@ mod tests {
         behavior.idle_drain_secs = 5;
 
         let pool =
-            ClientPool::new_with_behavior_for_test(test_session_config(), behavior, connector);
+            TestPool::new_with_behavior_for_test(test_session_config(), behavior, connector);
         let first = FakeSession::new(1);
         first.set_buffered_stream_bytes(4096);
         let second = FakeSession::new(1);
@@ -1361,7 +1374,7 @@ mod tests {
         behavior.idle_drain_secs = 5;
 
         let pool =
-            ClientPool::new_with_behavior_for_test(test_session_config(), behavior, connector);
+            TestPool::new_with_behavior_for_test(test_session_config(), behavior, connector);
         pool.inner.register_connection(FakeSession::new(1)).await;
         pool.inner.register_connection(FakeSession::new(1)).await;
 
@@ -1389,7 +1402,7 @@ mod tests {
                 FakeSession::new(0)
             }
         }));
-        let pool = ClientPool::new_with_behavior_for_test(
+        let pool = TestPool::new_with_behavior_for_test(
             test_session_config(),
             test_behavior(),
             connector.clone(),
@@ -1411,7 +1424,7 @@ mod tests {
     #[tokio::test]
     async fn pool_scales_when_waiters_arrive_under_real_session_load() {
         let connector = Arc::new(FakeConnector::new(|_| FakeSession::new(0)));
-        let pool = ClientPool::new_with_behavior_for_test(
+        let pool = TestPool::new_with_behavior_for_test(
             test_session_config(),
             test_behavior(),
             connector.clone(),
@@ -1481,7 +1494,7 @@ mod tests {
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 5;
 
-        let pool = ClientPool::new_with_behavior_for_test(
+        let pool = TestPool::new_with_behavior_for_test(
             SessionConfig::with_limits(true, 256, 30),
             behavior,
             connector.clone(),
@@ -1513,7 +1526,7 @@ mod tests {
         behavior.idle_drain_secs = 0;
 
         let pool =
-            ClientPool::new_with_behavior_for_test(test_session_config(), behavior, connector);
+            TestPool::new_with_behavior_for_test(test_session_config(), behavior, connector);
         pool.spawn_connections_for_test(1, false).await;
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1538,7 +1551,7 @@ mod tests {
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 0;
 
-        let pool = ClientPool::new_with_behavior_for_test(
+        let pool = TestPool::new_with_behavior_for_test(
             test_session_config(),
             behavior,
             connector.clone(),
@@ -1581,7 +1594,7 @@ mod tests {
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 0;
 
-        let pool = ClientPool::new_with_behavior_for_test(
+        let pool = TestPool::new_with_behavior_for_test(
             test_session_config(),
             behavior,
             connector.clone(),
@@ -1596,8 +1609,8 @@ mod tests {
         let snapshot = pool.snapshot().await;
         assert_eq!(snapshot.active, 0);
         assert_eq!(snapshot.draining, 0);
-        assert!(sessions[0].was_force_closed());
-        assert!(sessions[1].was_force_closed());
+        assert!(sessions[0].is_force_closed());
+        assert!(sessions[1].is_force_closed());
     }
 
     #[tokio::test]
@@ -1616,7 +1629,7 @@ mod tests {
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 5;
 
-        let pool = ClientPool::new_with_behavior_for_test(
+        let pool = TestPool::new_with_behavior_for_test(
             test_session_config(),
             behavior,
             connector.clone(),
@@ -1648,7 +1661,7 @@ mod tests {
         assert_eq!(snapshot.draining, 0);
         assert_eq!(snapshot.active + snapshot.draining, 1);
         assert_eq!(connector.sessions().await.len(), 2);
-        assert!(sessions[0].was_force_closed());
+        assert!(sessions[0].is_force_closed());
         pool.inner.acquire_waiters.store(0, Ordering::Relaxed);
     }
 
@@ -1662,7 +1675,7 @@ mod tests {
         behavior.min_initial_connections = 1;
         behavior.max_initial_connections = 1;
 
-        let pool = ClientPool::new_with_behavior_for_test(
+        let pool = TestPool::new_with_behavior_for_test(
             SessionConfig::with_limits(true, 32, 30),
             behavior,
             connector.clone(),
@@ -1700,7 +1713,7 @@ mod tests {
         behavior.max_initial_connections = 1;
         behavior.idle_drain_secs = 5;
 
-        let pool = ClientPool::new_with_behavior_for_test(
+        let pool = TestPool::new_with_behavior_for_test(
             SessionConfig::with_limits(true, 32, 30),
             behavior,
             connector.clone(),
@@ -1731,7 +1744,7 @@ mod tests {
         behavior.idle_drain_secs = 5;
 
         let pool =
-            ClientPool::new_with_behavior_for_test(test_session_config(), behavior, connector);
+            TestPool::new_with_behavior_for_test(test_session_config(), behavior, connector);
         let busy = FakeSession::new(pool.inner.streams_per_connection_target());
         pool.inner.register_connection(busy).await;
 

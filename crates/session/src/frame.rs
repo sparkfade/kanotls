@@ -81,6 +81,16 @@ impl Frame {
     }
 
     pub fn encode_psh(stream_id: u32, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + payload.len());
+        Self::encode_psh_into(&mut buf, stream_id, payload)?;
+        Ok(buf)
+    }
+
+    pub fn encode_psh_into(
+        dst: &mut Vec<u8>,
+        stream_id: u32,
+        payload: &[u8],
+    ) -> anyhow::Result<()> {
         if payload.len() > MAX_PAYLOAD_LEN {
             anyhow::bail!(
                 "frame payload too large: {} > {}",
@@ -88,13 +98,15 @@ impl Frame {
                 MAX_PAYLOAD_LEN
             );
         }
-        let data_len = payload.len() as u16;
-        let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + data_len as usize);
-        buf.push(CMD_PSH);
-        buf.extend_from_slice(&stream_id.to_be_bytes());
-        buf.extend_from_slice(&data_len.to_be_bytes());
-        buf.extend_from_slice(payload);
-        Ok(buf)
+        dst.push(CMD_PSH);
+        dst.extend_from_slice(&stream_id.to_be_bytes());
+        dst.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        dst.extend_from_slice(payload);
+        Ok(())
+    }
+
+    pub fn encoded_len(payload_len: usize) -> usize {
+        FRAME_HEADER_SIZE + payload_len
     }
 
     pub fn decode(src: &mut BytesMut) -> Option<Frame> {
@@ -127,16 +139,57 @@ pub(crate) fn coalesce_encoded_frames(frames: &[Vec<u8>], max_packet_len: usize)
     for frame in frames {
         if frame.len() > max_packet_len {
             if !current.is_empty() {
-                out.push(std::mem::take(&mut current));
+                out.push(std::mem::replace(
+                    &mut current,
+                    Vec::with_capacity(max_packet_len),
+                ));
             }
             out.push(frame.clone());
             continue;
         }
 
         if current.len() + frame.len() > max_packet_len && !current.is_empty() {
-            out.push(std::mem::take(&mut current));
+            out.push(std::mem::replace(
+                &mut current,
+                Vec::with_capacity(max_packet_len),
+            ));
         }
         current.extend_from_slice(frame);
+    }
+
+    if !current.is_empty() {
+        out.push(current);
+    }
+
+    out
+}
+
+pub(crate) fn coalesce_encoded_frames_owned(
+    frames: Vec<Vec<u8>>,
+    max_packet_len: usize,
+) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut current = Vec::new();
+
+    for frame in frames {
+        if frame.len() > max_packet_len {
+            if !current.is_empty() {
+                out.push(std::mem::replace(
+                    &mut current,
+                    Vec::with_capacity(max_packet_len),
+                ));
+            }
+            out.push(frame);
+            continue;
+        }
+
+        if current.len() + frame.len() > max_packet_len && !current.is_empty() {
+            out.push(std::mem::replace(
+                &mut current,
+                Vec::with_capacity(max_packet_len),
+            ));
+        }
+        current.extend_from_slice(&frame);
     }
 
     if !current.is_empty() {

@@ -88,8 +88,9 @@ pub(super) fn check_counter_replay(
     let session_id = raw_counter >> 24;
     let sequence = raw_counter & 0x00FF_FFFF;
 
-    let mut key_material = derived_psk.to_vec();
-    key_material.extend_from_slice(&session_id.to_be_bytes());
+    let mut key_material = [0u8; 40];
+    key_material[..derived_psk.len()].copy_from_slice(derived_psk);
+    key_material[derived_psk.len()..].copy_from_slice(&session_id.to_be_bytes());
     let cache_key = derive_counter_cache_key(&key_material);
 
     match COUNTER_CACHE.lock() {

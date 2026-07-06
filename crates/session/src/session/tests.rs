@@ -532,7 +532,7 @@ async fn dropped_submitted_stream_clears_pending_client_buffers() {
     drop(stream);
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    assert!(!client.pending_data.lock().await.contains_key(&sid));
+    assert!(!client.pending_data.lock().await.contains(sid));
     assert!(!client.pending_fin.lock().await.contains(&sid));
     assert_eq!(client.active_stream_count().await, 0);
 
