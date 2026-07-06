@@ -8,7 +8,7 @@ Experimental TLS + Noise tunnel for transport protocol research.
 
 ```
 Application:   SOCKS5 / HTTP CONNECT proxy
-Session:       Multiplexed streams + single-flush stream open + bimodal TLS record dispatch
+Session:       Multiplexed streams + single-flush stream open + active traffic-shaped TLS record dispatch
 Transport:     Noise_NNpsk0 (X25519 + ChaChaPoly + BLAKE2s) inside TLS 1.3 records
 Outer TLS:     ClientHello presets (firefox / rustls / python-openssl)
                + cached reference endpoint record mirroring
@@ -34,7 +34,7 @@ Detailed mechanism reference: [docs/MECHANISM.md](docs/MECHANISM.md)
 - **Single binary**: `cargo build --release`. Mode auto-detected from inbound protocol types.
 - **TLS fingerprint presets**: `firefox`, `rustls`, `python-openssl` (alias `baseline`). Default `firefox`. Custom ClientHello hex via `template_path`.
 - **Idle teardown**: Pin-reset idle timer per session; resets on each successful read. Idle timeout (default 45 s) triggers graceful session teardown with Noise-encrypted `close_notify` and TCP FIN. No application-layer heartbeat — kernel TCP keepalive (60 s idle, 30 s interval, 3 retries on Linux) handles dead-peer detection.
-- **Bimodal record sizing**: Full bulk blocks are exact 16406-byte records (16384 content + 1 inner content type + 16 AEAD tag + 5 header, matching real Firefox TLS 1.3). Tail records (< 16382 B) use jittered padding (80% ≤32 B via exponential distribution, 20% full-block fill) producing wire sizes from n+24 to 16406. Control frames use HTTP/2-mimicking discrete sizes (33-82 bytes) with occasional HEADERS-like continuous frames (274-824 B C2S, 124-424 B S2C) via state-aware sampler (handshake pool vs transport pool).
+- **Active traffic shaping**: A full-lifecycle Markov state machine (TrafficShaper) actively slices, pads, and paces every application-data (0x17) record to shaper-dictated wire lengths — plaintext size never maps to wire size. Supports an optional Restls-style declarative script (`traffic_script`) for deterministic control over post-handshake packet sequences, including inter-record Delay timing (log-normal or pre-recorded IAT replay) and asymmetric FakeResponse interactions (CMD_PADDING). All padding bytes are sourced from a shared 8 MiB CSPRNG-seeded noise pool, cryptographically isomorphic to genuine AEAD ciphertext.
 - **Template hot-reload**: `template_path` hex files are polled every 30 s for mtime changes. On update, the file is re-parsed, the template cache invalidated, and new connections pick up the fresh ClientHello without restart. Failed parses are logged but preserve the previous template.
 
 ## Quick Start
@@ -395,6 +395,7 @@ The server config accepts an optional `camouflage.fallback` object (all fields h
 | `settings.camouflage.fallback`             | server | Pre-auth fallback tuning (see below) |
 | `settings.session.max_streams_per_session` | both   | Max streams per tunnel (default 256) |
 | `settings.session.idle_timeout_secs`       | both   | Session idle timeout (default 45)    |
+| `settings.session.traffic_script`          | both   | Optional Restls-style traffic script (see docs/MECHANISM.md §3.5) |
 
 ### Outbound fields (server)
 
@@ -422,6 +423,7 @@ The server config accepts an optional `camouflage.fallback` object (all fields h
 | `settings.tls.template_path`               | Path to captured ClientHello hex file; overrides Firefox/Python-OpenSSL templates (ignored for `rustls`). Hot-reloaded via 30 s mtime polling. |
 | `settings.session.idle_timeout_secs`       | Session idle timeout (default 45)                                                                   |
 | `settings.session.max_streams_per_session` | Max streams per tunnel (default 256)                                                                |
+| `settings.session.traffic_script`          | Optional Restls-style traffic script (see docs/MECHANISM.md §3.5)                                   |
 
 ## Handshake Sequence
 
@@ -440,7 +442,7 @@ Client                                 Server                       Reference En
   |--- CCS (0x14) + Finished ghost ----->|  (Noise-encrypted in 0x17)
   |--- H2 SETTINGS ghost (0x17) -------->|  (65–77 B plaintext variant)
   |                                      |                                    |
-  |<====== Noise transport (0x17) ======>|  bimodal: bulk 16406/exp-jittered tail / ctrl HTTP/2-mimicking
+  |<====== Noise transport (0x17) ======>|  shaped: TrafficShaper-dictated / ctrl HTTP/2-mimicking
 ```
 
 ## License

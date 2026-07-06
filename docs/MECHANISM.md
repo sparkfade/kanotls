@@ -119,14 +119,11 @@ The shaper maintains three macro-states that govern sizing policy over the conne
 | `InteractiveControl` | Sampled from HTTP/2 discrete + HEADERS distributions (reuses `control_size`) | 15% chance Log-Normal IAT | Mimics web-application request/response patterns with variable-sized records. |
 | `AsymmetricBulk` | Full MTU-anchored records (`max_data_record_wire_len` ≈ 16406) | None | Sustained high-throughput transfers; removes fragmentation caps to anchor sizes to realistic web-framing boundaries. |
 
-**Transition logic**: state is re-evaluated per emitted packet using a sliding window of recent payload sizes (`RECENT_WINDOW_SIZE = 8`):
-- `InteractiveControl → AsymmetricBulk`: at least `BULK_ENTRY_THRESHOLD` (3) of the last 8 payloads are full-capacity — indicating a sustained large transfer.
-- `AsymmetricBulk → InteractiveControl`: at least `BULK_EXIT_THRESHOLD` (6) of the last 8 payloads are small — transfer is winding down.
-- `HandshakeShaping →`: After ≥6 control frames (handshake complete), the shaper enters `InteractiveControl` (if scripted prefix still active, script rules govern instead).
+**Transition logic**: state is re-evaluated per emitted packet using **probabilistic smoothing**. The probability `p_bulk = pending_len / max_pending_flush_size` drives transitions: a nearly-full pending backlog strongly biases entry into `AsymmetricBulk`, while a drained buffer biases exit back to `InteractiveControl` (exit probability capped at 85%). This replaces the v1.1 deterministic thresholds with a continuous probability ramp that avoids state oscillation at the boundary.
 
 ### 3.5 Restls-Style Script Engine
 
-The script engine provides deterministic control over the first 12 post-handshake data packets (`SCRIPTED_PACKET_PREFIX`). Each rule defines:
+The script engine provides deterministic control over post-handshake data packets. Script rules are cycled with `packet_seq % script.len()`. After the script's natural end, a **smooth blend window** (`SCRIPT_BLEND_WINDOW = 6` packets) linearly ramps the probability of falling through to the Markov machine from 0% to 100%, eliminating the hard "first-N-packets" cliff. Each rule defines:
 
 ```
 ScriptRule { len_lo, len_hi, delay: DelaySpec, expect_responses: u8 }
@@ -146,7 +143,12 @@ Length: 300~400, Delay: 1.5~0.5, FakeResponse: 2
 
 ### 3.6 IAT Delay Modeling
 
-Inter-record delays use a **log-normal distribution** sourced via Box-Muller normal sampling (`sample_log_normal(mu, sigma)` → `Duration::from_micros`). This fits the right-skewed, positive-definite distribution of real TCP inter-arrival times better than uniform or exponential jitter. The Markov InteractiveControl state applies a 15% delay probability; the script engine applies delays per-rule. AsymmetricBulk state uses zero delay (back-to-back emission) to preserve throughput.
+Inter-record delays use two delay specifications:
+
+- **`DelaySpec::LogNormal { mu_ms, sigma_ms }`**: Log-normal distribution sourced via Box-Muller normal sampling (`sample_log_normal(mu, sigma)` → `Duration::from_micros`). This fits the right-skewed, positive-definite distribution of real TCP inter-arrival times better than uniform or exponential jitter.
+- **`DelaySpec::Replay(&[u32])`**: Pre-recorded IAT (Inter-Arrival Time) traces in microseconds, read circularly with `packet_seq % len`. Used for replaying reference-endpoint connection timing sequences.
+
+The Markov `InteractiveControl` state applies a 15% delay probability; the script engine applies delays per-rule. `AsymmetricBulk` state uses zero delay (back-to-back emission) to preserve throughput.
 
 ### 3.7 Noise Pool (Entropy Alignment)
 
@@ -321,7 +323,7 @@ The `session` block (optional, under `settings` in both client outbounds and ser
 |---|---|---|---|
 | `max_streams_per_session` | usize | 256 | Maximum concurrent multiplexed streams per tunnel session. |
 | `idle_timeout_secs` | u64 | 45 | Session idle teardown timeout (with ±10% jitter). |
-| `traffic_script` | optional string | (embedded default) | Restls-style script controlling the first 12 post-handshake data packets (§3.5). Example: `"Length: 200~250, Delay: 0, FakeResponse: 0\nLength: 300~400, Delay: 2.0~0.5, FakeResponse: 1"`. Malformed rules trigger a non-fatal startup warning; the embedded default is used as fallback. |
+| `traffic_script` | optional string | (embedded default) | Restls-style script controlling post-handshake data packets (§3.5). Rules are cycled with `packet_seq % N` and transition to the Markov machine via a 6-packet smooth blend window. Example: `"Length: 200~250, Delay: 0, FakeResponse: 0\nLength: 300~400, Delay: 2.0~0.5, FakeResponse: 1"`. Malformed rules trigger a non-fatal startup warning; the embedded default is used as fallback. |
 
 The embedded default script:
 ```
@@ -333,4 +335,4 @@ Length: 200~300, Delay: 0, FakeResponse: 1
 Length: 400~600, Delay: 3.0~0.7, FakeResponse: 0
 ```
 
-After the scripted prefix is exhausted, the TrafficShaper's Markov state machine (§3.4) governs sizing and delay for the remainder of the connection lifecycle. No configuration surface exists for the Markov transition parameters — they are derived from the sliding window of recent payload sizes and are directionally symmetric.
+After the script rules are exhausted (with the smooth blend window bridging into the Markov machine), the TrafficShaper's Markov state machine (§3.4) governs sizing and delay for the remainder of the connection lifecycle. No configuration surface exists for the Markov transition parameters — they are derived from the pending backlog pressure via a probabilistic `p_bulk` ramp and are directionally symmetric.
