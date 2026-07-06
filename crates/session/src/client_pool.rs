@@ -1344,8 +1344,7 @@ mod tests {
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 5;
 
-        let pool =
-            TestPool::new_with_behavior_for_test(test_session_config(), behavior, connector);
+        let pool = TestPool::new_with_behavior_for_test(test_session_config(), behavior, connector);
         let first = FakeSession::new(1);
         first.set_buffered_stream_bytes(4096);
         let second = FakeSession::new(1);
@@ -1373,8 +1372,7 @@ mod tests {
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 5;
 
-        let pool =
-            TestPool::new_with_behavior_for_test(test_session_config(), behavior, connector);
+        let pool = TestPool::new_with_behavior_for_test(test_session_config(), behavior, connector);
         pool.inner.register_connection(FakeSession::new(1)).await;
         pool.inner.register_connection(FakeSession::new(1)).await;
 
@@ -1525,8 +1523,7 @@ mod tests {
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 0;
 
-        let pool =
-            TestPool::new_with_behavior_for_test(test_session_config(), behavior, connector);
+        let pool = TestPool::new_with_behavior_for_test(test_session_config(), behavior, connector);
         pool.spawn_connections_for_test(1, false).await;
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1743,8 +1740,7 @@ mod tests {
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 5;
 
-        let pool =
-            TestPool::new_with_behavior_for_test(test_session_config(), behavior, connector);
+        let pool = TestPool::new_with_behavior_for_test(test_session_config(), behavior, connector);
         let busy = FakeSession::new(pool.inner.streams_per_connection_target());
         pool.inner.register_connection(busy).await;
 

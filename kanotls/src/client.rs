@@ -111,7 +111,12 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
         .as_ref()
         .and_then(|s| s.traffic_script.clone());
     let pool = Arc::new(ClientPool::new(
-        SessionConfig::with_script(true, max_streams_per_session, idle_timeout_secs, traffic_script),
+        SessionConfig::with_script(
+            true,
+            max_streams_per_session,
+            idle_timeout_secs,
+            traffic_script,
+        ),
         ClientPoolConnectOptions {
             server_addr: server_addr.clone(),
             sni: sni.clone(),
