@@ -4,82 +4,53 @@ use crate::frame::{
 };
 use crate::stream::{Stream, StreamInit, StreamOpenState, StreamParts};
 use crate::shaper::TrafficShaper;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use kanotls_tunnel::{FlowDirection, SnowyStream};
-use std::collections::{HashMap, HashSet};
-use std::pin::Pin;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
-use std::task::{Context, Poll};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify, RwLock};
 use tracing::{debug, error, trace, warn};
 
-struct SplitInner {
-    stream: StdMutex<SnowyStream>,
+#[derive(Default)]
+pub(crate) struct PendingData {
+    queues: HashMap<u32, VecDeque<Vec<u8>>>,
 }
 
-struct SplitReadHalf {
-    inner: Arc<SplitInner>,
-}
-
-struct SplitWriteHalf {
-    inner: Arc<SplitInner>,
-}
-
-fn split_snowy(stream: SnowyStream) -> (SplitReadHalf, SplitWriteHalf) {
-    let inner = Arc::new(SplitInner {
-        stream: StdMutex::new(stream),
-    });
-    (
-        SplitReadHalf {
-            inner: inner.clone(),
-        },
-        SplitWriteHalf { inner },
-    )
-}
-
-impl AsyncRead for SplitReadHalf {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let mut guard = self.inner.stream.lock().unwrap();
-        let stream = unsafe { Pin::new_unchecked(&mut *guard) };
-        stream.poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for SplitWriteHalf {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let mut guard = self.inner.stream.lock().unwrap();
-        let stream = unsafe { Pin::new_unchecked(&mut *guard) };
-        stream.poll_write(cx, buf)
+impl PendingData {
+    pub fn contains(&self, sid: u32) -> bool {
+        self.queues.contains_key(&sid)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let mut guard = self.inner.stream.lock().unwrap();
-        let stream = unsafe { Pin::new_unchecked(&mut *guard) };
-        stream.poll_flush(cx)
+    pub fn remove(&mut self, sid: u32) -> Option<VecDeque<Vec<u8>>> {
+        self.queues.remove(&sid)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let mut guard = self.inner.stream.lock().unwrap();
-        let stream = unsafe { Pin::new_unchecked(&mut *guard) };
-        stream.poll_shutdown(cx)
+    pub fn clear(&mut self) {
+        self.queues.clear();
     }
-}
 
-impl SplitWriteHalf {
-    fn with_stream<R>(&self, f: impl FnOnce(&mut SnowyStream) -> R) -> R {
-        let mut guard = self.inner.stream.lock().unwrap();
-        f(&mut guard)
+    pub fn len(&self) -> usize {
+        self.queues.len()
+    }
+
+    pub fn entry(&mut self, sid: u32) -> &mut VecDeque<Vec<u8>> {
+        self.queues.entry(sid).or_default()
+    }
+
+    pub fn get_mut(&mut self, sid: u32) -> Option<&mut VecDeque<Vec<u8>>> {
+        self.queues.get_mut(&sid)
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.queues.values().flat_map(|q| q.iter()).map(Vec::len).sum()
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.queues.is_empty()
     }
 }
 
@@ -90,14 +61,14 @@ const MAX_PENDING_STREAM_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PENDING_STREAMS: usize = 1024;
 const STREAM_CHANNEL_CAPACITY: usize = 32;
 const MAX_SESSION_REASSEMBLY_BYTES: usize = 1024 * 1024;
-const WRITE_CHANNEL_CAPACITY: usize = 64;
 const MAX_STREAM_OVERFLOW_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PENDING_FLUSH_SIZE: usize = 256 * 1024;
 
 const LAZY_FLUSH_MS: u64 = 5;
+const READ_CHANNEL_CAPACITY: usize = 64;
 
 pub struct Session {
-    read_half: Mutex<Option<SplitReadHalf>>,
+    read_rx: Mutex<Option<mpsc::Receiver<Bytes>>>,
     pub(crate) writer: SharedTunnelWriter,
     pub(crate) streams: Arc<RwLock<HashMap<u32, StreamHandle>>>,
     pub(crate) next_stream_id: AtomicU32,
@@ -110,7 +81,7 @@ pub struct Session {
     close_notify: Arc<Notify>,
     pending_inbound_streams: AtomicUsize,
     pending_open_streams: Arc<Mutex<HashMap<u32, PendingOpenStream>>>,
-    pub(crate) pending_data: Arc<Mutex<HashMap<u32, Vec<Vec<u8>>>>>,
+    pub(crate) pending_data: Arc<Mutex<PendingData>>,
     pending_fin: Arc<Mutex<HashSet<u32>>>,
     closing_streams: Arc<Mutex<HashSet<u32>>>,
     on_new_stream: Option<Arc<dyn Fn(u32) -> bool + Send + Sync>>,
@@ -152,7 +123,7 @@ pub(crate) enum PendingAcceptFlushResult {
 struct PendingStreamHandleGuard {
     stream_id: u32,
     streams: Arc<RwLock<HashMap<u32, StreamHandle>>>,
-    pending_data: Arc<Mutex<HashMap<u32, Vec<Vec<u8>>>>>,
+    pending_data: Arc<Mutex<PendingData>>,
     pending_fin: Arc<Mutex<HashSet<u32>>>,
     closing_streams: Arc<Mutex<HashSet<u32>>>,
     cleanup: Option<SubmittedOpenCleanup>,
@@ -183,8 +154,8 @@ pub(crate) enum TrafficClass {
 }
 
 pub(crate) struct SessionWriter {
-    control_tx: mpsc::Sender<WriteRequest>,
-    bulk_tx: mpsc::Sender<WriteRequest>,
+    control_tx: mpsc::UnboundedSender<WriteRequest>,
+    bulk_tx: mpsc::UnboundedSender<WriteRequest>,
     close_requested: Arc<AtomicBool>,
     close_notify: Arc<Notify>,
 }
@@ -220,17 +191,18 @@ impl Session {
         } else {
             None
         };
-        let (read_half, write_half) = split_snowy(tunnel);
         let close_requested = Arc::new(AtomicBool::new(false));
         let close_notify = Arc::new(Notify::new());
         let activity = Arc::new(ActivityTracker::new());
+        let (read_tx, read_rx) = mpsc::channel::<Bytes>(READ_CHANNEL_CAPACITY);
         let writer = Arc::new(SessionWriter::new(
-            write_half,
+            tunnel,
             close_requested.clone(),
             close_notify.clone(),
             activity.clone(),
             config.is_client,
             config.traffic_script.as_deref(),
+            read_tx,
         ));
         let idle_timeout_with_jitter_secs = {
             let base = config.idle_timeout_secs.max(1);
@@ -241,7 +213,7 @@ impl Session {
         };
 
         Self {
-            read_half: Mutex::new(Some(read_half)),
+            read_rx: Mutex::new(Some(read_rx)),
             writer: writer.clone(),
             streams: Arc::new(RwLock::new(HashMap::new())),
             next_stream_id: AtomicU32::new(if config.is_client { 1 } else { 0 }),
@@ -254,7 +226,7 @@ impl Session {
             close_notify,
             pending_inbound_streams: AtomicUsize::new(0),
             pending_open_streams: Arc::new(Mutex::new(HashMap::new())),
-            pending_data: Arc::new(Mutex::new(HashMap::new())),
+            pending_data: Arc::new(Mutex::new(PendingData::default())),
             pending_fin: Arc::new(Mutex::new(HashSet::new())),
             closing_streams: Arc::new(Mutex::new(HashSet::new())),
             on_new_stream,
@@ -330,7 +302,7 @@ impl Session {
     }
 
     pub(crate) async fn clear_pending_client_stream_state(&self, sid: u32) {
-        self.pending_data.lock().await.remove(&sid);
+        self.pending_data.lock().await.remove(sid);
         self.pending_fin.lock().await.remove(&sid);
     }
 
@@ -470,8 +442,9 @@ impl Session {
 
         let mut encoded = Vec::new();
         for chunk in data.chunks(MAX_PAYLOAD_LEN) {
-            let frame = Frame::psh(sid, chunk.to_vec());
-            encoded.push(frame.encode()?);
+            let mut pkt = Vec::with_capacity(Frame::encoded_len(chunk.len()));
+            Frame::encode_psh_into(&mut pkt, sid, chunk)?;
+            encoded.push(pkt);
         }
         self.write_many_encoded_payloads(&encoded, FlushBehavior::Auto, TrafficClass::Bulk)
             .await?;
@@ -511,14 +484,13 @@ impl Session {
     }
 
     pub async fn run_read_loop(&self) -> Result<(), anyhow::Error> {
-        let mut read_half = self
-            .read_half
+        let mut read_rx = self
+            .read_rx
             .lock()
             .await
             .take()
             .ok_or_else(|| anyhow::anyhow!("session read loop already running"))?;
-        let mut buf = BytesMut::with_capacity(16384);
-        let mut read_buf = vec![0u8; 16384];
+        let mut buf = BytesMut::with_capacity(65536);
 
         let mut settings_received = self.is_client;
 
@@ -545,27 +517,23 @@ impl Session {
                     idle_timeout.as_mut().reset(tokio::time::Instant::now() + idle_duration);
                     continue;
                 }
-                result = read_half.read(&mut read_buf) => result,
+                data = read_rx.recv() => data,
             };
 
             idle_timeout
                 .as_mut()
                 .reset(tokio::time::Instant::now() + idle_duration);
 
-            let n = match read_result {
-                Ok(0) => {
+            match read_result {
+                Some(data) => {
+                    self.activity.record_read_activity();
+                    buf.extend_from_slice(&data);
+                }
+                None => {
                     debug!("tunnel eof, ending read loop");
                     break;
                 }
-                Ok(n) => n,
-                Err(e) => {
-                    error!("tunnel read error: {}", e);
-                    break;
-                }
             };
-
-            self.activity.record_read_activity();
-            buf.extend_from_slice(&read_buf[..n]);
             if buf.len() > MAX_SESSION_REASSEMBLY_BYTES {
                 warn!(
                     "closing session: frame reassembly buffer exceeded {} bytes",
@@ -654,7 +622,7 @@ impl Session {
                         let has_pending = self
                             .pending_data
                             .try_lock()
-                            .map(|guard| guard.contains_key(&frame.stream_id))
+                            .map(|guard| guard.contains(frame.stream_id))
                             .unwrap_or(true);
 
                         if !has_pending {
@@ -826,11 +794,11 @@ impl Session {
                         .pending_data
                         .lock()
                         .await
-                        .contains_key(&frame.stream_id)
+                        .contains(frame.stream_id)
                         || self.pending_fin.lock().await.contains(&frame.stream_id);
                     if tx.send(payload).is_err() {
                         self.streams.write().await.remove(&frame.stream_id);
-                        self.pending_data.lock().await.remove(&frame.stream_id);
+                        self.pending_data.lock().await.remove(frame.stream_id);
                         self.pending_fin.lock().await.remove(&frame.stream_id);
                         return Ok(());
                     }
@@ -885,13 +853,13 @@ impl Session {
 
     async fn store_pending_data(&self, sid: u32, payload: Vec<u8>) -> bool {
         let mut pending = self.pending_data.lock().await;
-        let total_bytes: usize = pending.values().flatten().map(Vec::len).sum();
+        let total_bytes: usize = pending.total_bytes();
         if total_bytes.saturating_add(payload.len()) > MAX_PENDING_STREAM_BYTES {
             warn!("dropping pending stream data: pending byte limit exceeded");
             return false;
         }
 
-        if !pending.contains_key(&sid) && pending.len() >= MAX_PENDING_STREAMS {
+        if !pending.contains(sid) && pending.len() >= MAX_PENDING_STREAMS {
             warn!(
                 stream_id = sid,
                 "dropping pending stream data: pending stream limit exceeded"
@@ -899,7 +867,7 @@ impl Session {
             return false;
         }
 
-        let queue = pending.entry(sid).or_default();
+        let queue = pending.entry(sid);
         let stream_bytes: usize = queue.iter().map(Vec::len).sum();
         if stream_bytes.saturating_add(payload.len()) > MAX_STREAM_OVERFLOW_BYTES {
             warn!(
@@ -915,7 +883,7 @@ impl Session {
             );
             return false;
         }
-        queue.push(payload);
+        queue.push_back(payload);
         true
     }
 
@@ -1103,7 +1071,7 @@ impl Session {
                 .pending_data
                 .lock()
                 .await
-                .remove(&sid)
+                .remove(sid)
                 .unwrap_or_default();
             let pending_fin = self.pending_fin.lock().await.remove(&sid);
             (pending_data, pending_fin, data_tx, fin_tx, notify)
@@ -1140,9 +1108,9 @@ impl Session {
 
         if !remaining.is_empty() {
             let mut pending = self.pending_data.lock().await;
-            let queue = pending.entry(sid).or_default();
+            let queue = pending.entry(sid);
             for item in remaining {
-                queue.push(item);
+                queue.push_back(item);
             }
             drop(pending);
             notify.notify_one();
@@ -1158,20 +1126,21 @@ impl Session {
 
 impl SessionWriter {
     fn new(
-        write_half: SplitWriteHalf,
+        snow_stream: SnowyStream,
         close_requested: Arc<AtomicBool>,
         close_notify: Arc<Notify>,
         activity: Arc<ActivityTracker>,
         is_client: bool,
         traffic_script: Option<&str>,
+        read_tx: mpsc::Sender<Bytes>,
     ) -> Self {
         let direction = if is_client {
             FlowDirection::C2S
         } else {
             FlowDirection::S2C
         };
-        let (control_tx, control_rx) = mpsc::channel(WRITE_CHANNEL_CAPACITY);
-        let (bulk_tx, bulk_rx) = mpsc::channel(WRITE_CHANNEL_CAPACITY);
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (bulk_tx, bulk_rx) = mpsc::unbounded_channel();
         let run_close_requested = close_requested.clone();
         let run_close_notify = close_notify.clone();
         let run_activity = activity.clone();
@@ -1179,7 +1148,7 @@ impl SessionWriter {
         let script_owned = traffic_script.map(|s| s.to_string());
         tokio::spawn(async move {
             Self::run(
-                write_half,
+                snow_stream,
                 control_rx,
                 bulk_rx,
                 run_close_requested,
@@ -1187,6 +1156,7 @@ impl SessionWriter {
                 run_activity,
                 run_direction,
                 script_owned,
+                read_tx,
             )
             .await;
         });
@@ -1234,7 +1204,6 @@ impl SessionWriter {
             response_tx,
             flush,
         })
-        .await
         .map_err(|_| anyhow::anyhow!("session writer closed"))?;
 
         Ok(PendingWrite {
@@ -1257,7 +1226,7 @@ impl SessionWriter {
             TrafficClass::Control => &self.control_tx,
             TrafficClass::Bulk => &self.bulk_tx,
         };
-        tx.try_send(WriteRequest {
+        tx.send(WriteRequest {
             packets,
             response_tx,
             flush,
@@ -1267,20 +1236,22 @@ impl SessionWriter {
 
     #[allow(clippy::too_many_arguments)]
     async fn run(
-        mut write_half: SplitWriteHalf,
-        mut control_rx: mpsc::Receiver<WriteRequest>,
-        mut bulk_rx: mpsc::Receiver<WriteRequest>,
+        mut snow_stream: SnowyStream,
+        mut control_rx: mpsc::UnboundedReceiver<WriteRequest>,
+        mut bulk_rx: mpsc::UnboundedReceiver<WriteRequest>,
         close_requested: Arc<AtomicBool>,
         close_notify: Arc<Notify>,
         activity: Arc<ActivityTracker>,
         direction: FlowDirection,
         traffic_script: Option<String>,
+        read_tx: mpsc::Sender<Bytes>,
     ) {
         let mut pending: Vec<u8> = Vec::with_capacity(65536);
         let mut responders: Vec<(usize, oneshot::Sender<Result<(), String>>)> = Vec::new();
         let mut total_queued: usize = 0;
         let mut total_emitted: usize = 0;
         let mut shaper = TrafficShaper::new(direction, traffic_script.as_deref());
+        let mut read_buf = BytesMut::zeroed(16384);
 
         loop {
             if close_requested.load(Ordering::Relaxed) {
@@ -1306,10 +1277,10 @@ impl SessionWriter {
                     }
 
                     if !pending.is_empty() {
-                        match Self::drive_shaper(&mut pending, &mut shaper, &mut write_half, &activity).await {
+                        match Self::drive_shaper(&mut pending, &mut shaper, &mut snow_stream, &activity).await {
                             Ok((fake_frames, consumed)) => {
                                 total_emitted += consumed;
-                                let _ = Self::emit_fake_frames(&mut write_half, direction, &fake_frames).await;
+                                let _ = Self::emit_fake_frames(&mut snow_stream, direction, &fake_frames).await;
                                 while !responders.is_empty() && responders[0].0 <= total_emitted {
                                     let (_, tx) = responders.remove(0);
                                     let _ = tx.send(Ok(()));
@@ -1326,37 +1297,65 @@ impl SessionWriter {
                         }
                     }
 
-                    let prepare_result: Result<(), String> =
-                        write_half.with_stream(|stream| {
-                            let state = stream.control_state();
-                            for packet in &request.packets {
-                                let size = stream.next_control_size(state, direction);
-                                debug!(
-                                    "control write: frame_cmd=0x{:02x} wire_size={}",
-                                    packet.first().unwrap_or(&0),
-                                    size
-                                );
-                                if let Err(e) = stream.prepare_control_record(packet, size) {
-                                    return Err(e.to_string());
-                                }
-                                shaper.note_control_frame();
+                    {
+                        let state = snow_stream.control_state();
+                        let mut err: Option<String> = None;
+                        for packet in &request.packets {
+                            let size = snow_stream.next_control_size(state, direction);
+                            debug!(
+                                "control write: frame_cmd=0x{:02x} wire_size={}",
+                                packet.first().unwrap_or(&0),
+                                size
+                            );
+                            if let Err(e) = snow_stream.prepare_control_record(packet, size) {
+                                err = Some(e.to_string());
+                                break;
                             }
-                            Ok(())
-                        });
+                            shaper.note_control_frame();
+                        }
+                        if let Some(msg) = err {
+                            let _ = request.response_tx.send(Err(msg.clone()));
+                            break;
+                        }
+                    }
 
-                    match prepare_result {
-                        Err(msg) => {
+                    match snow_stream.flush().await {
+                        Err(e) => {
+                            let msg = e.to_string();
                             let _ = request.response_tx.send(Err(msg.clone()));
                             break;
                         }
                         Ok(()) => {
-                            if let Err(e) = write_half.flush().await {
-                                let msg = e.to_string();
-                                let _ = request.response_tx.send(Err(msg.clone()));
-                                break;
-                            }
                             activity.record_write_activity();
                             let _ = request.response_tx.send(Ok(()));
+                        }
+                    }
+                }
+                read_result = async {
+                    read_buf.resize(16384, 0);
+                    let n = snow_stream.read(&mut read_buf[..]).await?;
+                    if n == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "tunnel eof",
+                        ));
+                    }
+                    activity.record_read_activity();
+                    let chunk = read_buf.split_to(n).freeze();
+                    read_tx.send(chunk).await.map_err(|_| {
+                        std::io::Error::other("session read channel closed")
+                    })?;
+                    Ok(())
+                } => {
+                    match read_result {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            debug!("tunnel eof, ending writer read path");
+                            break;
+                        }
+                        Err(e) => {
+                            error!("tunnel read error: {}", e);
+                            break;
                         }
                     }
                 }
@@ -1382,10 +1381,10 @@ impl SessionWriter {
                     if request.flush == FlushBehavior::Immediate
                         || pending.len() >= MAX_PENDING_FLUSH_SIZE
                     {
-                        match Self::drive_shaper(&mut pending, &mut shaper, &mut write_half, &activity).await {
+                        match Self::drive_shaper(&mut pending, &mut shaper, &mut snow_stream, &activity).await {
                             Ok((fake_frames, consumed)) => {
                                 total_emitted += consumed;
-                                let _ = Self::emit_fake_frames(&mut write_half, direction, &fake_frames).await;
+                                let _ = Self::emit_fake_frames(&mut snow_stream, direction, &fake_frames).await;
                                 while !responders.is_empty() && responders[0].0 <= total_emitted {
                                     let (_, tx) = responders.remove(0);
                                     let _ = tx.send(Ok(()));
@@ -1402,10 +1401,10 @@ impl SessionWriter {
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(LAZY_FLUSH_MS)), if !pending.is_empty() => {
-                    match Self::drive_shaper(&mut pending, &mut shaper, &mut write_half, &activity).await {
+                    match Self::drive_shaper(&mut pending, &mut shaper, &mut snow_stream, &activity).await {
                         Ok((fake_frames, consumed)) => {
                             total_emitted += consumed;
-                            let _ = Self::emit_fake_frames(&mut write_half, direction, &fake_frames).await;
+                            let _ = Self::emit_fake_frames(&mut snow_stream, direction, &fake_frames).await;
                         }
                         Err(e) => {
                             let msg = e.to_string();
@@ -1424,12 +1423,12 @@ impl SessionWriter {
         }
 
         if !pending.is_empty() {
-            let _ = Self::drive_shaper(&mut pending, &mut shaper, &mut write_half, &activity).await;
+            let _ = Self::drive_shaper(&mut pending, &mut shaper, &mut snow_stream, &activity).await;
             for (_, tx) in responders.drain(..) {
                 let _ = tx.send(Ok(()));
             }
         }
-        let _ = write_half.shutdown().await;
+        let _ = snow_stream.shutdown().await;
     }
 
     /// Drain the plaintext backlog into individually-sized 0x17 records, each
@@ -1445,7 +1444,7 @@ impl SessionWriter {
     async fn drive_shaper(
         pending: &mut Vec<u8>,
         shaper: &mut TrafficShaper,
-        write_half: &mut SplitWriteHalf,
+        snow_stream: &mut SnowyStream,
         activity: &ActivityTracker,
     ) -> std::io::Result<(Vec<Vec<u8>>, usize)> {
         let mut fake_frames = Vec::new();
@@ -1464,19 +1463,16 @@ impl SessionWriter {
                 .min(SnowyStream::data_record_capacity());
             let take = payload_cap.min(remaining);
 
-            let prepared = {
+            {
                 let slice = &pending[consumed..consumed + take];
-                write_half.with_stream(|stream| {
-                    stream.prepare_data_record(slice, policy.target_wire_len)
-                })
-            };
-            prepared?;
+                snow_stream.prepare_data_record(slice, policy.target_wire_len)?;
+            }
 
             consumed += take;
             shaper.record_payload_size(take);
             shaper.advance();
 
-            write_half.flush().await?;
+            tokio::io::AsyncWriteExt::flush(&mut *snow_stream).await?;
 
             if let Some(fake) = &policy.fake {
                 let frame = Frame::padding_request(fake.responses);
@@ -1500,22 +1496,21 @@ impl SessionWriter {
 
     /// Emit fake-response control frames generated by the shaper.
     async fn emit_fake_frames(
-        write_half: &mut SplitWriteHalf,
+        snow_stream: &mut SnowyStream,
         direction: FlowDirection,
         frames: &[Vec<u8>],
     ) -> std::io::Result<()> {
         if frames.is_empty() {
             return Ok(());
         }
-        write_half.with_stream(|stream| {
-            let state = stream.control_state();
+        {
+            let state = snow_stream.control_state();
             for packet in frames {
-                let size = stream.next_control_size(state, direction);
-                stream.prepare_control_record(packet, size)?;
+                let size = snow_stream.next_control_size(state, direction);
+                snow_stream.prepare_control_record(packet, size)?;
             }
-            std::io::Result::Ok(())
-        })?;
-        write_half.flush().await
+        }
+        tokio::io::AsyncWriteExt::flush(snow_stream).await
     }
 }
 
@@ -1586,7 +1581,7 @@ impl Drop for PendingStreamHandleGuard {
         }
 
         if let Ok(mut pending) = pending_data.try_lock() {
-            pending.remove(&stream_id);
+            pending.remove(stream_id);
         }
         if let Ok(mut pending) = pending_fin.try_lock() {
             pending.remove(&stream_id);
@@ -1601,7 +1596,7 @@ impl Drop for PendingStreamHandleGuard {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 streams.write().await.remove(&stream_id);
-                pending_data.lock().await.remove(&stream_id);
+                pending_data.lock().await.remove(stream_id);
                 pending_fin.lock().await.remove(&stream_id);
             });
         }

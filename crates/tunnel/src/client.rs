@@ -123,11 +123,13 @@ pub async fn client_tunnel(
                         );
                         continue;
                     }
-                    let mut unmasked_payload = payload.to_vec();
+                    let mut unmasked_payload = [0u8; MAX_TLS_RECORD_PAYLOAD_LEN];
+                    let plen = payload.len();
+                    unmasked_payload[..plen].copy_from_slice(payload);
                     let server_e_mask = derive_noise_e_mask(&derived_psk, &client_noise_tag);
                     xor_in_place(&mut unmasked_payload[..32], &server_e_mask);
-                    let mut e_ee = vec![0u8; 16384];
-                    match noise.read_message(&unmasked_payload, &mut e_ee) {
+                    let mut e_ee = [0u8; MAX_TLS_RECORD_PAYLOAD_LEN];
+                    match noise.read_message(&unmasked_payload[..plen], &mut e_ee) {
                         Ok(len) => {
                             if len >= HANDSHAKE_CONTROL_LEN
                                 && &e_ee[..HANDSHAKE_CONTROL_MAGIC.len()] == HANDSHAKE_CONTROL_MAGIC
