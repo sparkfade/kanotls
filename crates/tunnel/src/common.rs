@@ -358,8 +358,7 @@ impl SnowyStream {
     fn drain_tx_agg_buf_exact(&mut self) -> io::Result<()> {
         while !self.tx_agg_buf.is_empty() {
             let data_len = self.tx_agg_buf.len().min(BLOCK_DATA_CAPACITY);
-            let target_plaintext_len =
-                data_len + BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN;
+            let target_plaintext_len = data_len + BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN;
             {
                 let data = &self.tx_agg_buf[..data_len];
                 encrypt_variable_block(
@@ -681,10 +680,8 @@ pub const MIN_CONTROL_WIRE_LEN: usize =
 
 /// Minimum on-wire size of a shaped 0x17 data record carrying zero payload
 /// bytes (2-byte length prefix + 1-byte inner content type).
-pub const MIN_DATA_WIRE_LEN: usize = TLS_RECORD_HEADER_LEN
-    + BLOCK_LEN_PREFIX_SIZE
-    + INNER_CONTENT_TYPE_LEN
-    + AEAD_TAG_LEN;
+pub const MIN_DATA_WIRE_LEN: usize =
+    TLS_RECORD_HEADER_LEN + BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN + AEAD_TAG_LEN;
 
 fn encrypt_variable_block(
     noise: &mut TransportState,

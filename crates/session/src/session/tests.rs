@@ -863,7 +863,10 @@ async fn high_throughput_bulk_transfer_preserves_stream_integrity() {
             .await
             .expect("server accepts stream")
             .expect("server accepts stream");
-    assert_eq!(server_stream.read().await, Some(b"bulk.example:443".to_vec()));
+    assert_eq!(
+        server_stream.read().await,
+        Some(b"bulk.example:443".to_vec())
+    );
     server_stream
         .send_synack()
         .await
@@ -932,6 +935,182 @@ async fn high_throughput_bulk_transfer_preserves_stream_integrity() {
     server.session.force_close();
 }
 
+#[tokio::test]
+async fn concurrent_bidirectional_bulk_transfer_keeps_session_usable() {
+    let (client, server) = session_pair().await;
+
+    async fn open_test_stream(
+        client: &Arc<Session>,
+        server: &ServerSessionHandler,
+        target: &'static [u8],
+    ) -> (crate::Stream, crate::server::ServerStream) {
+        let mut client_stream = client.open_stream().await.expect("client stream opens");
+        client_stream
+            .write_early(target)
+            .await
+            .expect("client sends target");
+        let (_sid, mut server_stream) =
+            tokio::time::timeout(Duration::from_secs(1), server.accept_stream())
+                .await
+                .expect("server accepts stream")
+                .expect("server accepts stream");
+        assert_eq!(server_stream.read().await, Some(target.to_vec()));
+        server_stream
+            .send_synack()
+            .await
+            .expect("server sends synack");
+        client_stream.wait_open().await.expect("stream opens");
+        (client_stream, server_stream)
+    }
+
+    let (mut down_client_stream, mut down_server_stream) =
+        open_test_stream(&client, &server, b"down.example:443").await;
+    let (mut up_client_stream, mut up_server_stream) =
+        open_test_stream(&client, &server, b"up.example:443").await;
+
+    const EACH_WAY: usize = 2 * 1024 * 1024;
+    let c2s_pattern = |i: usize| -> u8 { ((i * 17 + 11) % 251) as u8 };
+    let s2c_pattern = |i: usize| -> u8 { ((i * 29 + 3) % 253) as u8 };
+
+    let down_writer = tokio::spawn(async move {
+        let mut sent = 0usize;
+        let chunk_sizes = [32768usize, 98304, 5000, 131072];
+        let mut k = 0usize;
+        while sent < EACH_WAY {
+            let n = chunk_sizes[k % chunk_sizes.len()].min(EACH_WAY - sent);
+            let mut buf = vec![0u8; n];
+            for (j, b) in buf.iter_mut().enumerate() {
+                *b = s2c_pattern(sent + j);
+            }
+            down_server_stream
+                .write(&buf)
+                .await
+                .expect("server writes bulk");
+            sent += n;
+            k += 1;
+        }
+        down_server_stream
+            .close_write()
+            .await
+            .expect("server half closes");
+        sent
+    });
+
+    let down_reader = tokio::spawn(async move {
+        let mut received = 0usize;
+        let mut ok = true;
+        while let Some(data) = down_client_stream.read().await {
+            for (j, &b) in data.iter().enumerate() {
+                if b != s2c_pattern(received + j) {
+                    ok = false;
+                    break;
+                }
+            }
+            received += data.len();
+            if !ok || received >= EACH_WAY {
+                break;
+            }
+        }
+        (received, ok)
+    });
+
+    let up_writer = tokio::spawn(async move {
+        let mut sent = 0usize;
+        let chunk_sizes = [4096usize, 65536, 131072, 7777];
+        let mut k = 0usize;
+        while sent < EACH_WAY {
+            let n = chunk_sizes[k % chunk_sizes.len()].min(EACH_WAY - sent);
+            let mut buf = vec![0u8; n];
+            for (j, b) in buf.iter_mut().enumerate() {
+                *b = c2s_pattern(sent + j);
+            }
+            up_client_stream
+                .write(&buf)
+                .await
+                .expect("client writes bulk");
+            sent += n;
+            k += 1;
+        }
+        up_client_stream
+            .close_write()
+            .await
+            .expect("client half closes");
+        sent
+    });
+
+    let up_reader = tokio::spawn(async move {
+        let mut received = 0usize;
+        let mut ok = true;
+        while let Some(data) = up_server_stream.read().await {
+            for (j, &b) in data.iter().enumerate() {
+                if b != c2s_pattern(received + j) {
+                    ok = false;
+                    break;
+                }
+            }
+            received += data.len();
+            if !ok || received >= EACH_WAY {
+                break;
+            }
+        }
+        (received, ok)
+    });
+
+    let down_sent = tokio::time::timeout(Duration::from_secs(30), down_writer)
+        .await
+        .expect("down writer must not deadlock")
+        .expect("down writer joins");
+    let up_sent = tokio::time::timeout(Duration::from_secs(30), up_writer)
+        .await
+        .expect("up writer must not deadlock")
+        .expect("up writer joins");
+    let (down_received, down_ok) = tokio::time::timeout(Duration::from_secs(30), down_reader)
+        .await
+        .expect("down reader must not deadlock")
+        .expect("down reader joins");
+    let (up_received, up_ok) = tokio::time::timeout(Duration::from_secs(30), up_reader)
+        .await
+        .expect("up reader must not deadlock")
+        .expect("up reader joins");
+
+    assert!(down_ok, "client observed corrupted server->client bytes");
+    assert!(up_ok, "server observed corrupted client->server bytes");
+    assert_eq!(down_sent, EACH_WAY);
+    assert_eq!(down_received, EACH_WAY);
+    assert_eq!(up_sent, EACH_WAY);
+    assert_eq!(up_received, EACH_WAY);
+
+    let mut probe = client.open_stream().await.expect("probe stream opens");
+    probe
+        .write_early(b"probe.example:443")
+        .await
+        .expect("probe sends target");
+    let (_probe_sid, mut probe_server_stream) =
+        tokio::time::timeout(Duration::from_secs(1), server.accept_stream())
+            .await
+            .expect("server accepts probe stream")
+            .expect("server accepts probe stream");
+    assert_eq!(
+        probe_server_stream.read().await,
+        Some(b"probe.example:443".to_vec())
+    );
+    probe_server_stream
+        .send_synack()
+        .await
+        .expect("probe synack");
+    probe.wait_open().await.expect("probe opens");
+    probe.write(b"ping").await.expect("probe writes ping");
+    assert_eq!(probe_server_stream.read().await, Some(b"ping".to_vec()));
+    probe_server_stream
+        .write(b"pong")
+        .await
+        .expect("probe writes pong");
+    assert_eq!(probe.read().await, Some(b"pong".to_vec()));
+
+    client.force_close();
+    server.session.force_close();
+}
+
 // Phase 2 CMD_PADDING integration: verify the fake-response engine works
 // end-to-end — a request triggers M split replies on the peer, replies are
 // silently discarded, and concurrent stream data is not corrupted.
@@ -973,7 +1152,10 @@ async fn cmd_padding_request_triggers_split_replies_and_preserves_stream_data() 
     // Write stream data from client in the opposite direction while the
     // control path processes the padding burst.
     let payload = b"stream-data-after-padding";
-    stream.write(payload).await.expect("client writes stream data");
+    stream
+        .write(payload)
+        .await
+        .expect("client writes stream data");
 
     let received = tokio::time::timeout(Duration::from_secs(2), server_stream.read())
         .await
@@ -993,7 +1175,7 @@ async fn cmd_padding_request_triggers_split_replies_and_preserves_stream_data() 
 // both peers without affecting any stream state.
 #[tokio::test]
 async fn cmd_padding_reply_flag_is_silently_absorbed() {
-    use super::{TrafficClass, FlushBehavior};
+    use super::{FlushBehavior, TrafficClass};
     let (client, server) = session_pair().await;
 
     // Open a stream to confirm the data path stays clean.
@@ -1025,13 +1207,12 @@ async fn cmd_padding_reply_flag_is_silently_absorbed() {
         .expect("server injects stray reply");
 
     // Stream data should flow unimpeded.
-    stream.write(b"healthy").await.expect("client writes after stray padding");
-    assert_eq!(
-        server_stream.read().await,
-        Some(b"healthy".to_vec())
-    );
+    stream
+        .write(b"healthy")
+        .await
+        .expect("client writes after stray padding");
+    assert_eq!(server_stream.read().await, Some(b"healthy".to_vec()));
 
     client.force_close();
     server.session.force_close();
 }
-
