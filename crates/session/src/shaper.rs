@@ -3,6 +3,7 @@ use std::time::Duration;
 
 const RECENT_WINDOW_SIZE: usize = 8;
 const MAX_PENDING_FLUSH_SIZE: usize = 256 * 1024;
+const BULK_FAST_PATH_THRESHOLD: usize = MAX_PENDING_FLUSH_SIZE / 2;
 #[allow(dead_code)]
 const CONTROL_FRAMES_HANDSHAKE: u64 = 6;
 
@@ -22,7 +23,10 @@ pub(crate) enum MacroState {
 #[allow(dead_code)]
 pub(crate) enum DelaySpec {
     None,
-    LogNormal { mu_ms: f64, sigma_ms: f64 },
+    LogNormal {
+        mu_ms: f64,
+        sigma_ms: f64,
+    },
     /// Replay pre-recorded IAT (Inter-Arrival Time) values from a
     /// reference endpoint trace. Values are in microseconds. The
     /// array is read circularly with `packet_seq % len`.
@@ -153,6 +157,16 @@ impl TrafficShaper {
         debug_assert!(pending_len > 0);
         let conn_state = self.connection_state();
         let cap = SnowyStream::data_record_capacity();
+
+        if pending_len >= BULK_FAST_PATH_THRESHOLD || pending_len >= cap {
+            self.state = MacroState::AsymmetricBulk;
+            return ShapePolicy {
+                target_wire_len: SnowyStream::max_data_record_wire_len(),
+                delay: Duration::ZERO,
+                fake: None,
+                allow_full_block: true,
+            };
+        }
 
         if conn_state == ConnectionState::Handshake {
             return self.handshake_policy(pending_len, cap);
@@ -297,7 +311,6 @@ impl TrafficShaper {
         self.recent_payload_sizes[self.recent_payload_idx % RECENT_WINDOW_SIZE] = size;
         self.recent_payload_idx = self.recent_payload_idx.wrapping_add(1);
     }
-
 }
 
 fn delay_from_spec(spec: &DelaySpec, packet_seq: u64) -> Duration {
@@ -348,8 +361,14 @@ fn parse_script(text: &str) -> Result<Vec<ScriptRule>, String> {
             if let Some(rest) = part.strip_prefix("Length:") {
                 let rest = rest.trim();
                 if let Some((lo, hi)) = rest.split_once('~') {
-                    let lo: usize = lo.trim().parse().map_err(|e| format!("bad len_lo: {}", e))?;
-                    let hi: usize = hi.trim().parse().map_err(|e| format!("bad len_hi: {}", e))?;
+                    let lo: usize = lo
+                        .trim()
+                        .parse()
+                        .map_err(|e| format!("bad len_lo: {}", e))?;
+                    let hi: usize = hi
+                        .trim()
+                        .parse()
+                        .map_err(|e| format!("bad len_hi: {}", e))?;
                     if lo > hi {
                         return Err(format!("len_lo {} > len_hi {}", lo, hi));
                     }
@@ -360,8 +379,14 @@ fn parse_script(text: &str) -> Result<Vec<ScriptRule>, String> {
                 delay = if rest == "0" {
                     DelaySpec::None
                 } else if let Some((mu_s, sigma_s)) = rest.split_once('~') {
-                    let mu: f64 = mu_s.trim().parse().map_err(|e| format!("bad delay mu: {}", e))?;
-                    let sigma: f64 = sigma_s.trim().parse().map_err(|e| format!("bad delay sigma: {}", e))?;
+                    let mu: f64 = mu_s
+                        .trim()
+                        .parse()
+                        .map_err(|e| format!("bad delay mu: {}", e))?;
+                    let sigma: f64 = sigma_s
+                        .trim()
+                        .parse()
+                        .map_err(|e| format!("bad delay sigma: {}", e))?;
                     DelaySpec::LogNormal {
                         mu_ms: mu,
                         sigma_ms: sigma,
@@ -378,11 +403,15 @@ fn parse_script(text: &str) -> Result<Vec<ScriptRule>, String> {
                     }
                 };
             } else if let Some(rest) = part.strip_prefix("FakeResponse:") {
-                fake_response = rest.trim().parse().map_err(|e| format!("bad fake: {}", e))?;
+                fake_response = rest
+                    .trim()
+                    .parse()
+                    .map_err(|e| format!("bad fake: {}", e))?;
             }
         }
 
-        let (len_lo, len_hi) = len_range.ok_or_else(|| format!("missing Length field in '{}'", line))?;
+        let (len_lo, len_hi) =
+            len_range.ok_or_else(|| format!("missing Length field in '{}'", line))?;
         rules.push(ScriptRule {
             len_lo,
             len_hi,
