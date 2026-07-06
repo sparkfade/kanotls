@@ -33,8 +33,8 @@ Detailed mechanism reference: [docs/MECHANISM.md](docs/MECHANISM.md)
 - **Destination guardrails**: Server rejects loopback, private, link-local, multicast, broadcast, unspecified, CGNAT, reserved (`240.0.0.0/4`), and port-0 destinations.
 - **Single binary**: `cargo build --release`. Mode auto-detected from inbound protocol types.
 - **TLS fingerprint presets**: `firefox`, `rustls`, `python-openssl` (alias `baseline`). Default `firefox`. Custom ClientHello hex via `template_path`.
-- **Idle teardown**: Pin-reset idle timer per session; resets on each successful read. Idle timeout (default 45 s) triggers graceful session teardown with Noise-encrypted `close_notify` and TCP FIN. No application-layer heartbeat — kernel TCP keepalive (60 s idle, 30 s interval, 3 retries on Linux) handles dead-peer detection.
-- **Active traffic shaping**: A full-lifecycle Markov state machine (TrafficShaper) actively slices, pads, and paces every application-data (0x17) record to shaper-dictated wire lengths — plaintext size never maps to wire size. Supports an optional Restls-style declarative script (`traffic_script`) for deterministic control over post-handshake packet sequences, including inter-record Delay timing (log-normal or pre-recorded IAT replay) and asymmetric FakeResponse interactions (CMD_PADDING). All padding bytes are sourced from a shared 8 MiB CSPRNG-seeded noise pool, cryptographically isomorphic to genuine AEAD ciphertext.
+- **Idle teardown**: Pin-reset idle timer per session; resets on each successful read. Idle timeout (default 45 s, configurable with ±10% jitter) triggers graceful session teardown with Noise-encrypted `close_notify` and TCP FIN. No application-layer heartbeat — kernel TCP keepalive (60 s idle, 30 s interval, 3 retries on Linux) handles dead-peer detection.
+- **Active traffic shaping**: A full-lifecycle Markov state machine (TrafficShaper) actively slices, pads, and paces every application-data (0x17) record to shaper-dictated wire lengths — plaintext size never maps to wire size. Supports an optional declarative script (`traffic_script`) for deterministic control over post-handshake packet sequences, including inter-record Delay timing (log-normal or pre-recorded IAT replay) and asymmetric FakeResponse interactions (CMD_PADDING). All padding bytes are sourced from a shared 8 MiB CSPRNG-seeded noise pool, cryptographically isomorphic to genuine AEAD ciphertext.
 - **Template hot-reload**: `template_path` hex files are polled every 30 s for mtime changes. On update, the file is re-parsed, the template cache invalidated, and new connections pick up the fresh ClientHello without restart. Failed parses are logged but preserve the previous template.
 
 ## Quick Start
@@ -68,7 +68,8 @@ Start with `kanotls --config config.json`. Role auto-detection: `"protocol": "tu
         },
         "session": {
           "max_streams_per_session": 256,
-          "idle_timeout_secs": 60
+          "idle_timeout_secs": 45,
+          "traffic_script": "Length: 200~250, Delay: 0, FakeResponse: 0\nLength: 180~220, Delay: 1.5~0.6, FakeResponse: 0\nLength: 250~350, Delay: 0, FakeResponse: 1\nLength: 300~400, Delay: 2.0~0.5, FakeResponse: 0\nLength: 200~300, Delay: 0, FakeResponse: 1\nLength: 400~600, Delay: 3.0~0.7, FakeResponse: 0"
         }
       }
     }
@@ -77,8 +78,7 @@ Start with `kanotls --config config.json`. Role auto-detection: `"protocol": "tu
     {
       "tag": "direct",
       "protocol": "direct"
-    }
-,
+    },
     // SOCKS5 upstream proxy outbound (see Server Outbounds section):
     // {
     //   "tag": "socks5-out",
@@ -133,8 +133,9 @@ Start with `kanotls --config config.json`. Role auto-detection: `"protocol": "tu
           "template_path": "/etc/kanotls/firefox_client_hello.hex"
         },
         "session": {
-          "idle_timeout_secs": 60,
-          "max_streams_per_session": 256
+          "max_streams_per_session": 256,
+          "idle_timeout_secs": 45,
+          "traffic_script": "Length: 200~250, Delay: 0, FakeResponse: 0\nLength: 180~220, Delay: 1.5~0.6, FakeResponse: 0\nLength: 250~350, Delay: 0, FakeResponse: 1\nLength: 300~400, Delay: 2.0~0.5, FakeResponse: 0\nLength: 200~300, Delay: 0, FakeResponse: 1\nLength: 400~600, Delay: 3.0~0.7, FakeResponse: 0"
         }
       }
     }
@@ -200,13 +201,34 @@ The client inbound `protocol` field accepts `"socks"` as an alias for `"socks5"`
 
 `idle_timeout_secs` on the client side is clamped to the range `[5, 3600]` at runtime (config validation accepts `[1, 3600]`). Server-side configuration is unclamped.
 
-The session read loop uses a pin-reset idle timer (default 45 s) that resets on each successful read. When the timer fires and no streams are active, the session tears down gracefully. No application-layer heartbeat is sent — kernel TCP keepalive handles dead-peer detection.
+The session read loop uses a pin-reset idle timer (default 45 s, with ±10% jitter) that resets on each successful read. When the timer fires and no streams are active, the session tears down gracefully with a Noise-encrypted `close_notify` and TCP FIN. No application-layer heartbeat is sent — kernel TCP keepalive handles dead-peer detection.
 
-The server pre-allocates an 8 MiB entropy pool (`ENTROPY_POOL`) at startup, used for ghost record payload generation during synthetic camouflage replay.
+Both server and client pre-allocate an 8 MiB entropy pool at startup, used for active record padding and camouflage ghost-record payload generation during synthetic replay.
+
+### Traffic Script
+
+`traffic_script` is an **optional** declarative program that controls the size, timing, and peer-interaction behavior of post-handshake application-data records. When omitted, an embedded default script (6 rules, shown in the config examples above) is used. `session.max_streams_per_session`, `session.idle_timeout_secs`, and `session.traffic_script` are all optional — see the [Config Reference](#config-reference) for which side each field applies to.
+
+The script is one rule per line; `#` comments and blank lines are ignored. Rules are applied cyclically via `packet_seq % rule_count` and, once exhausted, blend into the Markov shaping machine over a 6-packet window (see docs/MECHANISM.md §3.5). Each rule has three fields:
+
+| Field | Format | Meaning |
+|-------|--------|---------|
+| `Length` | `lo~hi` | Application-content byte count for this record, sampled uniformly from `[lo, hi]`. The shaper pads (or splits) to the resulting wire size, decoupling wire size from real payload size. `lo` must be ≤ `hi`. **Required.** |
+| `Delay` | `0` \| `mu~sigma` \| `n` | Inter-record pause. `0` = no delay; `mu~sigma` = log-normal distribution with parameters in milliseconds; a bare integer `n` = shorthand for `ln(n)~0.5`. |
+| `FakeResponse` | integer | If `> 0`, after flushing this record the sender queues a `CMD_PADDING` request and the peer replies with that many asymmetric cover frames (breaks request/response symmetry). `0` disables it. |
+
+Example (each `\n` is a literal newline inside the JSON string):
+
+```
+Length: 200~250, Delay: 0, FakeResponse: 0
+Length: 300~400, Delay: 2.0~0.5, FakeResponse: 1
+```
+
+Malformed rules are non-fatal: a warning is logged at startup and the entire embedded default script is used as fallback.
 
 ### TLS Configuration
 
-The outer TLS ClientHello is generated per the `fingerprint` preset. `insecure` affects only the native-rustls generation path. Endpoint authentication and payload confidentiality come entirely from `Noise_NNpsk0` with the configured `password`. The server uses cached reference-endpoint profiles for visible record replay; `template_path` overrides the Firefox/Python-OpenSSL templates with a captured hex file (ignored by `rustls`).
+The outer TLS ClientHello is generated per the `fingerprint` preset. `insecure` (default `false`) disables TLS certificate verification in the native-rustls ClientHello generation path. Endpoint authentication and payload confidentiality come entirely from `Noise_NNpsk0` with the configured `password` — the outer TLS layer provides camouflage only. The server uses cached reference-endpoint profiles for visible record replay; `template_path` overrides the Firefox/Python-OpenSSL templates with a captured hex file (ignored by `rustls`).
 
 ### TLS Fingerprint Presets
 
@@ -263,6 +285,7 @@ The server XOR-unmasks, validates the Noise tag and counter MAC, checks counter 
 | FIN | 0x03 | Close stream |
 | SETTINGS | 0x04 | Session capability negotiation |
 | SYNACK | 0x07 | Stream open acknowledgment |
+| PADDING | 0x08 | Fake-response interaction engine |
 
 Max payload per frame: 65535 bytes. Adjacent frames are coalesced within the limit, then encrypted as TLS records.
 
@@ -272,16 +295,16 @@ Client fuses `[SETTINGS] [SYN] [PSH(target)] [PSH(data)]` into one coalesced flu
 
 ### Connection Pool (Client)
 
-- **Target pool size**: 4–16 concurrent connections, seeded by fingerprint family, SNI, and time-of-day
+- **Target pool size**: Seeded from fingerprint family, SNI, and time-of-day (default 4–16)
 - **Staggered startup**: Initial connections spawn with jittered delays (50–2500 ms)
-- **Soft TTL rotation**: After 120–300 s (seeded), connections stop accepting new streams
+- **Soft TTL rotation**: 120–300 s (seeded), connections stop accepting new streams
 - **Idle drain**: 30 s idle with no active streams → connection closed
 - **Demand-driven scaling**: New connections spawn only when waiters exist
 - **Load-aware selection**: Connections chosen by stream count and buffered-traffic bytes
 
 ### Idle Teardown
 
-Session read loop uses a pinned `tokio::time::sleep` timer that resets on each successful read. On idle timeout tick (default 45 s), the session checks whether any streams are active; if idle, it sends a Noise-encrypted TLS `close_notify` (0x15) and TCP FIN, tearing down the connection gracefully. No CMD_PING heartbeat is sent at the application layer — kernel TCP keepalive (60 s idle, 30 s interval, 3 retries on Linux) serves as the dead-peer detection mechanism instead.
+Session read loop uses a pinned `tokio::time::sleep` timer that resets on each successful read. On idle timeout tick (default 45 s, configurable with ±10% jitter), the session checks whether any streams are active; if idle, it sends a Noise-encrypted TLS `close_notify` (0x15) and TCP FIN, tearing down the connection gracefully. No CMD_PING heartbeat is sent at the application layer — kernel TCP keepalive (60 s idle, 30 s interval, 3 retries on Linux) serves as the dead-peer detection mechanism instead.
 
 ## Camouflage Endpoint Caching
 
@@ -357,7 +380,7 @@ The server config accepts an optional `camouflage.fallback` object (all fields h
 | `cooldown_duration_secs` | 300 | Cooldown after rate-limit (s) |
 | `connect_timeout_secs` | 3 | Connection timeout (s) |
 
-> **Note**: These fields are accepted during config parsing but are **not yet wired** into the runtime. Actual pre-auth fallback limits are randomized at startup from fixed ranges (see Pre-Auth Fallback table above).
+> The fields above are accepted at config parse time for forward-compatibility. The actual pre-auth fallback limits are randomized at startup from hardcoded ranges (see Pre-Auth Fallback table). The config values are reserved for a future tunable-fallback feature.
 
 ## Constraint Invariants
 
@@ -369,7 +392,7 @@ The server config accepts an optional `camouflage.fallback` object (all fields h
 | Max active sessions | 4096 |
 | Counter sliding window | 64-bit bitmap (tolerates up to 63 behind) |
 | Replay cache | 65536 entries, 600 s retention |
-| ServerHello downgrade sentinel | Last 8 bytes preserved |
+| Max streams per session | 4096 (config validation) |
 
 ## Config Reference
 
@@ -393,9 +416,9 @@ The server config accepts an optional `camouflage.fallback` object (all fields h
 | `settings.camouflage.host`                 | server | Reference TLS 1.3 endpoint hostname (DNS name; IP literals rejected) |
 | `settings.camouflage.port`                 | server | Reference endpoint port              |
 | `settings.camouflage.fallback`             | server | Pre-auth fallback tuning (see below) |
-| `settings.session.max_streams_per_session` | both   | Max streams per tunnel (default 256) |
-| `settings.session.idle_timeout_secs`       | both   | Session idle timeout (default 45)    |
-| `settings.session.traffic_script`          | both   | Optional Restls-style traffic script (see docs/MECHANISM.md §3.5) |
+| `settings.session.max_streams_per_session` | both   | Optional. Max streams per tunnel (default 256) |
+| `settings.session.idle_timeout_secs`       | both   | Optional. Session idle timeout (default 45)    |
+| `settings.session.traffic_script`          | both   | Optional. Declarative traffic script (see docs/MECHANISM.md §3.5 and the Traffic Script section above) |
 
 ### Outbound fields (server)
 
@@ -410,20 +433,20 @@ The server config accepts an optional `camouflage.fallback` object (all fields h
 
 ### Outbound fields (client)
 
-| Field                                      | Description                                                                                         |
-| --------------------------------------------| -----------------------------------------------------------------------------------------------------|
-| `tag`                                      | Routing tag                                                                                         |
-| `protocol`                                 | Must be `"tunnel"`                                                                                  |
-| `settings.server`                          | Server address                                                                                      |
-| `settings.port`                            | Server port                                                                                         |
-| `settings.password`                        | Pre-shared key                                                                                      |
-| `settings.tls.sni`                         | ClientHello SNI (DNS name; IP literals rejected)                                                    |
-| `settings.tls.insecure`                    | ClientHello-generation flag (default `false`)                                                       |
-| `settings.tls.fingerprint`                 | Preset: `firefox` (default), `rustls`, `python-openssl`, `baseline`                                 |
-| `settings.tls.template_path`               | Path to captured ClientHello hex file; overrides Firefox/Python-OpenSSL templates (ignored for `rustls`). Hot-reloaded via 30 s mtime polling. |
-| `settings.session.idle_timeout_secs`       | Session idle timeout (default 45)                                                                   |
-| `settings.session.max_streams_per_session` | Max streams per tunnel (default 256)                                                                |
-| `settings.session.traffic_script`          | Optional Restls-style traffic script (see docs/MECHANISM.md §3.5)                                   |
+| Field | Description |
+|--------|----------------|
+| `tag` | Routing tag |
+| `protocol` | Must be `"tunnel"` |
+| `settings.server` | Server address |
+| `settings.port` | Server port |
+| `settings.password` | Pre-shared key (min 32 bytes) |
+| `settings.tls.sni` | ClientHello SNI (DNS name; IP literals rejected) |
+| `settings.tls.insecure` | Optional. Skip TLS cert verification in rustls path (default `false`). Only affects the native-rustls ClientHello generation; Noise provides endpoint auth. |
+| `settings.tls.fingerprint` | Optional. Preset: `firefox` (default), `rustls`, `python-openssl`, `baseline` |
+| `settings.tls.template_path` | Optional. Path to captured ClientHello hex file; overrides Firefox/Python-OpenSSL templates (ignored for `rustls`). Hot-reloaded via 30 s mtime polling. |
+| `settings.session.idle_timeout_secs` | Optional. Session idle timeout (default 45, clamped to [5,3600] client-side) |
+| `settings.session.max_streams_per_session` | Optional. Max streams per tunnel (default 256, validated to [1,4096]) |
+| `settings.session.traffic_script` | Optional. Declarative traffic script (see docs/MECHANISM.md §3.5 and the Traffic Script section above) |
 
 ## Handshake Sequence
 
@@ -439,10 +462,11 @@ Client                                 Server                       Reference En
   |<-- Noise response (0x17) ------------|  (e, ee + KTL1 + ghost_count)
   |<-- Ghost 0x17 × N -------------------|  (fake ticket header + entropy)
   |                                      |                                    |
-  |--- CCS (0x14) + Finished ghost ----->|  (Noise-encrypted in 0x17)
+  |--- CCS (6 B plain) ----------------->|  (0x14 record, unencrypted)
+  |--- Finished ghost (0x17, 58 B) ----->|  (Noise-encrypted in 0x17)
   |--- H2 SETTINGS ghost (0x17) -------->|  (65–77 B plaintext variant)
   |                                      |                                    |
-  |<====== Noise transport (0x17) ======>|  shaped: TrafficShaper-dictated / ctrl HTTP/2-mimicking
+  |<====== Noise transport (0x17) ======>|  shaped: TrafficShaper-dictated / control HTTP/2-mimicking
 ```
 
 ## License
