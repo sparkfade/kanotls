@@ -1,7 +1,7 @@
 use lazy_static::lazy_static;
 use lru::LruCache;
 use rand::Rng;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -88,8 +88,14 @@ pub(super) struct CamouflageProfile {
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct PooledProfile {
+    pub(super) profile: CamouflageProfile,
+    pub(super) fetched_at: Instant,
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct CamouflageProfilePool {
-    pub(super) profiles: Vec<CamouflageProfile>,
+    pub(super) profiles: VecDeque<PooledProfile>,
 }
 
 pub(super) fn make_control_payload(ghost_count: u16) -> [u8; HANDSHAKE_CONTROL_LEN] {
@@ -214,8 +220,7 @@ pub(super) fn sample_camouflage_profile(pool: &CamouflageProfilePool) -> Option<
     let mut usable: Vec<CamouflageProfile> = pool
         .profiles
         .iter()
-        .cloned()
-        .map(sanitize_camouflage_profile)
+        .map(|entry| sanitize_camouflage_profile(entry.profile.clone()))
         .filter(|profile| camouflage_profile_rank(profile) > 0)
         .collect();
     if usable.is_empty() {
@@ -239,19 +244,31 @@ pub(super) fn push_profile_variant(
     let profile = sanitize_camouflage_profile(profile);
 
     if let Some(existing) = profiles.iter_mut().find(|existing| {
-        existing.server_records == profile.server_records
-            && existing.prefix_app_data_sizes == profile.prefix_app_data_sizes
-            && existing.app_data_sizes == profile.app_data_sizes
-            && existing.early_app_data_gap_ms == profile.early_app_data_gap_ms
-            && existing.first_app_data_delay_ms == profile.first_app_data_delay_ms
-            && existing.has_ccs == profile.has_ccs
+        existing.profile.server_records == profile.server_records
+            && existing.profile.prefix_app_data_sizes == profile.prefix_app_data_sizes
+            && existing.profile.app_data_sizes == profile.app_data_sizes
+            && existing.profile.early_app_data_gap_ms == profile.early_app_data_gap_ms
+            && existing.profile.first_app_data_delay_ms == profile.first_app_data_delay_ms
+            && existing.profile.has_ccs == profile.has_ccs
     }) {
-        *existing = profile;
+        existing.profile = profile;
+        existing.fetched_at = Instant::now();
     } else {
-        profiles.push(profile);
+        profiles.push_back(PooledProfile {
+            profile,
+            fetched_at: Instant::now(),
+        });
         if profiles.len() > MAX_CAMOUFLAGE_PROFILE_VARIANTS {
-            let drop_idx = rand::thread_rng().gen_range(0..profiles.len());
-            profiles.swap_remove(drop_idx);
+            // Pool full: evict the stalest sample so refreshed fetches keep
+            // the pool biased towards recently observed flights.
+            if let Some(oldest_idx) = profiles
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(idx, _)| idx)
+            {
+                profiles.remove(oldest_idx);
+            }
         }
     }
 
@@ -453,9 +470,7 @@ pub(super) async fn fetch_camouflage_flight(
             ));
         }
     }
-    if cached_handshake_profile.is_some()
-        && camouflage_refresh_is_cooling_down(&refresh_cooldown_key).await
-    {
+    if camouflage_refresh_is_cooling_down(&refresh_cooldown_key).await {
         if let Some(profile) = cached_handshake_profile.clone() {
             debug!(
                 host,
@@ -500,9 +515,7 @@ pub(super) async fn fetch_camouflage_flight(
                 profile,
             ));
         }
-        if cached_handshake_profile.is_some()
-            && camouflage_refresh_is_cooling_down(&refresh_cooldown_key).await
-        {
+        if camouflage_refresh_is_cooling_down(&refresh_cooldown_key).await {
             anyhow::bail!(
                 "camouflage refresh cooldown active after recent failure for {}:{}",
                 host,
@@ -524,11 +537,7 @@ pub(super) async fn fetch_camouflage_flight(
             flight
         }
         Err(e) => {
-            if cached_handshake_profile.is_some() {
-                note_camouflage_refresh_failure(refresh_cooldown_key).await;
-            } else {
-                clear_camouflage_refresh_failure(&refresh_cooldown_key).await;
-            }
+            note_camouflage_refresh_failure(refresh_cooldown_key).await;
             if let Some(lease) = refresh_lease.as_mut() {
                 lease.release_now();
             }
@@ -582,18 +591,6 @@ pub(super) async fn fetch_camouflage_flight(
     }
 
     Ok((server_records, sizes, profile))
-}
-
-pub(super) async fn has_complete_camouflage_cache(
-    host: &str,
-    port: u16,
-    client_hello: &[u8],
-) -> bool {
-    if let Some(profile) = lookup_cached_camouflage_profile(host, port, client_hello).await {
-        is_complete_camouflage_profile(&profile)
-    } else {
-        false
-    }
 }
 
 pub(super) fn maybe_spawn_camouflage_refresh_daemon(

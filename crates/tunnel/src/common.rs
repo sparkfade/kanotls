@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::OwnedSemaphorePermit;
-use tracing::{debug, warn};
+use tracing::{trace, warn};
 
 use crate::control_size::{self, ConnectionState, FlowDirection};
 use crate::utils::hash_with_key;
@@ -181,7 +181,6 @@ pub struct SnowyStream {
     io_buf: Box<[u8; MAX_TLS_RECORD_PAYLOAD_LEN]>,
     decrypt_buf: Box<[u8; MAX_TLS_RECORD_PAYLOAD_LEN]>,
     encrypt_buf: Box<[u8; BLOCK_PLAINTEXT_SIZE]>,
-    tx_agg_buf: Vec<u8>,
     control_frame_count: u64,
     _permit: Option<OwnedSemaphorePermit>,
 }
@@ -203,42 +202,13 @@ impl StreamState {
 
 impl SnowyStream {
     pub fn new(socket: TcpStream, noise: TransportState) -> Self {
-        Self::new_with_permit_and_pre_read(socket, noise, None, Vec::new())
+        Self::new_with_permit(socket, noise, None)
     }
 
-    pub fn new_with_permit_and_pre_read(
+    pub fn new_with_permit(
         socket: TcpStream,
         noise: TransportState,
         permit: Option<OwnedSemaphorePermit>,
-        pre_read: Vec<u8>,
-    ) -> Self {
-        SnowyStream {
-            socket,
-            noise,
-            state: StreamState::Open,
-            close_notify_written: false,
-            read_buf_inner: pre_read,
-            read_offset: 0,
-            write_buffer: Vec::with_capacity(
-                TLS_RECORD_HEADER_LEN + BLOCK_PLAINTEXT_SIZE + AEAD_TAG_LEN,
-            ),
-            write_offset: 0,
-            tls_rx_buf: BytesMut::with_capacity(MAX_TLS_RECORD_PAYLOAD_LEN + TLS_RECORD_HEADER_LEN),
-            tls_rx_offset: 0,
-            io_buf: Box::new([0u8; MAX_TLS_RECORD_PAYLOAD_LEN]),
-            decrypt_buf: Box::new([0u8; MAX_TLS_RECORD_PAYLOAD_LEN]),
-            encrypt_buf: Box::new([0u8; BLOCK_PLAINTEXT_SIZE]),
-            tx_agg_buf: Vec::with_capacity(BLOCK_DATA_CAPACITY * 2),
-            control_frame_count: 0,
-            _permit: permit,
-        }
-    }
-
-    pub fn new_with_permit_and_pre_read_tls(
-        socket: TcpStream,
-        noise: TransportState,
-        permit: Option<OwnedSemaphorePermit>,
-        pre_read_tls: Vec<u8>,
     ) -> Self {
         SnowyStream {
             socket,
@@ -251,24 +221,14 @@ impl SnowyStream {
                 TLS_RECORD_HEADER_LEN + BLOCK_PLAINTEXT_SIZE + AEAD_TAG_LEN,
             ),
             write_offset: 0,
-            tls_rx_buf: {
-                let mut buf =
-                    BytesMut::with_capacity(MAX_TLS_RECORD_PAYLOAD_LEN + TLS_RECORD_HEADER_LEN);
-                buf.extend_from_slice(&pre_read_tls);
-                buf
-            },
+            tls_rx_buf: BytesMut::with_capacity(MAX_TLS_RECORD_PAYLOAD_LEN + TLS_RECORD_HEADER_LEN),
             tls_rx_offset: 0,
             io_buf: Box::new([0u8; MAX_TLS_RECORD_PAYLOAD_LEN]),
             decrypt_buf: Box::new([0u8; MAX_TLS_RECORD_PAYLOAD_LEN]),
             encrypt_buf: Box::new([0u8; BLOCK_PLAINTEXT_SIZE]),
-            tx_agg_buf: Vec::with_capacity(BLOCK_DATA_CAPACITY * 2),
             control_frame_count: 0,
             _permit: permit,
         }
-    }
-
-    pub fn into_inner(self) -> TcpStream {
-        self.socket
     }
 
     pub fn control_state(&self) -> ConnectionState {
@@ -285,7 +245,6 @@ impl SnowyStream {
         target_wire_len: usize,
     ) -> io::Result<()> {
         self.control_frame_count = self.control_frame_count.saturating_add(1);
-        self.drain_tx_agg_buf_exact()?;
 
         let target_plaintext_len = target_wire_len
             .saturating_sub(TLS_RECORD_HEADER_LEN + AEAD_TAG_LEN)
@@ -351,29 +310,6 @@ impl SnowyStream {
     pub const fn max_data_record_wire_len() -> usize {
         TLS_RECORD_HEADER_LEN + BLOCK_PLAINTEXT_SIZE + AEAD_TAG_LEN
     }
-
-    /// Drain any bytes accumulated by the generic `AsyncWrite` path into
-    /// exact-size records. On the shaped session path `tx_agg_buf` is always
-    /// empty, so this is a defensive no-op there.
-    fn drain_tx_agg_buf_exact(&mut self) -> io::Result<()> {
-        while !self.tx_agg_buf.is_empty() {
-            let data_len = self.tx_agg_buf.len().min(BLOCK_DATA_CAPACITY);
-            let target_plaintext_len = data_len + BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN;
-            {
-                let data = &self.tx_agg_buf[..data_len];
-                encrypt_variable_block(
-                    &mut self.noise,
-                    &mut self.write_buffer,
-                    &mut self.encrypt_buf,
-                    data,
-                    target_plaintext_len,
-                    PadFill::Entropy,
-                )?;
-            }
-            self.tx_agg_buf.drain(..data_len);
-        }
-        Ok(())
-    }
 }
 
 fn parse_tls_record(buf: &[u8]) -> io::Result<Option<(usize, u8)>> {
@@ -392,7 +328,7 @@ fn parse_tls_record(buf: &[u8]) -> io::Result<Option<(usize, u8)>> {
     if buf.len() < total {
         return Ok(None);
     }
-    debug!(
+    trace!(
         "parse_tls_record: type=0x{:02x} payload_len={} total={}",
         frame_type, length, total
     );
@@ -453,7 +389,7 @@ impl AsyncRead for SnowyStream {
                                     && this.decrypt_buf[2] == INNER_CONTENT_TYPE_ALERT;
 
                                 if is_close_notify || is_fatal_alert {
-                                    debug!(
+                                    trace!(
                                         "received TLS alert in 0x17: {}",
                                         if is_close_notify {
                                             "close_notify"
@@ -478,7 +414,7 @@ impl AsyncRead for SnowyStream {
                                 } else {
                                     0
                                 };
-                                debug!(
+                                trace!(
                                     "decrypted 0x17: plaintext_len={} prefix_data_len={} consumed={}",
                                     len,
                                     prefix_data_len,
@@ -674,9 +610,6 @@ pub enum PadFill {
     /// ciphertext, so padded records leak no structure.
     Entropy,
 }
-
-pub const MIN_CONTROL_WIRE_LEN: usize =
-    TLS_RECORD_HEADER_LEN + BLOCK_LEN_PREFIX_SIZE + AEAD_TAG_LEN;
 
 /// Minimum on-wire size of a shaped 0x17 data record carrying zero payload
 /// bytes (2-byte length prefix + 1-byte inner content type).

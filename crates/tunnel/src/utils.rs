@@ -117,12 +117,18 @@ pub fn stable_client_hello_fingerprint(record: &[u8]) -> Option<[u8; 32]> {
     Some(hash_with_key(CLIENT_HELLO_FP_CONTEXT, &normalized))
 }
 
-fn normalize_client_hello_padding_extension(record: &mut Vec<u8>) -> Option<()> {
-    const PADDING_EXTENSION_TYPE: u16 = 0x0015;
+/// Validate the ClientHello record shape and walk its extension entries,
+/// invoking `visit(ext_type, entry_range)` for each entry (`entry_range` spans
+/// the 2-byte type, 2-byte length, and data). Returns the offset of the
+/// extensions-length u16 field, or None on any truncation. Shared by all
+/// ClientHello extension scanners below.
+fn walk_client_hello_extensions(
+    record: &[u8],
+    mut visit: impl FnMut(u16, std::ops::Range<usize>),
+) -> Option<usize> {
     if record.len() < 9 || record[0] != 0x16 || record[5] != 0x01 {
         return None;
     }
-
     let (_, session_id_range) = client_hello_random_and_session_id_ranges(record)?;
     let mut cursor = session_id_range.end;
     let cipher_suites_len =
@@ -146,98 +152,90 @@ fn normalize_client_hello_padding_extension(record: &mut Vec<u8>) -> Option<()> 
         if ext_end > extensions_end {
             return None;
         }
-        if ext_type == PADDING_EXTENSION_TYPE {
-            let removed = ext_end - cursor;
-            record.drain(cursor..ext_end);
-            let new_extensions_len = extensions_len.checked_sub(removed)? as u16;
-            record[extensions_len_start..extensions_len_start + 2]
-                .copy_from_slice(&new_extensions_len.to_be_bytes());
-            let record_len = u16::from_be_bytes([record[3], record[4]]) as usize;
-            let new_record_len = record_len.checked_sub(removed)? as u16;
-            record[3..5].copy_from_slice(&new_record_len.to_be_bytes());
-            let handshake_len =
-                ((record[6] as usize) << 16) | ((record[7] as usize) << 8) | record[8] as usize;
-            let new_handshake_len = handshake_len.checked_sub(removed)?;
-            record[6] = ((new_handshake_len >> 16) & 0xff) as u8;
-            record[7] = ((new_handshake_len >> 8) & 0xff) as u8;
-            record[8] = (new_handshake_len & 0xff) as u8;
-            return Some(());
-        }
+        visit(ext_type, cursor..ext_end);
         cursor = ext_end;
     }
 
+    Some(extensions_len_start)
+}
+
+fn normalize_client_hello_padding_extension(record: &mut Vec<u8>) -> Option<()> {
+    const PADDING_EXTENSION_TYPE: u16 = 0x0015;
+    let mut padding_entry = None;
+    let extensions_len_start = walk_client_hello_extensions(record, |ext_type, entry| {
+        if ext_type == PADDING_EXTENSION_TYPE && padding_entry.is_none() {
+            padding_entry = Some(entry);
+        }
+    })?;
+    let Some(entry) = padding_entry else {
+        return Some(());
+    };
+
+    let removed = entry.end - entry.start;
+    record.drain(entry);
+    let extensions_len =
+        u16::from_be_bytes([record[extensions_len_start], record[extensions_len_start + 1]])
+            as usize;
+    let new_extensions_len = extensions_len.checked_sub(removed)? as u16;
+    record[extensions_len_start..extensions_len_start + 2]
+        .copy_from_slice(&new_extensions_len.to_be_bytes());
+    let record_len = u16::from_be_bytes([record[3], record[4]]) as usize;
+    let new_record_len = record_len.checked_sub(removed)? as u16;
+    record[3..5].copy_from_slice(&new_record_len.to_be_bytes());
+    let handshake_len =
+        ((record[6] as usize) << 16) | ((record[7] as usize) << 8) | record[8] as usize;
+    let new_handshake_len = handshake_len.checked_sub(removed)?;
+    record[6] = ((new_handshake_len >> 16) & 0xff) as u8;
+    record[7] = ((new_handshake_len >> 8) & 0xff) as u8;
+    record[8] = (new_handshake_len & 0xff) as u8;
     Some(())
 }
 
 pub fn client_hello_key_share_range(record: &[u8]) -> Option<std::ops::Range<usize>> {
-    if record.len() < 9 || record[0] != 0x16 || record[5] != 0x01 {
-        return None;
-    }
-
-    let (_, session_id_range) = client_hello_random_and_session_id_ranges(record)?;
-    let mut cursor = session_id_range.end;
-    if cursor + 2 > record.len() {
-        return None;
-    }
-    let cipher_suites_len = u16::from_be_bytes([record[cursor], record[cursor + 1]]) as usize;
-    cursor += 2 + cipher_suites_len;
-    if cursor >= record.len() {
-        return None;
-    }
-
-    let compression_methods_len = record[cursor] as usize;
-    cursor += 1 + compression_methods_len;
-    if cursor + 2 > record.len() {
-        return None;
-    }
-
-    let extensions_len = u16::from_be_bytes([record[cursor], record[cursor + 1]]) as usize;
-    cursor += 2;
-    let extensions_end = cursor.checked_add(extensions_len)?;
-    if extensions_end > record.len() {
-        return None;
-    }
-
-    while cursor + 4 <= extensions_end {
-        let ext_type = u16::from_be_bytes([record[cursor], record[cursor + 1]]);
-        let ext_len = u16::from_be_bytes([record[cursor + 2], record[cursor + 3]]) as usize;
-        let ext_data = cursor + 4;
-        let ext_end = ext_data.checked_add(ext_len)?;
-        if ext_end > extensions_end {
-            return None;
+    let mut result = None;
+    let mut malformed = false;
+    walk_client_hello_extensions(record, |ext_type, entry| {
+        if ext_type != 0x0033 || result.is_some() || malformed {
+            return;
         }
-
-        if ext_type == 0x0033 {
-            if ext_len < 4 || ext_data + 2 > ext_end {
-                return None;
-            }
-            let mut share_cursor = ext_data + 2;
-            let mut first_share_range = None;
-            while share_cursor + 4 <= ext_end {
-                let group = u16::from_be_bytes([record[share_cursor], record[share_cursor + 1]]);
-                let share_len =
-                    u16::from_be_bytes([record[share_cursor + 2], record[share_cursor + 3]])
-                        as usize;
-                let share_start = share_cursor + 4;
-                let share_end = share_start.checked_add(share_len)?;
-                if share_end > ext_end {
-                    return None;
-                }
-                if first_share_range.is_none() {
-                    first_share_range = Some(share_start..share_end);
-                }
-                if group == 0x001d {
-                    return Some(share_start..share_end);
-                }
-                share_cursor = share_end;
-            }
-            return first_share_range;
+        let ext_data = entry.start + 4;
+        let ext_end = entry.end;
+        if ext_end - ext_data < 4 {
+            malformed = true;
+            return;
         }
-
-        cursor = ext_end;
+        let mut share_cursor = ext_data + 2;
+        let mut first_share_range = None;
+        while share_cursor + 4 <= ext_end {
+            let group = u16::from_be_bytes([record[share_cursor], record[share_cursor + 1]]);
+            let share_len =
+                u16::from_be_bytes([record[share_cursor + 2], record[share_cursor + 3]]) as usize;
+            let share_start = share_cursor + 4;
+            let Some(share_end) = share_start.checked_add(share_len) else {
+                malformed = true;
+                return;
+            };
+            if share_end > ext_end {
+                malformed = true;
+                return;
+            }
+            if first_share_range.is_none() {
+                first_share_range = Some(share_start..share_end);
+            }
+            if group == 0x001d {
+                result = Some(share_start..share_end);
+                return;
+            }
+            share_cursor = share_end;
+        }
+        if result.is_none() {
+            result = first_share_range;
+        }
+    })?;
+    if malformed {
+        return None;
     }
-
-    None
+    result
 }
 
 #[derive(Debug)]
@@ -399,65 +397,38 @@ pub fn client_hello_random_and_session_id_ranges(
 }
 
 pub fn extract_client_hello_server_name(record: &[u8]) -> Option<&str> {
-    if record.len() < 9 || record[0] != 0x16 || record[5] != 0x01 {
-        return None;
-    }
-
-    let (_, session_id_range) = client_hello_random_and_session_id_ranges(record)?;
-    let mut cursor = session_id_range.end;
-    if cursor + 2 > record.len() {
-        return None;
-    }
-
-    let cipher_suites_len = u16::from_be_bytes([record[cursor], record[cursor + 1]]) as usize;
-    cursor += 2 + cipher_suites_len;
-    if cursor >= record.len() {
-        return None;
-    }
-
-    let compression_methods_len = record[cursor] as usize;
-    cursor += 1 + compression_methods_len;
-    if cursor + 2 > record.len() {
-        return None;
-    }
-
-    let extensions_len = u16::from_be_bytes([record[cursor], record[cursor + 1]]) as usize;
-    cursor += 2;
-    let extensions_end = cursor.checked_add(extensions_len)?;
-    if extensions_end > record.len() {
-        return None;
-    }
-
-    while cursor + 4 <= extensions_end {
-        let ext_type = u16::from_be_bytes([record[cursor], record[cursor + 1]]);
-        let ext_len = u16::from_be_bytes([record[cursor + 2], record[cursor + 3]]) as usize;
-        let ext_data = cursor + 4;
-        let ext_end = ext_data.checked_add(ext_len)?;
-        if ext_end > extensions_end {
-            return None;
+    let mut result = None;
+    let mut malformed = false;
+    walk_client_hello_extensions(record, |ext_type, entry| {
+        if ext_type != 0x0000 || result.is_some() || malformed {
+            return;
         }
-
-        if ext_type == 0x0000 {
-            if ext_len < 5 || ext_data + 5 > ext_end {
-                return None;
-            }
-            if record[ext_data + 2] != 0x00 {
-                return None;
-            }
-            let host_len =
-                u16::from_be_bytes([record[ext_data + 3], record[ext_data + 4]]) as usize;
-            let host_start = ext_data + 5;
-            let host_end = host_start.checked_add(host_len)?;
-            if host_end > ext_end {
-                return None;
-            }
-            return std::str::from_utf8(&record[host_start..host_end]).ok();
+        let ext_data = entry.start + 4;
+        let ext_end = entry.end;
+        if ext_end - ext_data < 5 {
+            malformed = true;
+            return;
         }
-
-        cursor = ext_end;
+        if record[ext_data + 2] != 0x00 {
+            malformed = true;
+            return;
+        }
+        let host_len = u16::from_be_bytes([record[ext_data + 3], record[ext_data + 4]]) as usize;
+        let host_start = ext_data + 5;
+        let Some(host_end) = host_start.checked_add(host_len) else {
+            malformed = true;
+            return;
+        };
+        if host_end > ext_end {
+            malformed = true;
+            return;
+        }
+        result = std::str::from_utf8(&record[host_start..host_end]).ok();
+    })?;
+    if malformed {
+        return None;
     }
-
-    None
+    result
 }
 
 pub fn is_server_hello(record: &[u8]) -> bool {

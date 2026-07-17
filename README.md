@@ -69,7 +69,8 @@ Start with `kanotls --config config.json`. Role auto-detection: `"protocol": "tu
         "session": {
           "max_streams_per_session": 256,
           "idle_timeout_secs": 45,
-          "traffic_script": "Length: 200~250, Delay: 0, FakeResponse: 0\nLength: 180~220, Delay: 1.5~0.6, FakeResponse: 0\nLength: 250~350, Delay: 0, FakeResponse: 1\nLength: 300~400, Delay: 2.0~0.5, FakeResponse: 0\nLength: 200~300, Delay: 0, FakeResponse: 1\nLength: 400~600, Delay: 3.0~0.7, FakeResponse: 0"
+          "traffic_script": "Length: 200~250, Delay: 0, FakeResponse: 0\nLength: 180~220, Delay: 1.5~0.6, FakeResponse: 0\nLength: 250~350, Delay: 0, FakeResponse: 1\nLength: 300~400, Delay: 2.0~0.5, FakeResponse: 0\nLength: 200~300, Delay: 0, FakeResponse: 1\nLength: 400~600, Delay: 3.0~0.7, FakeResponse: 0",
+          "post_script_shaping": "markov" // optional
         }
       }
     }
@@ -135,7 +136,8 @@ Start with `kanotls --config config.json`. Role auto-detection: `"protocol": "tu
         "session": {
           "max_streams_per_session": 256,
           "idle_timeout_secs": 45,
-          "traffic_script": "Length: 200~250, Delay: 0, FakeResponse: 0\nLength: 180~220, Delay: 1.5~0.6, FakeResponse: 0\nLength: 250~350, Delay: 0, FakeResponse: 1\nLength: 300~400, Delay: 2.0~0.5, FakeResponse: 0\nLength: 200~300, Delay: 0, FakeResponse: 1\nLength: 400~600, Delay: 3.0~0.7, FakeResponse: 0"
+          "traffic_script": "Length: 200~250, Delay: 0, FakeResponse: 0\nLength: 180~220, Delay: 1.5~0.6, FakeResponse: 0\nLength: 250~350, Delay: 0, FakeResponse: 1\nLength: 300~400, Delay: 2.0~0.5, FakeResponse: 0\nLength: 200~300, Delay: 0, FakeResponse: 1\nLength: 400~600, Delay: 3.0~0.7, FakeResponse: 0",
+          "post_script_shaping": "markov" // optional
         }
       }
     }
@@ -207,7 +209,7 @@ Both server and client pre-allocate an 8 MiB entropy pool at startup, used for a
 
 ### Traffic Script
 
-`traffic_script` is an **optional** declarative program that controls the size, timing, and peer-interaction behavior of post-handshake application-data records. When omitted, an embedded default script (6 rules, shown in the config examples above) is used. `session.max_streams_per_session`, `session.idle_timeout_secs`, and `session.traffic_script` are all optional — see the [Config Reference](#config-reference) for which side each field applies to.
+`traffic_script` is an **optional** declarative program that controls the size, timing, and peer-interaction behavior of post-handshake application-data records. When omitted, an embedded default script (6 rules, shown in the config examples above) is used. `session.max_streams_per_session`, `session.idle_timeout_secs`, and `session.traffic_script` are all optional — see the [Config Reference](#config-reference) for which side each field applies to. `session.post_script_shaping` selects what happens once the script is exhausted: the default `"markov"` blends into the Markov machine, while `"off"` disables post-script shaping entirely (records are emitted at their exact pending size with zero delay and no fake responses).
 
 The script is one rule per line; `#` comments and blank lines are ignored. Rules are applied cyclically via `packet_seq % rule_count` and, once exhausted, blend into the Markov shaping machine over a 6-packet window (see docs/MECHANISM.md §3.5). Each rule has three fields:
 
@@ -320,10 +322,10 @@ Before committing to the authenticated tunnel path, certain failures can fall ba
 
 | Limit | Value |
 |---|---|
-| Global concurrent fallbacks | 384–768 (randomized at startup) |
-| Per-IP concurrent fallbacks | 12–24 (randomized) |
-| Fallback connect timeout | 2–5 s (randomized) |
-| IP cooldown threshold | 75–150 fallbacks per 3000–4200 s window → 240–420 s cooldown |
+| Global concurrent fallbacks | 512 (fixed) |
+| Per-IP concurrent fallbacks | 16 (fixed) |
+| Fallback connect timeout | 3 s (fixed) |
+| IP cooldown threshold | 112 fallbacks per 3600 s window → 300 s cooldown |
 
 Fail-closed failures (read-stage errors, oversized records) never fall back.
 
@@ -367,21 +369,6 @@ Routing rules select the outbound:
 }
 ```
 
-### Fallback Tuning (`camouflage.fallback`)
-
-The server config accepts an optional `camouflage.fallback` object (all fields have defaults):
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `max_global` | 512 | Max total concurrent connections |
-| `max_per_ip` | 16 | Max concurrent connections per IP |
-| `min_lifetime_secs` | 30 | Min connection lifetime (s) |
-| `max_lifetime_secs` | 3600 | Max connection lifetime (s) |
-| `cooldown_duration_secs` | 300 | Cooldown after rate-limit (s) |
-| `connect_timeout_secs` | 3 | Connection timeout (s) |
-
-> The fields above are accepted at config parse time for forward-compatibility. The actual pre-auth fallback limits are randomized at startup from hardcoded ranges (see Pre-Auth Fallback table). The config values are reserved for a future tunable-fallback feature.
-
 ## Constraint Invariants
 
 | Constraint | Value |
@@ -415,10 +402,10 @@ The server config accepts an optional `camouflage.fallback` object (all fields h
 | `settings.password`                        | server | Pre-shared key, min 32 bytes         |
 | `settings.camouflage.host`                 | server | Reference TLS 1.3 endpoint hostname (DNS name; IP literals rejected) |
 | `settings.camouflage.port`                 | server | Reference endpoint port              |
-| `settings.camouflage.fallback`             | server | Pre-auth fallback tuning (see below) |
 | `settings.session.max_streams_per_session` | both   | Optional. Max streams per tunnel (default 256) |
 | `settings.session.idle_timeout_secs`       | both   | Optional. Session idle timeout (default 45)    |
 | `settings.session.traffic_script`          | both   | Optional. Declarative traffic script (see docs/MECHANISM.md §3.5 and the Traffic Script section above) |
+| `settings.session.post_script_shaping`     | both   | Optional. Post-script shaping: `"markov"` (default) or `"off"` (exact-size, zero-delay records once the script ends) |
 
 ### Outbound fields (server)
 
@@ -447,6 +434,7 @@ The server config accepts an optional `camouflage.fallback` object (all fields h
 | `settings.session.idle_timeout_secs` | Optional. Session idle timeout (default 45, clamped to [5,3600] client-side) |
 | `settings.session.max_streams_per_session` | Optional. Max streams per tunnel (default 256, validated to [1,4096]) |
 | `settings.session.traffic_script` | Optional. Declarative traffic script (see docs/MECHANISM.md §3.5 and the Traffic Script section above) |
+| `settings.session.post_script_shaping` | Optional. Post-script shaping: `"markov"` (default) or `"off"` |
 
 ## Handshake Sequence
 
