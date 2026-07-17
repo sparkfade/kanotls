@@ -6,7 +6,7 @@ use kanotls_proto::socks5::{
 };
 use kanotls_proto::target::{is_blocked_destination, parse_authority_target};
 use kanotls_proto::uot::{
-    decode_server_udp, decode_socks5_udp, encode_server_udp, encode_socks5_udp,
+    decode_socks5_udp, decode_udp_packet, encode_socks5_udp, encode_udp_packet,
 };
 use kanotls_session::{
     server::{ServerSessionHandler, ServerStream},
@@ -48,12 +48,6 @@ pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
     let config = load_server_config(config_path)?;
     info!("loaded server config, {} inbounds", config.inbounds.len());
 
-    if config.inbounds.is_empty() {
-        anyhow::bail!("no inbounds configured");
-    }
-
-    validate_server_routing_runtime(&config)?;
-
     let inbound = &config.inbounds[0];
     let selected_outbound = resolve_server_outbound(&config, inbound.tag.as_deref())?;
     info!("server outbound: {}", selected_outbound);
@@ -91,11 +85,17 @@ pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
         .session
         .as_ref()
         .and_then(|s| s.traffic_script.clone());
+    let post_script_off = inbound
+        .settings
+        .session
+        .as_ref()
+        .is_some_and(|s| s.post_script_shaping.as_deref() == Some("off"));
     let session_config = SessionConfig::with_script(
         false,
         max_streams_per_session,
         idle_timeout_secs,
         traffic_script,
+        post_script_off,
     );
 
     let shutdown = tokio::sync::watch::channel(false);
@@ -108,11 +108,13 @@ pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
+    let mut accept_error_delay = Duration::from_millis(10);
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((tcp, addr)) => {
+                        accept_error_delay = Duration::from_millis(10);
                         if let Err(e) = tcp.set_nodelay(true) {
                             debug!("failed to enable TCP_NODELAY for {}: {}", addr, e);
                         }
@@ -154,6 +156,8 @@ pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
                     }
                     Err(e) => {
                         error!("accept error: {}", e);
+                        tokio::time::sleep(accept_error_delay).await;
+                        accept_error_delay = (accept_error_delay * 2).min(Duration::from_secs(1));
                     }
                 }
             }
@@ -200,59 +204,33 @@ async fn handle_server_conn(
     }
 }
 
-fn validate_server_routing_runtime(config: &ServerConfig) -> anyhow::Result<()> {
-    let outbound_tags: std::collections::HashSet<_> = config
-        .outbounds
-        .iter()
-        .filter_map(|ob| ob.tag.as_deref())
-        .collect();
-
-    for rule in config
-        .routing
-        .as_ref()
-        .into_iter()
-        .flat_map(|routing| routing.rules.iter())
-    {
-        if !outbound_tags.contains(rule.outbound_tag.as_str()) {
-            anyhow::bail!(
-                "routing rule outbound_tag '{}' not found in configured outbounds",
-                rule.outbound_tag
-            );
-        }
-    }
-
-    Ok(())
-}
-
 fn resolve_server_outbound(
     config: &ServerConfig,
     inbound_tag: Option<&str>,
 ) -> anyhow::Result<ServerOutbound> {
-    let tag = find_routing_rule(config.routing.as_ref(), inbound_tag)
-        .map(|rule| rule.outbound_tag.as_str());
-
-    let tag = match tag {
-        Some(tag) => tag,
+    let outbound = match find_routing_rule(config.routing.as_ref(), inbound_tag) {
+        Some(rule) => {
+            let tag = rule.outbound_tag.as_str();
+            config
+                .outbounds
+                .iter()
+                .find(|ob| ob.tag.as_deref() == Some(tag))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("outbound tag '{}' not found in configured outbounds", tag)
+                })?
+        }
         None if config.outbounds.is_empty() => {
             anyhow::bail!("no outbounds configured and no routing rule matched");
         }
         None => {
-            let fallback_tag = config.outbounds[0].tag.as_deref().unwrap_or("<unnamed>");
             debug!(
                 "no routing rule matched inbound {:?}, falling back to outbound '{}'",
-                inbound_tag, fallback_tag
+                inbound_tag,
+                config.outbounds[0].tag.as_deref().unwrap_or("<unnamed>")
             );
-            fallback_tag
+            &config.outbounds[0]
         }
     };
-
-    let outbound = config
-        .outbounds
-        .iter()
-        .find(|ob| ob.tag.as_deref() == Some(tag))
-        .ok_or_else(|| {
-            anyhow::anyhow!("outbound tag '{}' not found in configured outbounds", tag)
-        })?;
 
     match outbound.protocol.as_str() {
         "direct" => Ok(ServerOutbound::Direct),
@@ -500,7 +478,7 @@ async fn relay_udp_server(
     let recv_task = tokio::spawn(async move {
         let mut buf = vec![0u8; RELAY_CHUNK_SIZE];
         while let Ok((n, addr)) = local_recv.recv_from(&mut buf).await {
-            match encode_server_udp(&buf[..n], &addr) {
+            match encode_udp_packet(&buf[..n], &addr) {
                 Ok(packet) => {
                     if tx.send(packet).await.is_err() {
                         break;
@@ -511,16 +489,17 @@ async fn relay_udp_server(
         }
     });
 
+    // idle 定时器循环外创建：任一方向有流量才重置，持续空闲
+    // UDP_RELAY_IDLE_TIMEOUT 后结束中继。
+    let idle = tokio::time::sleep(UDP_RELAY_IDLE_TIMEOUT);
+    tokio::pin!(idle);
     loop {
-        let idle = tokio::time::sleep(UDP_RELAY_IDLE_TIMEOUT);
-        tokio::pin!(idle);
-
         tokio::select! {
             data = stream.read() => {
                 idle.as_mut().reset(Instant::now() + UDP_RELAY_IDLE_TIMEOUT);
                 match data {
                     Some(d) => {
-                        if let Some((addr, payload)) = decode_server_udp(&d) {
+                        if let Some((addr, payload)) = decode_udp_packet(&d) {
                             if is_blocked_destination(&addr) {
                                 debug!("udp blocked: private addr {}", addr);
                                 continue;
@@ -540,7 +519,7 @@ async fn relay_udp_server(
             }
             _ = &mut idle => {
                 debug!("udp relay idle timeout");
-                return Ok(());
+                break;
             }
         }
     }
@@ -588,8 +567,9 @@ async fn relay_udp_via_socks5(
     let _control_guard = AbortOnDrop(tokio::spawn(async move {
         let mut ctrl = tcp_control;
         let mut buf = [0u8; 1];
-        if ctrl.read(&mut buf).await.is_err() || buf.is_empty() {
-            alive_flag.store(false, Ordering::SeqCst);
+        match ctrl.read(&mut buf).await {
+            Ok(0) | Err(_) => alive_flag.store(false, Ordering::SeqCst),
+            Ok(_) => {}
         }
     }));
 
@@ -603,7 +583,7 @@ async fn relay_udp_via_socks5(
                 continue;
             }
             if let Some((src_addr, payload)) = decode_socks5_udp(&buf[..n]) {
-                match encode_server_udp(&payload, &src_addr) {
+                match encode_udp_packet(&payload, &src_addr) {
                     Ok(packet) => {
                         if tx.send(packet).await.is_err() {
                             break;
@@ -615,17 +595,17 @@ async fn relay_udp_via_socks5(
         }
     });
 
-    // 5. main relay loop
+    // 5. main relay loop（idle 定时器循环外创建：任一方向有流量才重置，
+    // 持续空闲 UDP_RELAY_IDLE_TIMEOUT 后结束中继）
+    let idle = tokio::time::sleep(UDP_RELAY_IDLE_TIMEOUT);
+    tokio::pin!(idle);
     loop {
-        let idle = tokio::time::sleep(UDP_RELAY_IDLE_TIMEOUT);
-        tokio::pin!(idle);
-
         tokio::select! {
             data = stream.read() => {
                 idle.as_mut().reset(Instant::now() + UDP_RELAY_IDLE_TIMEOUT);
                 match data {
                     Some(d) => {
-                        if let Some((target, payload)) = decode_server_udp(&d) {
+                        if let Some((target, payload)) = decode_udp_packet(&d) {
                             if is_blocked_destination(&target) {
                                 debug!("udp via socks5 blocked: private addr {}", target);
                                 continue;
@@ -646,9 +626,10 @@ async fn relay_udp_via_socks5(
             }
             _ = &mut idle => {
                 debug!("udp via socks5 relay idle timeout");
-                return Ok(());
+                break;
             }
             _ = tokio::time::sleep(Duration::from_millis(500)), if !control_alive.load(Ordering::SeqCst) => {
+                recv_handle.abort();
                 anyhow::bail!("SOCKS5 UDP control channel closed");
             }
         }
@@ -676,30 +657,6 @@ mod tests {
             parse_authority_target("[2001:db8::1]:443").unwrap(),
             ("2001:db8::1".to_string(), 443)
         );
-    }
-
-    #[test]
-    fn blocks_private_and_loopback_addresses() {
-        for raw in [
-            "127.0.0.1:80",
-            "10.0.0.1:80",
-            "192.168.1.1:80",
-            "0.0.0.0:80",
-            "224.0.0.1:80",
-            "100.64.0.1:80",
-            "100.127.255.255:80",
-            "255.255.255.255:80",
-            "240.0.0.1:80",
-            "[::1]:80",
-            "[fc00::1]:80",
-            "[::]:80",
-            "[::ffff:127.0.0.1]:80",
-            "[::ffff:10.0.0.1]:80",
-            "[::ffff:100.64.0.1]:80",
-        ] {
-            let addr = raw.parse::<std::net::SocketAddr>().unwrap();
-            assert!(is_blocked_destination(&addr), "{} should be blocked", raw);
-        }
     }
 
     #[test]

@@ -1,9 +1,10 @@
 use crate::frame::{Frame, CMD_SYNACK};
 use crate::session::{
-    PendingAcceptFlushResult, PendingData, Session, SessionConfig, StreamHandle, TrafficClass,
+    subtract_buffered_stream_bytes, PendingAcceptFlushResult, PendingData, Session, SessionConfig,
+    StreamHandle, TrafficClass,
 };
 use kanotls_tunnel::SnowyStream;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::warn;
@@ -116,11 +117,7 @@ impl ServerStream {
     pub async fn read(&mut self) -> Option<Vec<u8>> {
         loop {
             if let Ok(data) = self.data_rx.try_recv() {
-                let _ = self.buffered_stream_bytes.fetch_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |v| Some(v.saturating_sub(data.len())),
-                );
+                subtract_buffered_stream_bytes(&self.buffered_stream_bytes, data.len());
                 return Some(data);
             }
             if let Some(data) = self.try_drain_pending_data() {
@@ -133,11 +130,7 @@ impl ServerStream {
             tokio::select! {
                 data = self.data_rx.recv() => {
                     if let Some(ref d) = data {
-                        let _ = self.buffered_stream_bytes.fetch_update(
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                            |v| Some(v.saturating_sub(d.len())),
-                        );
+                        subtract_buffered_stream_bytes(&self.buffered_stream_bytes, d.len());
                     }
                     return data;
                 }
@@ -145,19 +138,10 @@ impl ServerStream {
                     continue;
                 }
                 _ = self.fin_rx.recv() => {
-                    if let Ok(data) = self.data_rx.try_recv() {
-                        let _ = self.buffered_stream_bytes.fetch_update(
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                            |v| Some(v.saturating_sub(data.len())),
-                        );
-                        return Some(data);
-                    }
-                    if let Some(data) = self.try_drain_pending_data() {
-                        return Some(data);
-                    }
+                    // 与 Stream::read 同口径：先置 read_closed 再回路排空，
+                    // 避免 fin 令牌被中途消费后 read 永远挂在 select 上。
                     self.read_closed = true;
-                    return None;
+                    continue;
                 }
             }
         }
@@ -167,15 +151,20 @@ impl ServerStream {
         let mut pending = self.pending_data.try_lock().ok()?;
         let queue = pending.get_mut(self.sid)?;
         let data = queue.pop_front()?;
-        let _ =
-            self.buffered_stream_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(data.len()))
-                });
+        subtract_buffered_stream_bytes(&self.buffered_stream_bytes, data.len());
         if queue.is_empty() {
             pending.remove(self.sid);
         }
         Some(data)
+    }
+
+    // data channel 中已入账但未读的字节随流关闭一并丢弃，按量扣减。
+    fn discard_unread_channel_bytes(&mut self) {
+        let mut drained = 0usize;
+        while let Ok(data) = self.data_rx.try_recv() {
+            drained += data.len();
+        }
+        subtract_buffered_stream_bytes(&self.buffered_stream_bytes, drained);
     }
 
     pub async fn write(&self, data: &[u8]) -> Result<(), anyhow::Error> {
@@ -215,6 +204,7 @@ impl ServerStream {
         } else {
             self.close_write().await
         };
+        self.discard_unread_channel_bytes();
         self.session.finish_closing_stream(self.sid).await;
         self.closed = true;
         result
@@ -223,6 +213,8 @@ impl ServerStream {
 
 impl Drop for ServerStream {
     fn drop(&mut self) {
+        // data channel 中已入账但未读的字节随接收端销毁被丢弃，按量扣减。
+        self.discard_unread_channel_bytes();
         if self.closed {
             return;
         }

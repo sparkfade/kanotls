@@ -375,20 +375,9 @@ async fn read_address(
         0x04 => {
             let mut data = [0u8; 18];
             reader.read_exact(&mut data).await?;
-            let segments: Vec<String> = (0..8)
-                .map(|i| format!("{:02x}{:02x}", data[i * 2], data[i * 2 + 1]))
-                .collect();
-            let ip = format!(
-                "{}:{}:{}:{}:{}:{}:{}:{}",
-                segments[0],
-                segments[1],
-                segments[2],
-                segments[3],
-                segments[4],
-                segments[5],
-                segments[6],
-                segments[7]
-            );
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&data[..16]);
+            let ip = std::net::Ipv6Addr::from(octets);
             let port = u16::from_be_bytes([data[16], data[17]]);
             Ok((format!("[{}]", ip), port))
         }

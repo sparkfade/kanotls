@@ -1,4 +1,3 @@
-use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use std::f64::consts::PI;
 
@@ -30,8 +29,8 @@ pub enum FlowDirection {
     S2C,
 }
 
-const WINDOW_UPDATE_WIRE: usize = 13 + BLOCK_LEN_PREFIX_SIZE + CONTROL_TLS_OVERHEAD;
-const PING_WIRE: usize = 17 + BLOCK_LEN_PREFIX_SIZE + CONTROL_TLS_OVERHEAD;
+pub const WINDOW_UPDATE_WIRE: usize = 13 + BLOCK_LEN_PREFIX_SIZE + CONTROL_TLS_OVERHEAD;
+pub const PING_WIRE: usize = 17 + BLOCK_LEN_PREFIX_SIZE + CONTROL_TLS_OVERHEAD;
 const SETTINGS_ACK_WIRE: usize = 9 + BLOCK_LEN_PREFIX_SIZE + CONTROL_TLS_OVERHEAD;
 const SETTINGS_SMALL_WIRE: usize = 27 + BLOCK_LEN_PREFIX_SIZE + CONTROL_TLS_OVERHEAD;
 const SETTINGS_LARGE_WIRE: usize = 45 + BLOCK_LEN_PREFIX_SIZE + CONTROL_TLS_OVERHEAD;
@@ -135,8 +134,20 @@ pub fn next_control_size(
     let discrete_threshold = 1.0 - headers_weight / discrete_total;
 
     if rng.gen::<f64>() < discrete_threshold {
-        let dist = WeightedIndex::new(discrete_weights).expect("control size weights valid");
-        discrete_pool[dist.sample(rng)]
+        // The pools hold only 5-7 constant entries, so a cumulative-weight
+        // linear scan is cheaper than rebuilding a WeightedIndex (which
+        // heap-allocates) for every control frame.
+        let total: f64 = discrete_weights.iter().sum();
+        let mut roll = rng.gen::<f64>() * total;
+        let mut idx = discrete_weights.len() - 1;
+        for (i, &weight) in discrete_weights.iter().enumerate() {
+            if roll < weight {
+                idx = i;
+                break;
+            }
+            roll -= weight;
+        }
+        discrete_pool[idx]
     } else {
         let sampler = match direction {
             FlowDirection::C2S => headers_c2s_sampler(),
@@ -161,19 +172,6 @@ mod tests {
     const _MLWU_CHECK: () = assert!(MERGED_SETTINGS_WU_LARGE_WIRE == 82);
     const _MAWU_CHECK: () = assert!(MERGED_SETTINGS_ACK_WU_WIRE == 46);
     const _MPWU_CHECK: () = assert!(MERGED_PING_WU_WIRE == 54);
-
-    #[test]
-    fn wire_constants_match_spec() {
-        let _ = WINDOW_UPDATE_WIRE;
-        let _ = PING_WIRE;
-        let _ = SETTINGS_ACK_WIRE;
-        let _ = SETTINGS_SMALL_WIRE;
-        let _ = SETTINGS_LARGE_WIRE;
-        let _ = MERGED_SETTINGS_WU_SMALL_WIRE;
-        let _ = MERGED_SETTINGS_WU_LARGE_WIRE;
-        let _ = MERGED_SETTINGS_ACK_WU_WIRE;
-        let _ = MERGED_PING_WU_WIRE;
-    }
 
     #[test]
     fn handshake_pool_excludes_ping() {
