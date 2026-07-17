@@ -11,9 +11,11 @@ rustls.workspace = true
 webpki-roots.workspace = true
 snow.workspace = true
 rand.workspace = true
+ring = "0.17"
 hex.workspace = true
 blake2.workspace = true
 lru.workspace = true
+kanotls-config = { path = "../config" }
 
 lazy_static.workspace = true
 futures.workspace = true

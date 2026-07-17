@@ -23,79 +23,32 @@ pub fn validate_session_config(prefix: &str, session: &crate::model::SessionConf
     if let Some(ref script) = session.traffic_script {
         validate_traffic_script(prefix, script);
     }
+    if let Some(ref mode) = session.post_script_shaping {
+        validate_post_script_shaping(prefix, mode);
+    }
     Ok(())
+}
+
+fn validate_post_script_shaping(prefix: &str, mode: &str) {
+    if !matches!(mode, "markov" | "off") {
+        tracing::warn!(
+            "{}: session.post_script_shaping '{}' is invalid (expected \"markov\" or \"off\"); the default \"markov\" behavior will be used instead",
+            prefix,
+            mode
+        );
+    }
 }
 
 fn validate_traffic_script(prefix: &str, script: &str) {
-    for (idx, line) in script.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Err(e) = validate_script_line(line) {
-            tracing::warn!(
-                "{}: traffic_script line {} is malformed ({}); the embedded default script will be used instead",
-                prefix,
-                idx + 1,
-                e
-            );
-        }
+    // 与 session 侧共用同一解析实现（crate::script::parse_traffic_script），
+    // 校验结果即 shaper 的实际行为：解析失败则回退内嵌默认脚本。
+    if let Err(e) = crate::script::parse_traffic_script(script) {
+        tracing::warn!(
+            "{}: traffic_script is malformed ({}); the embedded default script will be used instead",
+            prefix,
+            e
+        );
     }
-}
-
-fn validate_script_line(line: &str) -> Result<(), String> {
-    let mut has_length = false;
-    for part in line.split(',') {
-        let part = part.trim();
-        if part.starts_with("Length:") {
-            let rest = part.strip_prefix("Length:").unwrap().trim();
-            if let Some((lo, hi)) = rest.split_once('~') {
-                let lo: usize = lo
-                    .trim()
-                    .parse()
-                    .map_err(|e| format!("bad Length lo: {}", e))?;
-                let hi: usize = hi
-                    .trim()
-                    .parse()
-                    .map_err(|e| format!("bad Length hi: {}", e))?;
-                if lo > hi {
-                    return Err(format!("len_lo {} > len_hi {}", lo, hi));
-                }
-                if lo == 0 {
-                    return Err("Length lo must be > 0".to_string());
-                }
-                has_length = true;
-            } else {
-                let _: usize = rest.parse().map_err(|e| format!("bad Length: {}", e))?;
-                has_length = true;
-            }
-        } else if part.starts_with("Delay:") {
-            let rest = part.strip_prefix("Delay:").unwrap().trim();
-            if rest != "0" {
-                if let Some((mu, sigma)) = rest.split_once('~') {
-                    let _: f64 = mu
-                        .trim()
-                        .parse()
-                        .map_err(|e| format!("bad Delay mu: {}", e))?;
-                    let _: f64 = sigma
-                        .trim()
-                        .parse()
-                        .map_err(|e| format!("bad Delay sigma: {}", e))?;
-                } else {
-                    let _: u64 = rest.parse().map_err(|e| format!("bad Delay: {}", e))?;
-                }
-            }
-        } else if part.starts_with("FakeResponse:") {
-            let rest = part.strip_prefix("FakeResponse:").unwrap().trim();
-            let _: u8 = rest
-                .parse()
-                .map_err(|e| format!("bad FakeResponse: {}", e))?;
-        }
-    }
-    if !has_length {
-        return Err("missing Length field".to_string());
-    }
-    Ok(())
 }
 
 pub fn is_placeholder_password(pw: &str) -> bool {
@@ -202,4 +155,32 @@ pub fn validate_dns_hostname(host: &str, field: &str, kind: &str) -> Result<()> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_with_post_script_shaping(mode: Option<&str>) -> crate::model::SessionConfig {
+        crate::model::SessionConfig {
+            post_script_shaping: mode.map(|m| m.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn post_script_shaping_accepts_markov_and_off() {
+        for mode in [Some("markov"), Some("off"), None] {
+            let session = session_with_post_script_shaping(mode);
+            assert!(validate_session_config("test", &session).is_ok());
+        }
+    }
+
+    #[test]
+    fn post_script_shaping_invalid_value_is_non_fatal() {
+        // Invalid values only trigger a warning and are treated as unset
+        // (the default "markov" behavior); validation must not fail.
+        let session = session_with_post_script_shaping(Some("bogus"));
+        assert!(validate_session_config("test", &session).is_ok());
+    }
 }

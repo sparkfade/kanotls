@@ -61,15 +61,15 @@ fn validate_server_inbound(inbound: &ServerInbound, idx: usize, config_path: &st
 
     let s = &inbound.settings;
 
+    if is_placeholder_password(&s.password) {
+        bail!(
+            "Detected unmodified default skeleton config.\n\
+             Please edit {} and replace the placeholder password.\n\
+             Generate a secure password: openssl rand -base64 48",
+            config_path
+        );
+    }
     if s.password.len() < 32 {
-        if is_placeholder_password(&s.password) {
-            bail!(
-                "Detected unmodified default skeleton config.\n\
-                 Please edit {} and replace the placeholder password.\n\
-                 Generate a secure password: openssl rand -base64 48",
-                config_path
-            );
-        }
         bail!(
             "{}: password must be at least 32 bytes (got {})",
             prefix,

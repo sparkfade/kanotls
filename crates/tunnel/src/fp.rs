@@ -53,12 +53,10 @@ pub(crate) fn fingerprint_preset(
 pub fn alpn_protocols_for_fingerprint(
     fingerprint: Option<&str>,
 ) -> Result<Vec<Vec<u8>>, anyhow::Error> {
-    let preset = parse_optional_fingerprint(fingerprint)?;
-    match preset.unwrap_or(FingerprintPreset::Firefox) {
-        FingerprintPreset::Firefox => Ok(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
-        FingerprintPreset::Rustls => Ok(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
-        FingerprintPreset::PythonOpenSsl => Ok(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
-    }
+    // Every preset currently advertises the same ALPN list; parse only to
+    // reject unsupported fingerprint names.
+    parse_optional_fingerprint(fingerprint)?;
+    Ok(vec![b"h2".to_vec(), b"http/1.1".to_vec()])
 }
 
 fn make_provider(fingerprint: Option<&str>) -> Result<CryptoProvider, anyhow::Error> {
@@ -102,13 +100,17 @@ fn parse_optional_fingerprint(
 }
 
 fn parse_fingerprint(fingerprint: &str) -> Result<FingerprintPreset, anyhow::Error> {
-    match fingerprint.trim().to_ascii_lowercase().as_str() {
-        "rustls" => Ok(FingerprintPreset::Rustls),
-        "firefox" => Ok(FingerprintPreset::Firefox),
-        "python-openssl" | "baseline" => Ok(FingerprintPreset::PythonOpenSsl),
-        other => anyhow::bail!(
-            "unsupported tls.fingerprint '{}', expected one of: firefox, rustls, python-openssl, baseline",
-            other
-        ),
-    }
+    let family = kanotls_config::normalize_tls_fingerprint(fingerprint).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unsupported tls.fingerprint '{}', expected one of: {}",
+            fingerprint,
+            kanotls_config::SUPPORTED_TLS_FINGERPRINTS.join(", ")
+        )
+    })?;
+    Ok(match family {
+        "rustls" => FingerprintPreset::Rustls,
+        "firefox" => FingerprintPreset::Firefox,
+        "python-openssl" => FingerprintPreset::PythonOpenSsl,
+        other => unreachable!("unexpected fingerprint family: {}", other),
+    })
 }
