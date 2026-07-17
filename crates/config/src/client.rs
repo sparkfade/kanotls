@@ -103,15 +103,15 @@ fn validate_client_outbound(
         bail!("{}: server port must not be 0", prefix);
     }
 
+    if is_placeholder_password(&s.password) {
+        bail!(
+            "Detected unmodified default skeleton config.\n\
+             Please edit {} and replace the placeholder password.\n\
+             Generate a secure password: openssl rand -base64 48",
+            config_path
+        );
+    }
     if s.password.len() < 32 {
-        if is_placeholder_password(&s.password) {
-            bail!(
-                "Detected unmodified default skeleton config.\n\
-                 Please edit {} and replace the placeholder password.\n\
-                 Generate a secure password: openssl rand -base64 48",
-                config_path
-            );
-        }
         bail!(
             "{}: password must be at least 32 bytes (got {})",
             prefix,
@@ -125,13 +125,13 @@ fn validate_client_outbound(
     validate_dns_hostname(&s.tls.sni, &format!("{}.tls.sni", prefix), "camouflage SNI")?;
 
     if let Some(fingerprint) = s.tls.fingerprint.as_deref() {
-        match fingerprint.trim().to_ascii_lowercase().as_str() {
-            "firefox" | "rustls" | "python-openssl" | "baseline" => {}
-            other => bail!(
-                "{}: unsupported tls.fingerprint '{}', expected one of: firefox, rustls, python-openssl, baseline",
+        if crate::normalize_tls_fingerprint(fingerprint).is_none() {
+            bail!(
+                "{}: unsupported tls.fingerprint '{}', expected one of: {}",
                 prefix,
-                other
-            ),
+                fingerprint,
+                crate::SUPPORTED_TLS_FINGERPRINTS.join(", ")
+            );
         }
     }
 

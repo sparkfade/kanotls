@@ -55,56 +55,6 @@ pub struct TunnelServerSettings {
 pub struct CamouflageConfig {
     pub host: String,
     pub port: u16,
-    #[serde(default)]
-    pub fallback: FallbackConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FallbackConfig {
-    #[serde(default = "default_max_global")]
-    pub max_global: usize,
-    #[serde(default = "default_max_per_ip")]
-    pub max_per_ip: usize,
-    #[serde(default = "default_min_lifetime_secs")]
-    pub min_lifetime_secs: u64,
-    #[serde(default = "default_max_lifetime_secs")]
-    pub max_lifetime_secs: u64,
-    #[serde(default = "default_cooldown_duration_secs")]
-    pub cooldown_duration_secs: u64,
-    #[serde(default = "default_connect_timeout_secs")]
-    pub connect_timeout_secs: u64,
-}
-
-fn default_max_global() -> usize {
-    512
-}
-fn default_max_per_ip() -> usize {
-    16
-}
-fn default_min_lifetime_secs() -> u64 {
-    30
-}
-fn default_max_lifetime_secs() -> u64 {
-    3600
-}
-fn default_cooldown_duration_secs() -> u64 {
-    300
-}
-fn default_connect_timeout_secs() -> u64 {
-    3
-}
-
-impl Default for FallbackConfig {
-    fn default() -> Self {
-        Self {
-            max_global: default_max_global(),
-            max_per_ip: default_max_per_ip(),
-            min_lifetime_secs: default_min_lifetime_secs(),
-            max_lifetime_secs: default_max_lifetime_secs(),
-            cooldown_duration_secs: default_cooldown_duration_secs(),
-            connect_timeout_secs: default_connect_timeout_secs(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +100,8 @@ pub struct SessionConfig {
     pub idle_timeout_secs: u64,
     #[serde(default)]
     pub traffic_script: Option<String>,
+    #[serde(default)]
+    pub post_script_shaping: Option<String>,
 }
 
 fn default_max_streams_per_session() -> usize {
@@ -166,6 +118,7 @@ impl Default for SessionConfig {
             max_streams_per_session: default_max_streams_per_session(),
             idle_timeout_secs: default_idle_timeout(),
             traffic_script: None,
+            post_script_shaping: None,
         }
     }
 }
