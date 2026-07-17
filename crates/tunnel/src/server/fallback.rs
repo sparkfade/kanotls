@@ -1,6 +1,8 @@
 use lazy_static::lazy_static;
+use lru::LruCache;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -8,6 +10,8 @@ use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
 use super::{resolve_allowed_camouflage, FailureClass};
+
+pub(super) const MAX_IP_REPUTATION_ENTRIES: usize = 65536;
 
 pub(super) struct FallbackLimits {
     pub(super) max_pre_auth_fallbacks: usize,
@@ -20,15 +24,13 @@ pub(super) struct FallbackLimits {
 
 impl FallbackLimits {
     fn new() -> Self {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
         Self {
-            max_pre_auth_fallbacks: rng.gen_range(384..=768),
-            max_pre_auth_fallbacks_per_ip: rng.gen_range(12..=24),
-            pre_auth_fallback_connect_timeout_secs: rng.gen_range(2..=5),
-            ip_reputation_cooldown_secs: rng.gen_range(240..=420),
-            ip_reputation_reset_secs: rng.gen_range(3000..=4200),
-            ip_reputation_max_fallbacks_per_window: rng.gen_range(75..=150),
+            max_pre_auth_fallbacks: 512,
+            max_pre_auth_fallbacks_per_ip: 16,
+            pre_auth_fallback_connect_timeout_secs: 3,
+            ip_reputation_cooldown_secs: 300,
+            ip_reputation_reset_secs: 3600,
+            ip_reputation_max_fallbacks_per_window: 112,
         }
     }
 }
@@ -45,8 +47,11 @@ lazy_static! {
     );
     pub(super) static ref PRE_AUTH_FALLBACK_PEER_COUNTS: std::sync::Mutex<HashMap<IpAddr, usize>> =
         std::sync::Mutex::new(HashMap::new());
-    pub(super) static ref IP_REPUTATIONS: std::sync::Mutex<HashMap<IpAddr, IpReputation>> =
-        std::sync::Mutex::new(HashMap::new());
+    pub(super) static ref IP_REPUTATIONS: std::sync::Mutex<LruCache<IpAddr, IpReputation>> =
+        std::sync::Mutex::new(LruCache::new(
+            NonZeroUsize::new(MAX_IP_REPUTATION_ENTRIES)
+                .expect("non-zero IP reputation cache size")
+        ));
 }
 
 pub(super) struct PreAuthFallbackPermit {
@@ -91,13 +96,7 @@ impl Drop for PreAuthFallbackPermit {
     }
 }
 
-pub(super) async fn emit_shaped_failure(
-    mut client_stream: TcpStream,
-    _initial_data: Vec<u8>,
-    _host: &str,
-    _port: u16,
-    _class: FailureClass,
-) {
+pub(super) async fn emit_shaped_failure(mut client_stream: TcpStream) {
     let _ = client_stream.shutdown().await;
 }
 
@@ -113,27 +112,12 @@ pub(super) async fn emit_pre_auth_failure(
         return;
     }
 
-    if should_try_pre_auth_fallback(class) {
-        match try_pre_auth_fallback(&mut client_stream, &initial_data, host, port).await {
-            Ok(()) => return,
-            Err(err) => debug!("pre-auth fallback unavailable: {}", err),
-        }
+    match try_pre_auth_fallback(&mut client_stream, &initial_data, host, port).await {
+        Ok(()) => return,
+        Err(err) => debug!("pre-auth fallback unavailable: {}", err),
     }
 
-    emit_shaped_failure(client_stream, Vec::new(), host, port, class).await;
-}
-
-pub(super) fn should_try_pre_auth_fallback(class: FailureClass) -> bool {
-    matches!(
-        class,
-        FailureClass::NonTlsFirstRecord
-            | FailureClass::AuthFailed
-            | FailureClass::InvalidFirstRecord
-            | FailureClass::MissingSni
-            | FailureClass::SniMismatch
-            | FailureClass::HandshakeTimeout
-            | FailureClass::CapacityLimited
-    )
+    emit_shaped_failure(client_stream).await;
 }
 
 pub(super) fn check_ip_reputation(ip: IpAddr) -> bool {
@@ -142,34 +126,37 @@ pub(super) fn check_ip_reputation(ip: IpAddr) -> bool {
     };
     let now = Instant::now();
 
-    if let Some(reputation) = reps.get(&ip) {
-        if let Some(cooldown) = reputation.cooldown_until {
-            if now < cooldown {
-                return false;
+    let mut entry = match reps.get(&ip) {
+        Some(reputation) => {
+            if let Some(cooldown) = reputation.cooldown_until {
+                if now < cooldown {
+                    return false;
+                }
             }
+            reputation.clone()
         }
-    }
-
-    let entry = reps.entry(ip).or_insert_with(IpReputation::new);
+        None => IpReputation::new(),
+    };
     entry.fallback_count += 1;
     entry.last_seen = now;
 
     let limits = fallback_limits();
+    let age = now.duration_since(entry.first_seen);
     if entry.fallback_count > limits.ip_reputation_max_fallbacks_per_window
-        && entry.last_seen.duration_since(entry.first_seen)
-            < Duration::from_secs(limits.ip_reputation_reset_secs)
+        && age < Duration::from_secs(limits.ip_reputation_reset_secs)
     {
         entry.cooldown_until = Some(now + Duration::from_secs(limits.ip_reputation_cooldown_secs));
+        reps.put(ip, entry);
         warn!("IP {:?} placed in cooldown for excessive fallbacks", ip);
         return false;
     }
 
-    let age = now.duration_since(entry.first_seen);
     if age > Duration::from_secs(limits.ip_reputation_reset_secs) {
-        *entry = IpReputation::new();
+        entry = IpReputation::new();
         entry.fallback_count = 1;
     }
 
+    reps.put(ip, entry);
     true
 }
 
@@ -237,14 +224,7 @@ pub(super) async fn try_capacity_limited_fallback(
         }
     }
 
-    emit_shaped_failure(
-        client_stream,
-        Vec::new(),
-        host,
-        port,
-        FailureClass::CapacityLimited,
-    )
-    .await;
+    emit_shaped_failure(client_stream).await;
 }
 
 pub(super) fn try_acquire_pre_auth_fallback_permit(

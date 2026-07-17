@@ -12,11 +12,12 @@ use crate::fp::FingerprintPreset;
 use crate::templates;
 use crate::utils::{
     client_hello_random_and_session_id_ranges, derive_counter_mac, derive_counter_mask,
-    derive_noise_e_mask, xor_32_bytes, xor_u64_bytes,
+    extract_client_hello_random_and_session_id, mask_noise_ephemeral_key, xor_u64_bytes,
+    MAX_TLS_RECORD_PAYLOAD_LEN,
 };
 
 lazy_static! {
-    static ref CLIENT_HELLO_TEMPLATES: Mutex<HashMap<String, Vec<Arc<ClientHelloTemplate>>>> =
+    static ref CLIENT_HELLO_TEMPLATES: Mutex<HashMap<String, Arc<ClientHelloTemplate>>> =
         Mutex::new(HashMap::new());
 }
 
@@ -48,27 +49,19 @@ impl Default for ConnectionCounter {
 #[derive(Debug)]
 pub struct ClientHelloTemplate {
     bytes: Vec<u8>,
-    random_range: Range<usize>,
-    session_id_range: Range<usize>,
+    cipher_suites_range: Range<usize>,
     key_share_range: Range<usize>,
     auxiliary_key_share_ranges: Vec<Range<usize>>,
     record_len_range: Range<usize>,
     handshake_len_range: Range<usize>,
     extensions_len_range: Range<usize>,
-    padding_strategy: ClientHelloPaddingStrategy,
     append_psk_key_exchange_modes: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ClientHelloPaddingStrategy {
-    PreserveCaptured,
-    Disabled,
 }
 
 #[derive(Debug, Clone)]
 struct ClientHelloLayout {
-    random_range: Range<usize>,
     session_id_range: Range<usize>,
+    cipher_suites_range: Range<usize>,
     key_share_range: Range<usize>,
     auxiliary_key_share_ranges: Vec<Range<usize>>,
     sni_range: Range<usize>,
@@ -98,7 +91,16 @@ impl ClientHelloTemplate {
             for range in &self.auxiliary_key_share_ranges {
                 if range.end <= out.len() {
                     let share_data = &mut out[range.clone()];
-                    if !share_data.is_empty() && share_data[0] == 0x04 {
+                    if share_data.len() == 65 && share_data[0] == 0x04 {
+                        // A 65-byte 0x04-prefixed share is an uncompressed SEC1
+                        // P-256 point: emit a real public key so DPI point
+                        // validation cannot tell the share apart from a genuine
+                        // key_share. Fall back to random fill if ring key
+                        // generation unexpectedly fails.
+                        if !fill_p256_public_key(share_data) {
+                            rng.fill_bytes(&mut share_data[1..]);
+                        }
+                    } else if !share_data.is_empty() && share_data[0] == 0x04 {
                         rng.fill_bytes(&mut share_data[1..]);
                     } else {
                         rng.fill_bytes(share_data);
@@ -106,23 +108,11 @@ impl ClientHelloTemplate {
                 }
             }
         }
-        let random_start = self.random_range.start;
-        let random_len = self.random_range.end - self.random_range.start;
-        let session_start = self.session_id_range.start;
-        let session_len = self.session_id_range.end - self.session_id_range.start;
-
-        let (_, after_random_start) = out.split_at_mut(random_start);
-        let (random, after_random) = after_random_start.split_at_mut(random_len);
-        let session_offset = session_start - self.random_range.end;
-        let (_, after_session_start) = after_random.split_at_mut(session_offset);
-        let (session_id, _) = after_session_start.split_at_mut(session_len);
+        let (random, session_id) = extract_client_hello_random_and_session_id(&mut out)
+            .ok_or_else(|| anyhow::anyhow!("ClientHello template missing random/session_id"))?;
         session_id[..16].copy_from_slice(&psk_e[32..48]);
-        let e_public = &psk_e[..32];
-        let mut e_bytes = [0u8; 32];
-        e_bytes.copy_from_slice(e_public);
-
-        let e_mask = derive_noise_e_mask(derived_psk, &session_id[..16]);
-        let masked_e = xor_32_bytes(e_public, &e_mask);
+        let e_bytes: [u8; 32] = psk_e[..32].try_into().expect("psk_e length checked above");
+        let masked_e = mask_noise_ephemeral_key(&e_bytes, derived_psk, &session_id[..16]);
         random.copy_from_slice(&masked_e);
 
         let counter_mask = derive_counter_mask(derived_psk, random);
@@ -132,20 +122,42 @@ impl ClientHelloTemplate {
         session_id[16..24].copy_from_slice(&masked_counter);
         session_id[24..32].copy_from_slice(&mac);
         session_id[31] &= !0x03;
-        apply_padding_strategy(
-            &mut out,
-            &self.record_len_range,
-            &self.handshake_len_range,
-            &self.extensions_len_range,
-            self.append_psk_key_exchange_modes,
-        )?;
+        if self.append_psk_key_exchange_modes {
+            append_psk_key_exchange_modes_extension(
+                &mut out,
+                &self.record_len_range,
+                &self.handshake_len_range,
+                &self.extensions_len_range,
+            )?;
+        }
         apply_client_hello_randomization(
             &mut out,
+            &self.cipher_suites_range,
             &self.extensions_len_range,
-            self.padding_strategy,
         )?;
         Ok(out)
     }
+}
+
+/// Generate a real ephemeral P-256 public key into `share_data` (65-byte
+/// uncompressed SEC1 point, 0x04 prefix — the exact shape ring emits).
+/// Returns false on any failure so the caller can fall back to random fill.
+fn fill_p256_public_key(share_data: &mut [u8]) -> bool {
+    let rng = ring::rand::SystemRandom::new();
+    let Ok(private_key) =
+        ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::ECDH_P256, &rng)
+    else {
+        return false;
+    };
+    let Ok(public_key) = private_key.compute_public_key() else {
+        return false;
+    };
+    let public_bytes = public_key.as_ref();
+    if public_bytes.len() != share_data.len() {
+        return false;
+    }
+    share_data.copy_from_slice(public_bytes);
+    true
 }
 
 pub fn get_or_build_client_hello_template(
@@ -164,10 +176,8 @@ pub fn get_or_build_client_hello_template(
 
     match CLIENT_HELLO_TEMPLATES.lock() {
         Ok(cache) => {
-            if let Some(templates) = cache.get(&key) {
-                return select_template(templates, &key)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("template pool is empty"));
+            if let Some(template) = cache.get(&key) {
+                return Ok(template.clone());
             }
         }
         Err(_) => {
@@ -175,14 +185,10 @@ pub fn get_or_build_client_hello_template(
         }
     }
 
-    let templates =
-        build_client_hello_template_pool(sni, fingerprint, custom_template_bytes, insecure)?;
-    let template = select_template(&templates, &key)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("template pool is empty"))?;
+    let template = build_client_hello_template(sni, fingerprint, custom_template_bytes, insecure)?;
     match CLIENT_HELLO_TEMPLATES.lock() {
         Ok(mut cache) => {
-            cache.insert(key, templates);
+            cache.insert(key, template.clone());
         }
         Err(_) => {
             warn!("client hello template cache poisoned, returning uncached template");
@@ -220,12 +226,12 @@ fn validate_template_sni(sni: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_client_hello_template_pool(
+fn build_client_hello_template(
     sni: &str,
     fingerprint: Option<&str>,
     custom_template_bytes: Option<&[u8]>,
     insecure: bool,
-) -> anyhow::Result<Vec<Arc<ClientHelloTemplate>>> {
+) -> anyhow::Result<Arc<ClientHelloTemplate>> {
     let preset = fp::fingerprint_preset(fingerprint)?;
 
     let custom_bytes = custom_template_bytes.map(|b| b.to_vec());
@@ -241,7 +247,7 @@ fn build_client_hello_template_pool(
 
     let mut layout = parse_client_hello_layout(&bytes)?;
     if std::str::from_utf8(&bytes[layout.sni_range.clone()]).ok() != Some(sni) {
-        set_sni_in_place(&mut bytes, &mut layout, sni)?;
+        set_sni_in_place(&mut bytes, &layout, sni)?;
         // Re-parse after SNI patching so hardcoded templates keep authoritative
         // ranges even if extension layout shifts in ways the local patch logic
         // does not explicitly model.
@@ -264,36 +270,17 @@ fn build_client_hello_template_pool(
     }
 
     let append_psk_key_exchange_modes = matches!(preset, FingerprintPreset::Rustls);
-    let padding_strategy = padding_strategy_for_preset(preset);
 
-    Ok(vec![Arc::new(ClientHelloTemplate {
+    Ok(Arc::new(ClientHelloTemplate {
         bytes,
-        random_range: layout.random_range,
-        session_id_range: layout.session_id_range,
+        cipher_suites_range: layout.cipher_suites_range,
         key_share_range: layout.key_share_range,
         auxiliary_key_share_ranges: layout.auxiliary_key_share_ranges,
         record_len_range: layout.record_len_range,
         handshake_len_range: layout.handshake_len_range,
         extensions_len_range: layout.extensions_len_range,
-        padding_strategy,
         append_psk_key_exchange_modes,
-    })])
-}
-
-fn padding_strategy_for_preset(preset: FingerprintPreset) -> ClientHelloPaddingStrategy {
-    match preset {
-        FingerprintPreset::Firefox | FingerprintPreset::PythonOpenSsl => {
-            ClientHelloPaddingStrategy::PreserveCaptured
-        }
-        FingerprintPreset::Rustls => ClientHelloPaddingStrategy::Disabled,
-    }
-}
-
-fn select_template<'a>(
-    templates: &'a [Arc<ClientHelloTemplate>],
-    _cache_key: &str,
-) -> Option<&'a Arc<ClientHelloTemplate>> {
-    templates.first()
+    }))
 }
 
 pub fn invalidate_client_hello_template_cache() {
@@ -314,33 +301,26 @@ pub fn invalidate_client_hello_template_cache() {
     }
 }
 
-fn apply_padding_strategy(
+/// Append the rustls-preset psk_key_exchange_modes extension at instantiate
+/// time. The padding extension's zero-data invariant is validated once at
+/// template build time (`validate_padding_extension_zero`) and instantiation
+/// never rewrites padding bytes, so it is not re-checked here.
+fn append_psk_key_exchange_modes_extension(
     bytes: &mut Vec<u8>,
     record_len_range: &Range<usize>,
     handshake_len_range: &Range<usize>,
     extensions_len_range: &Range<usize>,
-    append_psk_key_exchange_modes: bool,
 ) -> anyhow::Result<()> {
-    const PADDING_EXTENSION_TYPE: u16 = 0x0015;
     const PSK_KEY_EXCHANGE_MODES_EXTENSION: [u8; 6] = [0x00, 0x2D, 0x00, 0x02, 0x01, 0x00];
 
-    let existing_padding_extension =
-        find_extension(bytes, extensions_len_range, PADDING_EXTENSION_TYPE)?;
-    if let Some(extension) = &existing_padding_extension {
-        ensure_padding_extension_data_zero(bytes, &extension.data_range)?;
-    }
-    if append_psk_key_exchange_modes {
-        bytes.extend_from_slice(&PSK_KEY_EXCHANGE_MODES_EXTENSION);
-        adjust_handshake_lengths(
-            bytes,
-            record_len_range,
-            handshake_len_range,
-            extensions_len_range,
-            6,
-        )?;
-    }
-
-    Ok(())
+    bytes.extend_from_slice(&PSK_KEY_EXCHANGE_MODES_EXTENSION);
+    adjust_handshake_lengths(
+        bytes,
+        record_len_range,
+        handshake_len_range,
+        extensions_len_range,
+        6,
+    )
 }
 
 fn validate_padding_extension_zero(
@@ -380,15 +360,20 @@ fn is_grease_value(ext_type: u16) -> bool {
 
 fn apply_client_hello_randomization(
     bytes: &mut [u8],
+    cipher_suites_range: &Range<usize>,
     extensions_len_range: &Range<usize>,
-    _padding_strategy: ClientHelloPaddingStrategy,
 ) -> anyhow::Result<()> {
-    // Always rotate GREASE extension type values per instantiation, even for
-    // PreserveCaptured (Firefox) preset. GREASE rotation only replaces the
-    // 2-byte extension type, not the extension length or content, so it is
-    // safe regardless of padding strategy. Real Firefox randomizes GREASE
-    // values per ClientHello; freezing them enables cross-deployment clustering.
-    rotate_grease_extensions(bytes, extensions_len_range)?;
+    // Always rotate GREASE values per instantiation. GREASE rotation only
+    // replaces the 2-byte value at each GREASE position, never lengths or
+    // content. Real Firefox/NSS uses a single GREASE value for every GREASE
+    // position within one ClientHello (extension types, cipher_suites,
+    // supported_groups) and re-randomizes it per ClientHello; freezing it
+    // enables cross-deployment clustering.
+    let mut rng = rand::thread_rng();
+    let grease_value = GREASE_VALUES[rng.gen_range(0..GREASE_VALUES.len())];
+    rotate_grease_extensions(bytes, extensions_len_range, grease_value)?;
+    rotate_grease_cipher_suites(bytes, cipher_suites_range, grease_value)?;
+    rotate_grease_supported_groups(bytes, extensions_len_range, grease_value)?;
 
     Ok(())
 }
@@ -396,6 +381,7 @@ fn apply_client_hello_randomization(
 fn rotate_grease_extensions(
     bytes: &mut [u8],
     extensions_len_range: &Range<usize>,
+    grease_value: u16,
 ) -> anyhow::Result<()> {
     let mut cursor = extensions_len_range.end;
     let extensions_end = cursor + read_u16(bytes, extensions_len_range.start)? as usize;
@@ -408,11 +394,52 @@ fn rotate_grease_extensions(
             anyhow::bail!("truncated extension during GREASE rotation");
         }
         if is_grease_value(ext_type) {
-            let mut rng = rand::thread_rng();
-            let new_grease = GREASE_VALUES[rng.gen_range(0..GREASE_VALUES.len())];
-            bytes[cursor..cursor + 2].copy_from_slice(&new_grease.to_be_bytes());
+            bytes[cursor..cursor + 2].copy_from_slice(&grease_value.to_be_bytes());
         }
         cursor = ext_end;
+    }
+    Ok(())
+}
+
+fn rotate_grease_cipher_suites(
+    bytes: &mut [u8],
+    cipher_suites_range: &Range<usize>,
+    grease_value: u16,
+) -> anyhow::Result<()> {
+    if cipher_suites_range.end > bytes.len() {
+        anyhow::bail!("truncated cipher_suites during GREASE rotation");
+    }
+    let mut cursor = cipher_suites_range.start;
+    while cursor + 2 <= cipher_suites_range.end {
+        if is_grease_value(read_u16(bytes, cursor)?) {
+            bytes[cursor..cursor + 2].copy_from_slice(&grease_value.to_be_bytes());
+        }
+        cursor += 2;
+    }
+    Ok(())
+}
+
+fn rotate_grease_supported_groups(
+    bytes: &mut [u8],
+    extensions_len_range: &Range<usize>,
+    grease_value: u16,
+) -> anyhow::Result<()> {
+    const SUPPORTED_GROUPS_EXTENSION_TYPE: u16 = 0x000a;
+    let Some(extension) = find_extension(bytes, extensions_len_range, SUPPORTED_GROUPS_EXTENSION_TYPE)? else {
+        return Ok(());
+    };
+    let data_range = extension.data_range;
+    if data_range.end > bytes.len() || data_range.end - data_range.start < 2 {
+        anyhow::bail!("truncated supported_groups during GREASE rotation");
+    }
+    let groups_len = read_u16(bytes, data_range.start)? as usize;
+    let groups_end = (data_range.start + 2 + groups_len).min(data_range.end);
+    let mut cursor = data_range.start + 2;
+    while cursor + 2 <= groups_end {
+        if is_grease_value(read_u16(bytes, cursor)?) {
+            bytes[cursor..cursor + 2].copy_from_slice(&grease_value.to_be_bytes());
+        }
+        cursor += 2;
     }
     Ok(())
 }
@@ -452,8 +479,6 @@ fn adjust_handshake_lengths(
     extensions_len_range: &Range<usize>,
     added_total: usize,
 ) -> anyhow::Result<()> {
-    const MAX_TLS_RECORD_PAYLOAD_LEN: usize = 16384 + 256;
-
     let delta = added_total as isize;
     let new_record_len = adjust_u16(read_u16(bytes, record_len_range.start)?, delta)?;
     if new_record_len as usize > MAX_TLS_RECORD_PAYLOAD_LEN {
@@ -495,7 +520,7 @@ fn build_rustls_template_bytes(
 }
 
 fn parse_client_hello_layout(bytes: &[u8]) -> anyhow::Result<ClientHelloLayout> {
-    let (random_range, session_id_range) = client_hello_random_and_session_id_ranges(bytes)
+    let (_, session_id_range) = client_hello_random_and_session_id_ranges(bytes)
         .ok_or_else(|| anyhow::anyhow!("failed to locate ClientHello random/session_id"))?;
     if bytes.len() < 9 || bytes[0] != 0x16 || bytes[5] != 0x01 {
         anyhow::bail!("template is not a TLS ClientHello record");
@@ -503,6 +528,7 @@ fn parse_client_hello_layout(bytes: &[u8]) -> anyhow::Result<ClientHelloLayout> 
 
     let mut cursor = session_id_range.end;
     let cipher_suites_len = read_u16(bytes, cursor)? as usize;
+    let cipher_suites_range = cursor + 2..cursor + 2 + cipher_suites_len;
     cursor += 2 + cipher_suites_len;
     if bytes.len() <= cursor {
         anyhow::bail!("truncated ClientHello before compression methods");
@@ -581,8 +607,8 @@ fn parse_client_hello_layout(bytes: &[u8]) -> anyhow::Result<ClientHelloLayout> 
     }
 
     Ok(ClientHelloLayout {
-        random_range,
         session_id_range,
+        cipher_suites_range,
         key_share_range: key_share_range
             .ok_or_else(|| anyhow::anyhow!("failed to locate key_share extension"))?,
         auxiliary_key_share_ranges,
@@ -601,7 +627,7 @@ fn parse_client_hello_layout(bytes: &[u8]) -> anyhow::Result<ClientHelloLayout> 
 
 fn set_sni_in_place(
     bytes: &mut Vec<u8>,
-    layout: &mut ClientHelloLayout,
+    layout: &ClientHelloLayout,
     sni: &str,
 ) -> anyhow::Result<()> {
     let old_range = layout.sni_range.clone();
@@ -631,35 +657,9 @@ fn set_sni_in_place(
         new_bytes.len() as u16,
     )?;
 
-    layout.sni_range.end = layout.sni_range.start + new_bytes.len();
-    shift_layout_after(layout, old_range.end, delta);
+    // The caller re-parses the layout from the patched bytes, so the layout's
+    // ranges are deliberately not shifted here.
     Ok(())
-}
-
-fn shift_layout_after(layout: &mut ClientHelloLayout, pivot: usize, delta: isize) {
-    shift_range_after(&mut layout.key_share_range, pivot, delta);
-    shift_range_after(&mut layout.sni_range, pivot, delta);
-    for range in &mut layout.auxiliary_key_share_ranges {
-        shift_range_after(range, pivot, delta);
-    }
-}
-
-fn shift_range_after(range: &mut Range<usize>, pivot: usize, delta: isize) {
-    if delta == 0 {
-        return;
-    }
-    if range.start >= pivot {
-        range.start = shift_index(range.start, delta);
-        range.end = shift_index(range.end, delta);
-    }
-}
-
-fn shift_index(index: usize, delta: isize) -> usize {
-    if delta >= 0 {
-        index + delta as usize
-    } else {
-        index - (-delta) as usize
-    }
 }
 
 fn adjust_u16(value: u16, delta: isize) -> anyhow::Result<u16> {
@@ -801,6 +801,9 @@ mod tests {
         .unwrap();
     }
 
+    /// Intentional file side effect: writes a human-readable distribution
+    /// report to `target/outer-tls-standardity-regression.md` so the sampled
+    /// statistics can be inspected outside test logs.
     #[test]
     fn outer_tls_standardity_regression_report() {
         const SAMPLES: usize = 100;
@@ -935,22 +938,17 @@ mod tests {
         );
     }
 
-    fn template_from_bytes(
-        bytes: Vec<u8>,
-        padding_strategy: ClientHelloPaddingStrategy,
-    ) -> ClientHelloTemplate {
+    fn template_from_bytes(bytes: Vec<u8>) -> ClientHelloTemplate {
         let layout = parse_client_hello_layout(&bytes).unwrap();
         validate_padding_extension_zero(&bytes, &layout.extensions_len_range).unwrap();
         ClientHelloTemplate {
             bytes,
-            random_range: layout.random_range,
-            session_id_range: layout.session_id_range,
+            cipher_suites_range: layout.cipher_suites_range,
             key_share_range: layout.key_share_range,
             auxiliary_key_share_ranges: layout.auxiliary_key_share_ranges,
             record_len_range: layout.record_len_range,
             handshake_len_range: layout.handshake_len_range,
             extensions_len_range: layout.extensions_len_range,
-            padding_strategy,
             append_psk_key_exchange_modes: false,
         }
     }
@@ -1033,19 +1031,22 @@ mod tests {
     #[test]
     fn template_instantiate_injects_noise_auth_fields() {
         let mut bytes = vec![0u8; 120];
+        // instantiate locates random/session_id by parsing the record, so the
+        // synthetic bytes must be a well-formed ClientHello (session_id_len 32).
+        bytes[0] = 0x16;
+        bytes[5] = 0x01;
+        bytes[43] = 32;
         write_u16(&mut bytes, 3..5, 115).unwrap();
         write_u24(&mut bytes, 6..9, 111).unwrap();
         write_u16(&mut bytes, 112..114, 0).unwrap();
         let template = ClientHelloTemplate {
             bytes,
-            random_range: 11..43,
-            session_id_range: 44..76,
+            cipher_suites_range: 76..78,
             key_share_range: 80..112,
             auxiliary_key_share_ranges: Vec::new(),
             record_len_range: 3..5,
             handshake_len_range: 6..9,
             extensions_len_range: 112..114,
-            padding_strategy: ClientHelloPaddingStrategy::Disabled,
             append_psk_key_exchange_modes: true,
         };
         let derived_psk = [7u8; 32];
@@ -1075,38 +1076,6 @@ mod tests {
     }
 
     #[test]
-    fn select_template_returns_first_member() {
-        let first_template = Arc::new(ClientHelloTemplate {
-            bytes: vec![],
-            random_range: 0..0,
-            session_id_range: 0..0,
-            key_share_range: 0..0,
-            auxiliary_key_share_ranges: Vec::new(),
-            record_len_range: 0..0,
-            handshake_len_range: 0..0,
-            extensions_len_range: 0..0,
-            padding_strategy: ClientHelloPaddingStrategy::Disabled,
-            append_psk_key_exchange_modes: true,
-        });
-        let second_template = Arc::new(ClientHelloTemplate {
-            bytes: vec![1],
-            random_range: 0..0,
-            session_id_range: 0..0,
-            key_share_range: 0..0,
-            auxiliary_key_share_ranges: Vec::new(),
-            record_len_range: 0..0,
-            handshake_len_range: 0..0,
-            extensions_len_range: 0..0,
-            padding_strategy: ClientHelloPaddingStrategy::Disabled,
-            append_psk_key_exchange_modes: true,
-        });
-        let pool = vec![first_template.clone(), second_template.clone()];
-
-        let selected = select_template(&pool, "example:rustls:false").unwrap();
-        assert!(Arc::ptr_eq(selected, &first_template));
-    }
-
-    #[test]
     fn set_sni_updates_lengths_and_ranges() {
         let mut bytes = vec![0u8; 90];
         bytes[0] = 0x16;
@@ -1119,9 +1088,9 @@ mod tests {
         write_u16(&mut bytes, 37..39, 3).unwrap();
         bytes[39..42].copy_from_slice(b"old");
 
-        let mut layout = ClientHelloLayout {
-            random_range: 11..43,
+        let layout = ClientHelloLayout {
             session_id_range: 44..76,
+            cipher_suites_range: 76..78,
             key_share_range: 50..82,
             auxiliary_key_share_ranges: Vec::new(),
             sni_range: 39..42,
@@ -1133,15 +1102,14 @@ mod tests {
             sni_name_len_range: 37..39,
         };
 
-        set_sni_in_place(&mut bytes, &mut layout, "example.com").unwrap();
-        assert_eq!(&bytes[layout.sni_range.clone()], b"example.com");
+        set_sni_in_place(&mut bytes, &layout, "example.com").unwrap();
+        assert_eq!(&bytes[39..50], b"example.com");
         assert_eq!(read_u16(&bytes, 3).unwrap(), 93);
         assert_eq!(read_u24(&bytes, 6).unwrap(), 89);
         assert_eq!(read_u16(&bytes, 20).unwrap(), 48);
         assert_eq!(read_u16(&bytes, 30).unwrap(), 18);
         assert_eq!(read_u16(&bytes, 34).unwrap(), 16);
         assert_eq!(read_u16(&bytes, 37).unwrap(), 11);
-        assert_eq!(layout.key_share_range, 58..90);
     }
 
     #[test]
@@ -1228,7 +1196,7 @@ mod tests {
         let mut bytes = FIREFOX_BOOTSTRAP_CLIENT_HELLO.to_vec();
         append_zero_padding_extension(&mut bytes, 7);
         let captured_padding = padding_extension(&bytes).unwrap();
-        let template = template_from_bytes(bytes, ClientHelloPaddingStrategy::PreserveCaptured);
+        let template = template_from_bytes(bytes);
         let derived_psk = common::derive_psk(b"firefox-preserve-padding-psk");
         let mut noise_init = [0u8; 48];
         noise_init[..32].fill(7);
@@ -1330,13 +1298,24 @@ mod tests {
         let mut noise_init = [0u8; 48];
         initiator.write_message(&[], &mut noise_init).unwrap();
 
+        // 第二个连接必须有独立的临时密钥（与线上一致）——复用同一个
+        // noise_init 会使两侧的 counter_mask 相同，(200^m)-(100^m)==100
+        // 以约 1/256 的概率成立，导致断言偶发失败。
+        let mut initiator2 = snow::Builder::new(common::NOISE_PARAMS.clone())
+            .psk(0, &derived_psk)
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut noise_init2 = [0u8; 48];
+        initiator2.write_message(&[], &mut noise_init2).unwrap();
+
         let template =
             get_or_build_client_hello_template("example.com", Some("firefox"), None, true).unwrap();
         let ch1 = template
             .instantiate(&derived_psk, &noise_init, 100)
             .unwrap();
         let ch2 = template
-            .instantiate(&derived_psk, &noise_init, 200)
+            .instantiate(&derived_psk, &noise_init2, 200)
             .unwrap();
 
         let (_, sid_range1) = client_hello_random_and_session_id_ranges(&ch1).unwrap();
@@ -1354,6 +1333,136 @@ mod tests {
         assert_ne!(
             diff, 100,
             "session_id leaked absolute counter difference directly"
+        );
+    }
+
+    fn instantiated_grease_values(bytes: &[u8]) -> Vec<u16> {
+        let layout = parse_client_hello_layout(bytes).unwrap();
+        let mut values: Vec<u16> = extension_types(bytes)
+            .into_iter()
+            .filter(|ext_type| is_grease_value(*ext_type))
+            .collect();
+
+        let mut cursor = layout.cipher_suites_range.start;
+        while cursor + 2 <= layout.cipher_suites_range.end {
+            let value = read_u16(bytes, cursor).unwrap();
+            if is_grease_value(value) {
+                values.push(value);
+            }
+            cursor += 2;
+        }
+
+        if let Some(extension) = find_extension(bytes, &layout.extensions_len_range, 0x000a).unwrap()
+        {
+            let groups_len = read_u16(bytes, extension.data_range.start).unwrap() as usize;
+            let groups_end = (extension.data_range.start + 2 + groups_len).min(extension.data_range.end);
+            let mut cursor = extension.data_range.start + 2;
+            while cursor + 2 <= groups_end {
+                let value = read_u16(bytes, cursor).unwrap();
+                if is_grease_value(value) {
+                    values.push(value);
+                }
+                cursor += 2;
+            }
+        }
+
+        values
+    }
+
+    #[test]
+    fn instantiated_p256_auxiliary_key_share_is_a_valid_point() {
+        let template =
+            get_or_build_client_hello_template("example.com", Some("firefox"), None, true).unwrap();
+        let derived_psk = common::derive_psk(b"p256-aux-share-psk");
+        let mut noise_init = [0u8; 48];
+        noise_init[..32].fill(7);
+        noise_init[32..48].fill(9);
+
+        let out = template
+            .instantiate(&derived_psk, &noise_init, 1_700_000_000)
+            .unwrap();
+        let layout = parse_client_hello_layout(&out).unwrap();
+        let p256_share = layout
+            .auxiliary_key_share_ranges
+            .iter()
+            .find(|range| range.end - range.start == 65)
+            .expect("firefox template must carry a 65-byte P-256 auxiliary share");
+        let share = &out[p256_share.clone()];
+        assert_eq!(share[0], 0x04, "P-256 share must keep the SEC1 prefix");
+
+        // A successful ECDH agreement against the extracted share proves the
+        // bytes form a valid P-256 point (ring rejects invalid points).
+        let rng = ring::rand::SystemRandom::new();
+        let private_key =
+            ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::ECDH_P256, &rng)
+                .unwrap();
+        let peer_public =
+            ring::agreement::UnparsedPublicKey::new(&ring::agreement::ECDH_P256, share);
+        ring::agreement::agree_ephemeral(private_key, &peer_public, |_shared_secret| ())
+            .expect("instantiated P-256 share must be a valid curve point");
+    }
+
+    #[test]
+    fn grease_positions_rotate_to_single_per_connection_value() {
+        let mut bytes = FIREFOX_BOOTSTRAP_CLIENT_HELLO.to_vec();
+        let layout = parse_client_hello_layout(&bytes).unwrap();
+
+        // Inject one GREASE value per position class (same-length patches):
+        // cipher_suites[0], supported_groups[0], and one extension type slot.
+        bytes[layout.cipher_suites_range.start..layout.cipher_suites_range.start + 2]
+            .copy_from_slice(&0x0A0Au16.to_be_bytes());
+        let groups_extension = find_extension(&bytes, &layout.extensions_len_range, 0x000a)
+            .unwrap()
+            .expect("firefox template must carry supported_groups");
+        let first_group_offset = groups_extension.data_range.start + 2;
+        bytes[first_group_offset..first_group_offset + 2]
+            .copy_from_slice(&0x1A1Au16.to_be_bytes());
+        let ems_extension = find_extension(&bytes, &layout.extensions_len_range, 0x0017)
+            .unwrap()
+            .expect("firefox template must carry extended_master_secret");
+        let ems_type_offset = ems_extension.data_range.start - 4;
+        bytes[ems_type_offset..ems_type_offset + 2].copy_from_slice(&0x2A2Au16.to_be_bytes());
+
+        let template = template_from_bytes(bytes);
+        let derived_psk = common::derive_psk(b"grease-rotation-psk");
+        let mut noise_init = [0u8; 48];
+        noise_init[..32].fill(7);
+        noise_init[32..48].fill(9);
+
+        let grease_value_of = |counter: u64| {
+            let out = template
+                .instantiate(&derived_psk, &noise_init, counter)
+                .unwrap();
+            let values = instantiated_grease_values(&out);
+            assert_eq!(
+                values.len(),
+                3,
+                "expected GREASE at all three injected positions, got {:?}",
+                values
+            );
+            let first = values[0];
+            assert!(
+                GREASE_VALUES.contains(&first),
+                "rotated GREASE value {:#06x} must stay a valid GREASE value",
+                first
+            );
+            assert!(
+                values.iter().all(|&value| value == first),
+                "all GREASE positions must share one value per ClientHello: {:?}",
+                values
+            );
+            first
+        };
+
+        let first = grease_value_of(1_700_000_000);
+        let mut second = grease_value_of(1_700_000_001);
+        if second == first {
+            // 1/16 collision chance per draw; retry once before failing.
+            second = grease_value_of(1_700_000_002);
+        }
+        assert_ne!(
+            first, second,
+            "GREASE value must be re-randomized across connections"
         );
     }
 }

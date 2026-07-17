@@ -42,6 +42,12 @@ pub(crate) fn entropy_pool() -> &'static [u8] {
 /// A global atomic cursor advances by `dst.len()` per call so concurrent
 /// callers draw from distinct regions. The cursor carries position only — no
 /// adaptive or feedback state — keeping the source stateless by design.
+///
+/// When `dst` is longer than the pool, or a read crosses the pool boundary,
+/// the read wraps and pool bytes are reused within `dst`. That overlap is
+/// acceptable: the bytes only ever pad the plaintext side of an AEAD record
+/// (never keys, nonces, or tags), so a passive observer sees one more
+/// high-entropy ciphertext block and learns nothing from the repetition.
 pub fn fill_from_pool(dst: &mut [u8]) {
     if dst.is_empty() {
         return;

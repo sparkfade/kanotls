@@ -142,6 +142,8 @@ The script runs for `script.len()` packets. After the last rule is consumed, the
 
 After the blend window, the TrafficShaper's Markov machine takes over for the remainder of the connection lifetime. No configuration surface exists for the Markov parameters — they are derived solely from the pending-backlog pressure via the probabilistic `p_bulk` ramp (§3.4).
 
+**Post-script shaping switch (`post_script_shaping`):** the optional `session.post_script_shaping` config field selects what happens once the script is exhausted. The default `"markov"` behaves as described above (blend window → Markov machine). `"off"` disables all post-script shaping: once `packet_seq` reaches `script.len()`, every subsequent record carries exactly the pending payload (wire size = pending + fixed record overhead), with zero delay, no fake frames, and no blend window — plaintext size maps directly to wire size from that point on. The bulk fast path and bulk hysteresis (§3.4) still take priority in both modes. Any value other than `"markov"`/`"off"` triggers a non-fatal startup warning and is treated as unset.
+
 **Packet flow example — client → server, 3‑rule script:**
 
 Assume the following `traffic_script`:
@@ -170,6 +172,8 @@ After packet 3 the script has exhausted its 3 rules. Packets 4–9 are emitted w
 
 Scripts are sourced from an embedded default (6 rules, listed in §8), overridable via the `traffic_script` config field. The script parser supports `#` comments and blank lines. Config validation parse‑checks each line at startup; malformed lines trigger a non‑fatal warning and the embedded default is used as fallback.
 
+Besides `lo~hi`, the `Length` field also accepts `base?range`: the value is sampled once per connection at shaper construction as `base + U[0, range]` and then stays fixed for that connection's lifetime. After parsing, every connection randomizes its script in `TrafficShaper::new`: the rule order is rotated by a random offset and each rule's length window is scaled by an independent sample from U[0.85, 1.20] (clamped to ≥ 1 and ≤ data-record capacity), so the position→size mapping is not constant across connections.
+
 Format example:
 ```
 Length: 200~250, Delay: 0, FakeResponse: 0
@@ -178,10 +182,9 @@ Length: 300~400, Delay: 1.5~0.5, FakeResponse: 2
 
 ### 3.6 IAT Delay Modeling
 
-Inter-record delays use two delay specifications:
+Inter-record delays use a single non-zero delay specification (`DelaySpec::None` means zero delay):
 
 - **`DelaySpec::LogNormal { mu_ms, sigma_ms }`**: Log-normal distribution sourced via Box-Muller normal sampling (`sample_log_normal(mu, sigma)` → `Duration::from_micros`). This fits the right-skewed, positive-definite distribution of real TCP inter-arrival times better than uniform or exponential jitter.
-- **`DelaySpec::Replay(&[u32])`**: Pre-recorded IAT (Inter-Arrival Time) traces in microseconds, read circularly with `packet_seq % len`. Used for replaying reference-endpoint connection timing sequences.
 
 The Markov `InteractiveControl` state applies a 15% delay probability; the script engine applies delays per-rule. `AsymmetricBulk` state uses zero delay (back-to-back emission) to preserve throughput.
 
@@ -274,10 +277,10 @@ Failures before Noise authentication is committed (non-TLS first record, auth fa
 
 | Limit | Value |
 |---|---|
-| Global concurrent fallbacks | 384–768 (randomized at startup) |
-| Per-IP concurrent fallbacks | 12–24 (randomized) |
-| Fallback connect timeout | 2–5 s (randomized) |
-| IP cooldown threshold | 75–150 fallbacks per 3000–4200 s window → 240–420 s cooldown |
+| Global concurrent fallbacks | 512 (fixed) |
+| Per-IP concurrent fallbacks | 16 (fixed) |
+| Fallback connect timeout | 3 s (fixed) |
+| IP cooldown threshold | 112 fallbacks per 3600 s window → 300 s cooldown |
 
 ---
 
@@ -359,6 +362,7 @@ The `session` block (optional, under `settings` in both client outbounds and ser
 | `max_streams_per_session` | usize | 256 | Maximum concurrent multiplexed streams per tunnel session. |
 | `idle_timeout_secs` | u64 | 45 | Session idle teardown timeout (with ±10% jitter). |
 | `traffic_script` | optional string | (embedded default) | Declarative script controlling post-handshake data packets (§3.5). Rules are cycled with `packet_seq % N` and transition to the Markov machine via a 6-packet smooth blend window. Example: `"Length: 200~250, Delay: 0, FakeResponse: 0\nLength: 300~400, Delay: 2.0~0.5, FakeResponse: 1"`. Malformed rules trigger a non-fatal startup warning; the embedded default is used as fallback. |
+| `post_script_shaping` | optional string | `"markov"` | Post-script shaping mode (§3.5). `"markov"` (default): blend window → Markov machine. `"off"`: once the script is exhausted, records are emitted at their exact pending size with zero delay and no fake frames. Invalid values trigger a non-fatal startup warning and are treated as unset. |
 
 The embedded default script:
 ```
