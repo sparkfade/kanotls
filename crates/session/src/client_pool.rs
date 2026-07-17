@@ -34,8 +34,6 @@ pub struct ClientPool<C: TunnelConnector = DefaultConnector> {
     inner: Arc<PoolInner<C>>,
 }
 
-pub type DefaultClientPool = ClientPool<DefaultConnector>;
-
 #[derive(Clone)]
 struct PoolBehaviorContext {
     fingerprint_family: String,
@@ -118,7 +116,7 @@ impl PoolBehaviorConfig {
         self.min_active_connections.min(target_pool_size.max(1))
     }
 
-    fn lifecycle(&self, _behavior: &ResolvedPoolBehavior, _seq: u64) -> PoolLifecycle {
+    fn lifecycle(&self) -> PoolLifecycle {
         PoolLifecycle {
             soft_ttl: Duration::from_secs(self.soft_ttl_secs),
             idle_timeout: Duration::from_secs(self.idle_drain_secs),
@@ -513,7 +511,7 @@ impl<C: TunnelConnector> PoolInner<C> {
 
     async fn register_connection(self: &Arc<Self>, handle: Arc<C::Session>) {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        let lifecycle = self.behavior.lifecycle(&self.resolved_behavior, seq);
+        let lifecycle = self.behavior.lifecycle();
         let connection = Arc::new(PooledConnection {
             seq,
             handle,
@@ -917,57 +915,14 @@ impl PoolSession for LivePoolSession {
     }
 }
 
-impl SessionConfig {
-    pub fn new(is_client: bool) -> Self {
-        Self::with_limits(is_client, 256, 45)
-    }
-
-    pub fn with_limits(
-        is_client: bool,
-        max_streams_per_session: usize,
-        idle_timeout_secs: u64,
-    ) -> Self {
-        Self {
-            is_client,
-            max_streams_per_session,
-            idle_timeout_secs,
-            traffic_script: None,
-        }
-    }
-
-    pub fn with_script(
-        is_client: bool,
-        max_streams_per_session: usize,
-        idle_timeout_secs: u64,
-        traffic_script: Option<String>,
-    ) -> Self {
-        Self {
-            is_client,
-            max_streams_per_session,
-            idle_timeout_secs,
-            traffic_script,
-        }
-    }
-}
-
-impl Clone for SessionConfig {
-    fn clone(&self) -> Self {
-        Self {
-            is_client: self.is_client,
-            max_streams_per_session: self.max_streams_per_session,
-            idle_timeout_secs: self.idle_timeout_secs,
-            traffic_script: self.traffic_script.clone(),
-        }
-    }
-}
-
 impl PoolBehaviorContext {
     fn from_connect_options(connect_options: &ClientPoolConnectOptions) -> Self {
         let startup_epoch_secs = current_unix_epoch_secs();
         Self {
-            fingerprint_family: normalize_fingerprint_family(
-                connect_options.fingerprint.as_deref(),
+            fingerprint_family: kanotls_config::normalize_tls_fingerprint(
+                connect_options.fingerprint.as_deref().unwrap_or("firefox"),
             )
+            .unwrap_or("firefox")
             .to_string(),
             sni: connect_options.sni.trim().to_ascii_lowercase(),
             startup_epoch_secs,
@@ -1002,19 +957,6 @@ impl PoolBehaviorContext {
     }
 }
 
-fn normalize_fingerprint_family(fingerprint: Option<&str>) -> &'static str {
-    match fingerprint
-        .unwrap_or("firefox")
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "rustls" => "rustls",
-        "python-openssl" | "baseline" => "python-openssl",
-        _ => "firefox",
-    }
-}
-
 fn current_unix_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1035,7 +977,7 @@ fn hash_u64(seed: u64, value: u64) -> u64 {
 }
 
 fn derive_seed(seed: u64, salt: u64) -> u64 {
-    mix_seed(seed ^ salt.wrapping_mul(0x9e3779b97f4a7c15))
+    splitmix64(seed ^ salt.wrapping_mul(0x9e3779b97f4a7c15))
 }
 
 fn splitmix64(mut x: u64) -> u64 {
@@ -1045,13 +987,11 @@ fn splitmix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-use splitmix64 as mix_seed;
-
 fn seeded_usize_inclusive(seed: u64, min: usize, max: usize) -> usize {
     if min >= max {
         min
     } else {
-        min + (mix_seed(seed) as usize % (max - min + 1))
+        min + (splitmix64(seed) as usize % (max - min + 1))
     }
 }
 
@@ -1059,7 +999,7 @@ fn seeded_u64_inclusive(seed: u64, min: u64, max: u64) -> u64 {
     if min >= max {
         min
     } else {
-        min + (mix_seed(seed) % (max - min + 1))
+        min + (splitmix64(seed) % (max - min + 1))
     }
 }
 
@@ -1218,13 +1158,10 @@ mod tests {
         behavior.soft_ttl_secs = 180;
         behavior.idle_drain_secs = 30;
 
-        let resolved = behavior.resolve(&PoolBehaviorContext::for_test());
-
-        for seq in 1..=8 {
-            let lifecycle = behavior.lifecycle(&resolved, seq);
-            assert_eq!(lifecycle.soft_ttl, Duration::from_secs(180));
-            assert_eq!(lifecycle.idle_timeout, Duration::from_secs(30));
-        }
+        // TTL 与连接序号无关：所有连接拿到同一组常量。
+        let lifecycle = behavior.lifecycle();
+        assert_eq!(lifecycle.soft_ttl, Duration::from_secs(180));
+        assert_eq!(lifecycle.idle_timeout, Duration::from_secs(30));
     }
 
     #[tokio::test]
@@ -1750,17 +1687,5 @@ mod tests {
         let snapshot = pool.snapshot().await;
         assert_eq!(snapshot.active, 1);
         assert_eq!(snapshot.pending_spawns, 0);
-    }
-
-    #[test]
-    fn normalize_fingerprint_family_keeps_python_openssl_distinct() {
-        assert_eq!(
-            normalize_fingerprint_family(Some("python-openssl")),
-            "python-openssl"
-        );
-        assert_eq!(
-            normalize_fingerprint_family(Some("baseline")),
-            "python-openssl"
-        );
     }
 }
