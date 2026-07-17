@@ -1,8 +1,9 @@
 use crate::frame::{
-    coalesce_encoded_frames, Frame, CMD_FIN, CMD_PADDING, CMD_PSH, CMD_SETTINGS, CMD_SYN,
-    CMD_SYNACK, MAX_PAYLOAD_LEN,
+    coalesce_encoded_frames, encode_padding_reply_into, encode_padding_request_into,
+    encode_psh_frames, Frame, CMD_FIN, CMD_PADDING, CMD_PSH, CMD_SETTINGS, CMD_SYN, CMD_SYNACK,
+    MAX_PAYLOAD_LEN,
 };
-use crate::shaper::TrafficShaper;
+use crate::shaper::{ShapePolicy, TrafficShaper};
 use crate::stream::{Stream, StreamInit, StreamOpenState, StreamParts};
 use bytes::BytesMut;
 use kanotls_tunnel::{FlowDirection, SnowyStream};
@@ -11,7 +12,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify, RwLock};
 use tracing::{debug, error, trace, warn};
@@ -120,11 +121,6 @@ impl PendingData {
             .map(Vec::len)
             .sum()
     }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.queues.is_empty()
-    }
 }
 
 pub(crate) type SharedTunnelWriter = Arc<SessionWriter>;
@@ -136,9 +132,68 @@ const STREAM_CHANNEL_CAPACITY: usize = 32;
 const MAX_SESSION_REASSEMBLY_BYTES: usize = 1024 * 1024;
 const WRITE_CHANNEL_CAPACITY: usize = 64;
 const MAX_STREAM_OVERFLOW_BYTES: usize = 2 * 1024 * 1024;
-const MAX_PENDING_FLUSH_SIZE: usize = 256 * 1024;
 
 const LAZY_FLUSH_MS: u64 = 5;
+/// 懒冲刷定时器的“禁用”姿态：重置到遥远未来，等价于关闭，
+/// 避免 pending 为空期间残留过期 deadline。
+const LAZY_FLUSH_DISABLED: Duration = Duration::from_secs(3600);
+
+/// 稳态 H2 行为骨架（post-script steady state）：真实 HTTP/2 接收端按消费
+/// 字节数回发 WINDOW_UPDATE，并偶发 PING/PING-ACK 对。内容加密不可见，
+/// 只需复刻尺寸/时序语义。两者都以 CMD_PADDING 帧实现：flag=1 被对端
+/// 静默吸收（等价 WINDOW_UPDATE 的“无回复”语义），flag=0 m=1 会换来
+/// 一条 reply（等价 PING/PING-ACK 对）。
+const H2_WINDOW_UPDATE_MIN_BYTES: usize = 1024 * 1024;
+const H2_WINDOW_UPDATE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const H2_PING_MIN_INTERVAL_SECS: u64 = 60;
+const H2_PING_MAX_INTERVAL_SECS: u64 = 150;
+
+/// 测试覆写点：0 表示使用上面的生产常量。
+pub(crate) static H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES: AtomicUsize =
+    AtomicUsize::new(0);
+pub(crate) static H2_PING_INTERVAL_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// `prepare_control_record` 的最小 wire 开销：block 长度前缀 + TLS record
+/// 头 + AEAD tag + inner content type。junk_len 按此反解，使整条控制记录
+/// 的 wire 尺寸命中目标 H2 帧尺寸（采样尺寸更大时由 shaper 采样兜底）。
+const CONTROL_RECORD_MIN_OVERHEAD: usize = kanotls_tunnel::common::BLOCK_LEN_PREFIX_SIZE
+    + kanotls_tunnel::common::TLS_RECORD_HEADER_LEN
+    + kanotls_tunnel::common::AEAD_TAG_LEN
+    + kanotls_tunnel::common::INNER_CONTENT_TYPE_LEN;
+
+fn sample_h2_window_update_threshold() -> usize {
+    let override_bytes = H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES.load(Ordering::Relaxed);
+    if override_bytes > 0 {
+        return override_bytes;
+    }
+    use rand::Rng;
+    rand::thread_rng().gen_range(H2_WINDOW_UPDATE_MIN_BYTES..=H2_WINDOW_UPDATE_MAX_BYTES)
+}
+
+fn sample_h2_ping_interval() -> Duration {
+    let override_ms = H2_PING_INTERVAL_OVERRIDE_MS.load(Ordering::Relaxed);
+    if override_ms > 0 {
+        return Duration::from_millis(override_ms);
+    }
+    use rand::Rng;
+    let secs = rand::thread_rng().gen_range(H2_PING_MIN_INTERVAL_SECS..=H2_PING_MAX_INTERVAL_SECS);
+    Duration::from_secs(secs)
+}
+
+/// 构造一条 wire 尺寸 ≈ target_wire_len 的 CMD_PADDING 帧：junk_len 按
+/// CONTROL_RECORD_MIN_OVERHEAD 反解，packet 长度对齐目标 H2 帧总长。
+fn encode_h2_wire_sized_padding(flag: u8, m: u8, target_wire_len: usize) -> Vec<u8> {
+    let junk_len = target_wire_len
+        .saturating_sub(CONTROL_RECORD_MIN_OVERHEAD)
+        .saturating_sub(crate::frame::FRAME_HEADER_SIZE + 2);
+    let mut payload = vec![0u8; 2 + junk_len];
+    payload[0] = flag;
+    payload[1] = m;
+    kanotls_tunnel::fill_from_pool(&mut payload[2..]);
+    Frame::new(CMD_PADDING, 0, payload)
+        .encode()
+        .expect("h2 skeleton padding frame encodes")
+}
 
 pub struct Session {
     read_half: Mutex<Option<SplitReadHalf>>,
@@ -147,6 +202,7 @@ pub struct Session {
     pub(crate) next_stream_id: AtomicU32,
     pub(crate) is_client: bool,
     pub(crate) max_streams_per_session: usize,
+    pub(crate) post_script_off: bool,
     idle_timeout_with_jitter_secs: u64,
     pub(crate) shutdown: Arc<Notify>,
     alive: AtomicBool,
@@ -160,7 +216,6 @@ pub struct Session {
     on_new_stream: Option<Arc<dyn Fn(u32) -> bool + Send + Sync>>,
     pending_client_settings: Arc<Mutex<Option<Vec<u8>>>>,
     pub(crate) buffered_stream_bytes: Arc<AtomicUsize>,
-    activity: Arc<ActivityTracker>,
 }
 
 #[derive(Debug, Default)]
@@ -199,6 +254,7 @@ struct PendingStreamHandleGuard {
     pending_data: Arc<Mutex<PendingData>>,
     pending_fin: Arc<Mutex<HashSet<u32>>>,
     closing_streams: Arc<Mutex<HashSet<u32>>>,
+    buffered_stream_bytes: Arc<AtomicUsize>,
     cleanup: Option<SubmittedOpenCleanup>,
     armed: bool,
 }
@@ -207,11 +263,45 @@ struct SubmittedOpenCleanup {
     writer: SharedTunnelWriter,
 }
 
+#[derive(Clone)]
 pub struct SessionConfig {
     pub is_client: bool,
     pub max_streams_per_session: usize,
     pub idle_timeout_secs: u64,
     pub traffic_script: Option<String>,
+    pub post_script_off: bool,
+}
+
+impl SessionConfig {
+    pub fn with_limits(
+        is_client: bool,
+        max_streams_per_session: usize,
+        idle_timeout_secs: u64,
+    ) -> Self {
+        Self {
+            is_client,
+            max_streams_per_session,
+            idle_timeout_secs,
+            traffic_script: None,
+            post_script_off: false,
+        }
+    }
+
+    pub fn with_script(
+        is_client: bool,
+        max_streams_per_session: usize,
+        idle_timeout_secs: u64,
+        traffic_script: Option<String>,
+        post_script_off: bool,
+    ) -> Self {
+        Self {
+            is_client,
+            max_streams_per_session,
+            idle_timeout_secs,
+            traffic_script,
+            post_script_off,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -243,19 +333,13 @@ pub(crate) struct PendingWrite {
     response_rx: Option<oneshot::Receiver<Result<(), String>>>,
 }
 
-struct ActivityTracker {
-    started_at: Instant,
-    last_activity_ms: AtomicU64,
-    notify: Notify,
-}
-
 impl Session {
     pub fn new(
         tunnel: SnowyStream,
         config: SessionConfig,
         on_new_stream: Option<Arc<dyn Fn(u32) -> bool + Send + Sync>>,
     ) -> Self {
-        let pending_client_settings = if config.is_client {
+        let pending_client_settings = Arc::new(Mutex::new(if config.is_client {
             Some(
                 Frame::cmd_settings()
                     .encode()
@@ -263,18 +347,18 @@ impl Session {
             )
         } else {
             None
-        };
+        }));
         let close_requested = Arc::new(AtomicBool::new(false));
         let close_notify = Arc::new(Notify::new());
-        let activity = Arc::new(ActivityTracker::new());
         let (read_half, write_half) = split_snowy(tunnel);
         let writer = Arc::new(SessionWriter::new(
             write_half,
             close_requested.clone(),
             close_notify.clone(),
-            activity.clone(),
             config.is_client,
             config.traffic_script.as_deref(),
+            config.post_script_off,
+            pending_client_settings.clone(),
         ));
         let idle_timeout_with_jitter_secs = {
             let base = config.idle_timeout_secs.max(1);
@@ -291,6 +375,7 @@ impl Session {
             next_stream_id: AtomicU32::new(if config.is_client { 1 } else { 0 }),
             is_client: config.is_client,
             max_streams_per_session: config.max_streams_per_session,
+            post_script_off: config.post_script_off,
             idle_timeout_with_jitter_secs,
             shutdown: Arc::new(Notify::new()),
             alive: AtomicBool::new(true),
@@ -302,9 +387,8 @@ impl Session {
             pending_fin: Arc::new(Mutex::new(HashSet::new())),
             closing_streams: Arc::new(Mutex::new(HashSet::new())),
             on_new_stream,
-            pending_client_settings: Arc::new(Mutex::new(pending_client_settings)),
+            pending_client_settings,
             buffered_stream_bytes: Arc::new(AtomicUsize::new(0)),
-            activity,
         }
     }
 
@@ -374,7 +458,8 @@ impl Session {
     }
 
     pub(crate) async fn clear_pending_client_stream_state(&self, sid: u32) {
-        self.pending_data.lock().await.remove(sid);
+        let removed = self.pending_data.lock().await.remove(sid);
+        subtract_pending_data_bytes(removed, &self.buffered_stream_bytes);
         self.pending_fin.lock().await.remove(&sid);
     }
 
@@ -433,6 +518,7 @@ impl Session {
             pending_data: self.pending_data.clone(),
             pending_fin: self.pending_fin.clone(),
             closing_streams: self.closing_streams.clone(),
+            buffered_stream_bytes: self.buffered_stream_bytes.clone(),
             cleanup: None,
             armed: true,
         };
@@ -479,7 +565,6 @@ impl Session {
             },
             writer: self.writer.clone(),
             streams: self.streams.clone(),
-            pending_client_settings: self.pending_client_settings.clone(),
             pending_data: self.pending_data.clone(),
             pending_fin: self.pending_fin.clone(),
             closing_streams: self.closing_streams.clone(),
@@ -502,7 +587,7 @@ impl Session {
         traffic_class: TrafficClass,
     ) -> Result<(), anyhow::Error> {
         let data = frame.encode()?;
-        self.write_encoded_payload(&data, FlushBehavior::Immediate, traffic_class)
+        self.write_encoded_payload(data, FlushBehavior::Immediate, traffic_class)
             .await
     }
 
@@ -512,19 +597,15 @@ impl Session {
             return self.write_frame(&frame, TrafficClass::Bulk).await;
         }
 
-        let mut encoded = Vec::new();
-        for chunk in data.chunks(MAX_PAYLOAD_LEN) {
-            let mut pkt = Vec::with_capacity(Frame::encoded_len(chunk.len()));
-            Frame::encode_psh_into(&mut pkt, sid, chunk)?;
-            encoded.push(pkt);
-        }
-        self.write_many_encoded_payloads(&encoded, FlushBehavior::Auto, TrafficClass::Bulk)
+        let encoded = encode_psh_frames(sid, data)?;
+        self.write_many_encoded_payloads(encoded, FlushBehavior::Auto, TrafficClass::Bulk)
             .await?;
         Ok(())
     }
 
     pub(crate) async fn shutdown_stream(&self, sid: u32) -> Result<(), anyhow::Error> {
         let frame = Frame::fin(sid);
+        // FIN 走 Control（保序论证见 send_fin_frame）。
         self.write_frame(&frame, TrafficClass::Control).await
     }
 
@@ -535,17 +616,17 @@ impl Session {
 
     async fn write_encoded_payload(
         &self,
-        data: &[u8],
+        data: Vec<u8>,
         flush: FlushBehavior,
         traffic_class: TrafficClass,
     ) -> Result<(), anyhow::Error> {
-        self.write_many_encoded_payloads(&[data.to_vec()], flush, traffic_class)
+        self.write_many_encoded_payloads(vec![data], flush, traffic_class)
             .await
     }
 
     async fn write_many_encoded_payloads(
         &self,
-        frames: &[Vec<u8>],
+        frames: Vec<Vec<u8>>,
         flush: FlushBehavior,
         traffic_class: TrafficClass,
     ) -> Result<(), anyhow::Error> {
@@ -571,6 +652,13 @@ impl Session {
         let idle_timeout = tokio::time::sleep(idle_duration);
         tokio::pin!(idle_timeout);
 
+        // 稳态 H2 骨架状态：post_script_off 时整体关闭。
+        let h2_skeleton_enabled = !self.post_script_off;
+        let mut bytes_since_window_update = 0usize;
+        let mut window_update_threshold = sample_h2_window_update_threshold();
+        let h2_ping_timer = tokio::time::sleep(sample_h2_ping_interval());
+        tokio::pin!(h2_ping_timer);
+
         loop {
             if self.close_requested.load(Ordering::Relaxed) {
                 debug!("session close requested, ending read loop");
@@ -588,6 +676,30 @@ impl Session {
                         break;
                     }
                     idle_timeout.as_mut().reset(tokio::time::Instant::now() + idle_duration);
+                    continue;
+                }
+                _ = &mut h2_ping_timer, if h2_skeleton_enabled => {
+                    // 偶发 PING 对：flag=0 m=1 请求（wire ≈ H2 PING），对端
+                    // 回一条 padding reply，构成 PING/PING-ACK 时序。
+                    let packet = encode_h2_wire_sized_padding(
+                        0,
+                        1,
+                        kanotls_tunnel::control_size::PING_WIRE,
+                    );
+                    if let Err(e) = self
+                        .writer
+                        .submit_write_packets(
+                            vec![packet],
+                            FlushBehavior::Auto,
+                            TrafficClass::Control,
+                        )
+                        .await
+                    {
+                        warn!("failed to queue h2 ping padding: {}", e);
+                    }
+                    h2_ping_timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + sample_h2_ping_interval());
                     continue;
                 }
                 result = read_half.read(&mut read_buf) => result,
@@ -609,7 +721,6 @@ impl Session {
                 }
             };
 
-            self.activity.record_read_activity();
             buf.extend_from_slice(&read_buf[..n]);
             if buf.len() > MAX_SESSION_REASSEMBLY_BYTES {
                 warn!(
@@ -621,6 +732,33 @@ impl Session {
 
             let mut protocol_error = false;
             while let Some(frame) = Frame::decode(&mut buf) {
+                // WINDOW_UPDATE 节奏：每分发约 1–4MB 数据（阈值每连接随机、
+                // 越过后重采样）即向对端注入一条 flag=1 padding（wire ≈ H2
+                // WINDOW_UPDATE），方向天然是收 bulk 的一方发 WU。
+                if h2_skeleton_enabled && frame.cmd == CMD_PSH {
+                    bytes_since_window_update += frame.payload.len();
+                    while bytes_since_window_update >= window_update_threshold {
+                        bytes_since_window_update -= window_update_threshold;
+                        window_update_threshold = sample_h2_window_update_threshold();
+                        let packet = encode_h2_wire_sized_padding(
+                            1,
+                            0,
+                            kanotls_tunnel::control_size::WINDOW_UPDATE_WIRE,
+                        );
+                        if let Err(e) = self
+                            .writer
+                            .submit_write_packets(
+                                vec![packet],
+                                FlushBehavior::Auto,
+                                TrafficClass::Control,
+                            )
+                            .await
+                        {
+                            warn!("failed to queue h2 window update padding: {}", e);
+                            break;
+                        }
+                    }
+                }
                 if let Err(e) = self.handle_frame(frame, &mut settings_received).await {
                     warn!("frame handler error: {}", e);
                     protocol_error = true;
@@ -876,9 +1014,7 @@ impl Session {
                     let has_pending = self.pending_data.lock().await.contains(frame.stream_id)
                         || self.pending_fin.lock().await.contains(&frame.stream_id);
                     if tx.send(payload).is_err() {
-                        self.streams.write().await.remove(&frame.stream_id);
-                        self.pending_data.lock().await.remove(frame.stream_id);
-                        self.pending_fin.lock().await.remove(&frame.stream_id);
+                        self.remove_stream_state(frame.stream_id).await;
                         return Ok(());
                     }
                     if has_pending {
@@ -896,30 +1032,27 @@ impl Session {
             CMD_PADDING => {
                 let flag = frame.payload.first().copied().unwrap_or(0);
                 if flag == 0 {
-                    let m = frame.payload.get(1).copied().unwrap_or(1).max(1);
+                    let m = frame.payload.get(1).copied().unwrap_or(1).max(1).min(16);
                     let total_junk = frame.payload.len().saturating_sub(2).max(32);
-                    for i in 0..m {
-                        let step = (i as usize).saturating_mul(41) % 192;
+                    // 全部 reply 连续写进一个 buffer，作为单个 control
+                    // WriteRequest fire-and-forget 提交：只等入队成功，
+                    // 不等 socket 冲刷，读循环不被 reply 拖住。
+                    let mut replies = Vec::new();
+                    for i in 0..m as usize {
+                        let step = i.saturating_mul(41) % 192;
                         let junk_len = total_junk.min(48 + step);
-                        let reply = Frame::padding_reply(junk_len);
-                        let encoded = match reply.encode() {
-                            Ok(e) => e,
-                            Err(e) => {
-                                warn!("failed to encode CMD_PADDING reply: {}", e);
-                                break;
-                            }
-                        };
-                        if let Err(e) = self
-                            .write_encoded_payload(
-                                &encoded,
-                                FlushBehavior::Immediate,
-                                TrafficClass::Control,
-                            )
-                            .await
-                        {
-                            warn!("failed to send CMD_PADDING reply: {}", e);
-                            break;
-                        }
+                        encode_padding_reply_into(&mut replies, junk_len);
+                    }
+                    if let Err(e) = self
+                        .writer
+                        .submit_write_packets(
+                            vec![replies],
+                            FlushBehavior::Auto,
+                            TrafficClass::Control,
+                        )
+                        .await
+                    {
+                        warn!("failed to queue CMD_PADDING replies: {}", e);
                     }
                 }
             }
@@ -962,7 +1095,12 @@ impl Session {
             );
             return false;
         }
+        // 与投递进 data channel 的路径同口径：入队 pending 即计入缓冲总量，
+        // 后续由消费者或清理路径扣减，保证每字节恰好加一次减一次。
+        let payload_len = payload.len();
         queue.push_back(payload);
+        self.buffered_stream_bytes
+            .fetch_add(payload_len, Ordering::Relaxed);
         true
     }
 
@@ -1005,7 +1143,12 @@ impl Session {
             return true;
         }
 
+        // 与 store_pending_data 同口径：pre-accept 缓冲也计入总量，
+        // flush_pending_accept_stream 投递时只是转移，不再重复累加。
+        let payload_len = payload.len();
         stream.buffered_data.push(payload);
+        self.buffered_stream_bytes
+            .fetch_add(payload_len, Ordering::Relaxed);
         true
     }
 
@@ -1104,20 +1247,24 @@ impl Session {
                 (pending_data, pending_fin)
             };
 
-            for payload in pending_data {
-                let payload_len = payload.len();
-                if data_tx.try_send(payload).is_err() {
+            // buffered_data 在 store_pending_open_data 时已入账，投递进
+            // data channel 只是转移所有权，不再重复累加。
+            let mut payloads = pending_data.into_iter();
+            while let Some(payload) = payloads.next() {
+                if let Err(err) = data_tx.try_send(payload) {
                     warn!(
                         stream_id = sid,
                         "closing stream: receiver queue full while flushing pending accept data"
                     );
+                    // 未投递的字节随流关闭被丢弃，扣减对应的已入账总量。
+                    let dropped =
+                        err.into_inner().len() + payloads.map(|p| p.len()).sum::<usize>();
+                    subtract_buffered_stream_bytes(&self.buffered_stream_bytes, dropped);
                     let _ = self.close_stream(sid).await;
                     self.pending_open_streams.lock().await.remove(&sid);
                     return PendingAcceptFlushResult::ClosedLocally;
                 }
                 delivered_data = true;
-                self.buffered_stream_bytes
-                    .fetch_add(payload_len, Ordering::Relaxed);
             }
 
             if pending_fin {
@@ -1137,7 +1284,7 @@ impl Session {
     }
 
     async fn flush_client_pending_stream(&self, sid: u32) {
-        let (pending_data, pending_fin, data_tx, fin_tx, notify) = {
+        let (mut pending_data, pending_fin, data_tx, fin_tx, notify) = {
             let mut streams = self.streams.write().await;
             let Some(handle) = streams.get_mut(&sid) else {
                 return;
@@ -1159,23 +1306,25 @@ impl Session {
         let mut all_delivered = true;
         let mut remaining: Vec<Vec<u8>> = Vec::new();
 
-        for payload in pending_data {
+        // pending_data 在入队时已入账，投递进 data channel 只是转移，
+        // 不再重复累加；只有投递失败被丢弃时才需要扣减。
+        while let Some(payload) = pending_data.pop_front() {
             if all_delivered {
-                let payload_len = payload.len();
                 match data_tx.try_send(payload) {
-                    Ok(()) => {
-                        self.buffered_stream_bytes
-                            .fetch_add(payload_len, Ordering::Relaxed);
-                    }
+                    Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(payload)) => {
                         remaining.push(payload);
                         all_delivered = false;
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                    Err(mpsc::error::TrySendError::Closed(payload)) => {
                         warn!(
                             stream_id = sid,
                             "closing stream: receiver closed while flushing pre-SYNACK data"
                         );
+                        let dropped = payload.len()
+                            + remaining.iter().map(Vec::len).sum::<usize>()
+                            + pending_data.iter().map(Vec::len).sum::<usize>();
+                        subtract_buffered_stream_bytes(&self.buffered_stream_bytes, dropped);
                         let _ = self.close_stream(sid).await;
                         return;
                     }
@@ -1195,10 +1344,17 @@ impl Session {
             notify.notify_one();
         }
 
-        if all_delivered && pending_fin {
-            let _ = fin_tx.try_send(());
-            self.streams.write().await.remove(&sid);
-            self.clear_closing_stream(sid).await;
+        if pending_fin {
+            if all_delivered {
+                let _ = fin_tx.try_send(());
+                self.streams.write().await.remove(&sid);
+                self.clear_closing_stream(sid).await;
+            } else {
+                // 数据未全部投递时 FIN 不能丢：重新挂回 pending_fin，由消费者
+                // 排空 pending_data 后在 read 路径补投为 EOF。
+                self.pending_fin.lock().await.insert(sid);
+                notify.notify_one();
+            }
         }
     }
 }
@@ -1208,9 +1364,10 @@ impl SessionWriter {
         write_half: SplitWriteHalf,
         close_requested: Arc<AtomicBool>,
         close_notify: Arc<Notify>,
-        activity: Arc<ActivityTracker>,
         is_client: bool,
         traffic_script: Option<&str>,
+        post_script_off: bool,
+        pending_client_settings: Arc<Mutex<Option<Vec<u8>>>>,
     ) -> Self {
         let direction = if is_client {
             FlowDirection::C2S
@@ -1221,7 +1378,6 @@ impl SessionWriter {
         let (bulk_tx, bulk_rx) = mpsc::channel(WRITE_CHANNEL_CAPACITY);
         let run_close_requested = close_requested.clone();
         let run_close_notify = close_notify.clone();
-        let run_activity = activity.clone();
         let run_direction = direction;
         let script_owned = traffic_script.map(|s| s.to_string());
         tokio::spawn(async move {
@@ -1231,9 +1387,10 @@ impl SessionWriter {
                 bulk_rx,
                 run_close_requested,
                 run_close_notify,
-                run_activity,
                 run_direction,
                 script_owned,
+                post_script_off,
+                pending_client_settings,
             )
             .await;
         });
@@ -1319,15 +1476,22 @@ impl SessionWriter {
         mut bulk_rx: mpsc::Receiver<WriteRequest>,
         close_requested: Arc<AtomicBool>,
         close_notify: Arc<Notify>,
-        activity: Arc<ActivityTracker>,
         direction: FlowDirection,
         traffic_script: Option<String>,
+        post_script_off: bool,
+        pending_client_settings: Arc<Mutex<Option<Vec<u8>>>>,
     ) {
         let mut pending: Vec<u8> = Vec::with_capacity(65536);
-        let mut responders: Vec<(usize, oneshot::Sender<Result<(), String>>)> = Vec::new();
-        let mut total_queued: usize = 0;
-        let mut total_emitted: usize = 0;
-        let mut shaper = TrafficShaper::new(direction, traffic_script.as_deref());
+        // 仅 Immediate 写请求进入此队列：其字节随下一次 drive_shaper 全部
+        // 排空后统一应答。Auto 写请求入队即应答（背压由有界 bulk channel
+        // 的 send().await 提供），不进此队列。
+        let mut responders: Vec<oneshot::Sender<Result<(), String>>> = Vec::new();
+        let mut shaper = TrafficShaper::new(direction, traffic_script.as_deref(), post_script_off);
+
+        // 懒冲刷定时器固定化：循环外创建，仅在 pending 由空转非空时复位到
+        // now + LAZY_FLUSH_MS；drive_shaper 排空后复位到遥远未来（等价禁用）。
+        let lazy_flush = tokio::time::sleep(LAZY_FLUSH_DISABLED);
+        tokio::pin!(lazy_flush);
 
         loop {
             if close_requested.load(Ordering::Relaxed) {
@@ -1345,31 +1509,42 @@ impl SessionWriter {
 
                     if close_requested.load(Ordering::Relaxed) {
                         let msg = "session writer closed".to_string();
-                        for (_, responder) in responders.drain(..) {
+                        for responder in responders.drain(..) {
                             let _ = responder.send(Err(msg.clone()));
                         }
                         let _ = request.response_tx.send(Err(msg));
                         break;
                     }
 
+                    // 客户端的 SETTINGS 必须随首个 control 写请求上链。
+                    // 写循环串行处理 control 请求，在此前置可保证并发
+                    // deferred open 的 SYN 无法越过 SETTINGS 先到达对端。
+                    let mut request = request;
+                    if let Some(settings) = pending_client_settings.lock().await.take() {
+                        request.packets.insert(0, settings);
+                    }
+
+                    // Auto 应答解耦后，写端不等冲刷即可把后续 control 帧
+                    // 送入通道；control 写（如 FIN）不得越过仍滞留在 bulk
+                    // channel 中的数据。先把 bulk 队列中已到达的请求全部
+                    // 并入 pending，由下面的 drive_shaper 统一冲刷。
+                    while let Ok(bulk_request) = bulk_rx.try_recv() {
+                        Self::queue_bulk_request(&mut pending, &mut responders, bulk_request);
+                    }
+
                     if !pending.is_empty() {
-                        match Self::drive_shaper(&mut pending, &mut shaper, &mut write_half, &activity).await {
-                            Ok((fake_frames, consumed)) => {
-                                total_emitted += consumed;
-                                let _ = Self::emit_fake_frames(&mut write_half, direction, &fake_frames).await;
-                                while !responders.is_empty() && responders[0].0 <= total_emitted {
-                                    let (_, tx) = responders.remove(0);
-                                    let _ = tx.send(Ok(()));
-                                }
-                            }
-                            Err(e) => {
-                                let msg = e.to_string();
-                                for (_, responder) in responders.drain(..) {
-                                    let _ = responder.send(Err(msg.clone()));
-                                }
-                                let _ = request.response_tx.send(Err(msg));
-                                break;
-                            }
+                        if let Err(msg) = Self::drain_pending_and_respond(
+                            &mut pending,
+                            &mut shaper,
+                            &mut write_half,
+                            &mut responders,
+                            &mut lazy_flush,
+                            direction,
+                        )
+                        .await
+                        {
+                            let _ = request.response_tx.send(Err(msg));
+                            break;
                         }
                     }
 
@@ -1379,7 +1554,7 @@ impl SessionWriter {
                         for packet in &request.packets {
                             let result = write_half.with_stream(|stream| {
                                 let size = stream.next_control_size(state, direction);
-                                debug!(
+                                trace!(
                                     "control write: frame_cmd=0x{:02x} wire_size={}",
                                     packet.first().unwrap_or(&0),
                                     size
@@ -1390,7 +1565,6 @@ impl SessionWriter {
                                 err = Some(e.to_string());
                                 break;
                             }
-                            shaper.note_control_frame();
                         }
                         if let Some(msg) = err {
                             let _ = request.response_tx.send(Err(msg.clone()));
@@ -1405,7 +1579,6 @@ impl SessionWriter {
                             break;
                         }
                         Ok(()) => {
-                            activity.record_write_activity();
                             let _ = request.response_tx.send(Ok(()));
                         }
                     }
@@ -1415,71 +1588,118 @@ impl SessionWriter {
 
                     if close_requested.load(Ordering::Relaxed) {
                         let msg = "session writer closed".to_string();
-                        for (_, responder) in responders.drain(..) {
+                        for responder in responders.drain(..) {
                             let _ = responder.send(Err(msg.clone()));
                         }
                         let _ = request.response_tx.send(Err(msg));
                         break;
                     }
 
-                    let bytes_added: usize = request.packets.iter().map(|p| p.len()).sum();
-                    for packet in &request.packets {
-                        pending.extend_from_slice(packet);
-                    }
-                    total_queued += bytes_added;
-                    responders.push((total_queued, request.response_tx));
+                    let was_empty = pending.is_empty();
+                    let flush = request.flush;
+                    Self::queue_bulk_request(&mut pending, &mut responders, request);
 
-                    if request.flush == FlushBehavior::Immediate
-                        || pending.len() >= MAX_PENDING_FLUSH_SIZE
-                    {
-                        match Self::drive_shaper(&mut pending, &mut shaper, &mut write_half, &activity).await {
-                            Ok((fake_frames, consumed)) => {
-                                total_emitted += consumed;
-                                let _ = Self::emit_fake_frames(&mut write_half, direction, &fake_frames).await;
-                                while !responders.is_empty() && responders[0].0 <= total_emitted {
-                                    let (_, tx) = responders.remove(0);
-                                    let _ = tx.send(Ok(()));
-                                }
-                            }
-                            Err(e) => {
-                                let msg = e.to_string();
-                                for (_, responder) in responders.drain(..) {
-                                    let _ = responder.send(Err(msg.clone()));
-                                }
-                                break;
-                            }
-                        }
+                    if was_empty && !pending.is_empty() {
+                        lazy_flush.as_mut().reset(
+                            tokio::time::Instant::now() + Duration::from_millis(LAZY_FLUSH_MS),
+                        );
                     }
-                }
-                _ = tokio::time::sleep(Duration::from_millis(LAZY_FLUSH_MS)), if !pending.is_empty() => {
-                    match Self::drive_shaper(&mut pending, &mut shaper, &mut write_half, &activity).await {
-                        Ok((fake_frames, consumed)) => {
-                            total_emitted += consumed;
-                            let _ = Self::emit_fake_frames(&mut write_half, direction, &fake_frames).await;
-                        }
-                        Err(e) => {
-                            let msg = e.to_string();
-                            for (_, responder) in responders.drain(..) {
-                                let _ = responder.send(Err(msg.clone()));
-                            }
+
+                    if flush == FlushBehavior::Immediate
+                        || pending.len() >= crate::MAX_PENDING_FLUSH_SIZE
+                    {
+                        if Self::drain_pending_and_respond(
+                            &mut pending,
+                            &mut shaper,
+                            &mut write_half,
+                            &mut responders,
+                            &mut lazy_flush,
+                            direction,
+                        )
+                        .await
+                        .is_err()
+                        {
                             break;
                         }
                     }
-                    while !responders.is_empty() && responders[0].0 <= total_emitted {
-                        let (_, tx) = responders.remove(0);
-                        let _ = tx.send(Ok(()));
+                }
+                _ = &mut lazy_flush, if !pending.is_empty() => {
+                    if Self::drain_pending_and_respond(
+                        &mut pending,
+                        &mut shaper,
+                        &mut write_half,
+                        &mut responders,
+                        &mut lazy_flush,
+                        direction,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
                     }
                 }
             }
         }
 
         if !pending.is_empty() {
-            let _ = Self::drive_shaper(&mut pending, &mut shaper, &mut write_half, &activity).await;
-            for (_, tx) in responders.drain(..) {
-                let _ = tx.send(Ok(()));
+            let _ = Self::drive_shaper(&mut pending, &mut shaper, &mut write_half).await;
+            for responder in responders.drain(..) {
+                let _ = responder.send(Ok(()));
             }
         }
         let _ = write_half.shutdown().await;
+    }
+
+    /// 三个写循环分支共用的“排空 + 收尾”序列：drive_shaper 排空 pending，
+    /// 发出 fake 帧，应答全部 Immediate 等待者，并把懒冲刷定时器复位到
+    /// 禁用姿态。失败时已入队的 responder 以同一错误应答，错误消息返回给
+    /// 调用方做分支专属处理。
+    async fn drain_pending_and_respond(
+        pending: &mut Vec<u8>,
+        shaper: &mut TrafficShaper,
+        write_half: &mut SplitWriteHalf,
+        responders: &mut Vec<oneshot::Sender<Result<(), String>>>,
+        lazy_flush: &mut Pin<&mut tokio::time::Sleep>,
+        direction: FlowDirection,
+    ) -> Result<(), String> {
+        match Self::drive_shaper(pending, shaper, write_half).await {
+            Ok(fake_frames) => {
+                let _ = Self::emit_fake_frames(write_half, direction, &fake_frames).await;
+                for responder in responders.drain(..) {
+                    let _ = responder.send(Ok(()));
+                }
+                lazy_flush
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + LAZY_FLUSH_DISABLED);
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                for responder in responders.drain(..) {
+                    let _ = responder.send(Err(msg.clone()));
+                }
+                Err(msg)
+            }
+        }
+    }
+
+    /// Append a bulk write request to the plaintext backlog. Auto writes are
+    /// acked at enqueue — backpressure comes from the bounded bulk channel's
+    /// send().await, so writers never wait on the shaper's flush cadence;
+    /// Immediate writes queue their responder until the next drain.
+    fn queue_bulk_request(
+        pending: &mut Vec<u8>,
+        responders: &mut Vec<oneshot::Sender<Result<(), String>>>,
+        request: WriteRequest,
+    ) {
+        for packet in &request.packets {
+            pending.extend_from_slice(packet);
+        }
+        if request.flush == FlushBehavior::Auto {
+            let _ = request.response_tx.send(Ok(()));
+        } else {
+            responders.push(request.response_tx);
+        }
     }
 
     /// Drain the plaintext backlog into individually-sized 0x17 records, each
@@ -1489,6 +1709,11 @@ impl SessionWriter {
     /// shaper-chosen size. Each record is flushed before the next is prepared,
     /// bounding the encrypt buffer to a single record for memory safety.
     ///
+    /// The first policy of a drain is sticky: when it allows a full block
+    /// (bulk fast path), the entire backlog is carved into capacity-sized
+    /// records — the tail at its exact wire length — with zero delay, no fake
+    /// frames, and no per-record policy consultation.
+    ///
     /// Returns any CMD_PADDING fake-response frames queued by script rules;
     /// the caller must emit them on the control path before responding to
     /// callers.
@@ -1496,17 +1721,41 @@ impl SessionWriter {
         pending: &mut Vec<u8>,
         shaper: &mut TrafficShaper,
         write_half: &mut SplitWriteHalf,
-        activity: &ActivityTracker,
-    ) -> std::io::Result<(Vec<Vec<u8>>, usize)> {
+    ) -> std::io::Result<Vec<Vec<u8>>> {
         let mut fake_frames = Vec::new();
         let mut consumed = 0usize;
+
+        let mut first_policy = if pending.is_empty() {
+            None
+        } else {
+            Some(shaper.next_data_policy(pending.len()))
+        };
+        let sticky_full_block = first_policy
+            .as_ref()
+            .is_some_and(|policy| policy.allow_full_block);
 
         loop {
             if consumed >= pending.len() {
                 break;
             }
             let remaining = pending.len() - consumed;
-            let policy = shaper.next_data_policy(remaining);
+            let policy = match first_policy.take() {
+                Some(policy) => policy,
+                None if sticky_full_block => {
+                    let take = remaining.min(SnowyStream::data_record_capacity());
+                    ShapePolicy {
+                        target_wire_len: if take == SnowyStream::data_record_capacity() {
+                            SnowyStream::max_data_record_wire_len()
+                        } else {
+                            SnowyStream::data_record_wire_len(take)
+                        },
+                        delay: Duration::ZERO,
+                        fake: None,
+                        allow_full_block: true,
+                    }
+                }
+                None => shaper.next_data_policy(remaining),
+            };
             let overhead = kanotls_tunnel::common::MIN_DATA_WIRE_LEN;
             let payload_cap = policy
                 .target_wire_len
@@ -1522,18 +1771,14 @@ impl SessionWriter {
             }
 
             consumed += take;
-            shaper.record_payload_size(take);
             shaper.advance();
 
             write_half.flush().await?;
 
             if let Some(fake) = &policy.fake {
-                let frame = Frame::padding_request(fake.responses);
-                fake_frames.push(
-                    frame
-                        .encode()
-                        .map_err(|e| std::io::Error::other(format!("fake frame encode: {}", e)))?,
-                );
+                let mut encoded = Vec::new();
+                encode_padding_request_into(&mut encoded, fake.responses);
+                fake_frames.push(encoded);
             }
 
             if policy.delay > Duration::ZERO {
@@ -1541,10 +1786,8 @@ impl SessionWriter {
             }
         }
 
-        let total_consumed = consumed;
         pending.clear();
-        activity.record_write_activity();
-        Ok((fake_frames, total_consumed))
+        Ok(fake_frames)
     }
 
     /// Emit fake-response control frames generated by the shaper.
@@ -1565,33 +1808,6 @@ impl SessionWriter {
             std::io::Result::Ok(())
         })?;
         write_half.flush().await
-    }
-}
-
-impl ActivityTracker {
-    fn new() -> Self {
-        Self {
-            started_at: Instant::now(),
-            last_activity_ms: AtomicU64::new(0),
-            notify: Notify::new(),
-        }
-    }
-
-    fn record_read_activity(&self) {
-        self.last_activity_ms
-            .store(self.elapsed_ms(), Ordering::Relaxed);
-    }
-
-    fn record_write_activity(&self) {
-        self.record_read_activity();
-        self.notify.notify_one();
-    }
-
-    fn elapsed_ms(&self) -> u64 {
-        self.started_at
-            .elapsed()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64
     }
 }
 
@@ -1627,30 +1843,48 @@ impl Drop for PendingStreamHandleGuard {
         }
 
         let stream_id = self.stream_id;
-        let pending_data = self.pending_data.clone();
-        let pending_fin = self.pending_fin.clone();
-        let closing_streams = self.closing_streams.clone();
-        if let Ok(mut guard) = self.streams.try_write() {
-            guard.remove(&stream_id);
-        }
+        // 三处状态先尝试同步移除；全部成功则无需再 spawn 异步重复移除。
+        let streams_done = self
+            .streams
+            .try_write()
+            .map(|mut guard| {
+                guard.remove(&stream_id);
+            })
+            .is_ok();
+        let pending_data_done = self
+            .pending_data
+            .try_lock()
+            .map(|mut pending| {
+                let removed = pending.remove(stream_id);
+                subtract_pending_data_bytes(removed, &self.buffered_stream_bytes);
+            })
+            .is_ok();
+        let pending_fin_done = self
+            .pending_fin
+            .try_lock()
+            .map(|mut pending| {
+                pending.remove(&stream_id);
+            })
+            .is_ok();
 
-        if let Ok(mut pending) = pending_data.try_lock() {
-            pending.remove(stream_id);
-        }
-        if let Ok(mut pending) = pending_fin.try_lock() {
-            pending.remove(&stream_id);
-        }
-
-        let streams = self.streams.clone();
         let cleanup = self.cleanup.take();
         if let Some(cleanup) = cleanup.as_ref() {
-            remember_closing_stream_sync(stream_id, &closing_streams);
+            remember_closing_stream_sync(stream_id, &self.closing_streams);
             let _ = crate::stream::try_send_fin_frame(stream_id, &cleanup.writer);
         }
+
+        if streams_done && pending_data_done && pending_fin_done {
+            return;
+        }
+        let streams = self.streams.clone();
+        let pending_data = self.pending_data.clone();
+        let pending_fin = self.pending_fin.clone();
+        let buffered_stream_bytes = self.buffered_stream_bytes.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 streams.write().await.remove(&stream_id);
-                pending_data.lock().await.remove(stream_id);
+                let removed = pending_data.lock().await.remove(stream_id);
+                subtract_pending_data_bytes(removed, &buffered_stream_bytes);
                 pending_fin.lock().await.remove(&stream_id);
             });
         }
@@ -1708,6 +1942,27 @@ pub(crate) fn remember_closing_stream_sync(
             }
             closing.insert(stream_id);
         });
+    }
+}
+
+/// buffered_stream_bytes 的统一减法口径：任何扣减都不允许下溢回绕。
+pub(crate) fn subtract_buffered_stream_bytes(counter: &AtomicUsize, bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(bytes))
+    });
+}
+
+/// 从 pending_data 移除整段队列时，扣减其中仍挂在账上的字节数。
+pub(crate) fn subtract_pending_data_bytes(
+    queue: Option<VecDeque<Vec<u8>>>,
+    counter: &AtomicUsize,
+) {
+    if let Some(queue) = queue {
+        let bytes: usize = queue.iter().map(Vec::len).sum();
+        subtract_buffered_stream_bytes(counter, bytes);
     }
 }
 

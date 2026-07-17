@@ -10,6 +10,8 @@ const UDP_RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 pub async fn relay_udp_client_mode(
     mut stream: Stream,
     local: UdpSocket,
+    client_ip: std::net::IpAddr,
+    mut control_reader: impl tokio::io::AsyncReadExt + Unpin,
 ) -> Result<(), anyhow::Error> {
     let local_addr = local.local_addr()?;
     debug!("udp client bound to {}", local_addr);
@@ -23,8 +25,19 @@ pub async fn relay_udp_client_mode(
     let recv_task = tokio::spawn(async move {
         let mut buf = vec![0u8; RELAY_CHUNK_SIZE];
         while let Ok((n, addr)) = local_recv.recv_from(&mut buf).await {
-            *peer_recv.lock().await = Some(addr);
+            // RFC 1928 section 7: only the client holding the TCP control
+            // connection may use this UDP association. Lock onto the source
+            // address of its first valid datagram and reject everything else.
+            let locked = *peer_recv.lock().await;
+            match locked {
+                Some(expected) if expected != addr => continue,
+                None if addr.ip() != client_ip => continue,
+                _ => {}
+            }
             if let Some((target, payload)) = decode_socks5_udp(&buf[..n]) {
+                if locked.is_none() {
+                    *peer_recv.lock().await = Some(addr);
+                }
                 match encode_udp_packet(&payload, &target) {
                     Ok(packet) => {
                         if tx.send(packet).await.is_err() {
@@ -37,10 +50,12 @@ pub async fn relay_udp_client_mode(
         }
     });
 
+    let mut ctrl_buf = [0u8; 1];
+    // idle 定时器循环外创建：任一方向有流量才重置，持续空闲
+    // UDP_RELAY_IDLE_TIMEOUT 后终止本次 UDP 关联。
+    let idle = tokio::time::sleep(UDP_RELAY_IDLE_TIMEOUT);
+    tokio::pin!(idle);
     loop {
-        let idle = tokio::time::sleep(UDP_RELAY_IDLE_TIMEOUT);
-        tokio::pin!(idle);
-
         tokio::select! {
             data = stream.read() => {
                 idle.as_mut().reset(tokio::time::Instant::now() + UDP_RELAY_IDLE_TIMEOUT);
@@ -63,9 +78,20 @@ pub async fn relay_udp_client_mode(
                     break;
                 }
             }
+            // RFC 1928: the UDP association ends when the TCP control
+            // connection closes.
+            result = control_reader.read(&mut ctrl_buf) => {
+                match result {
+                    Ok(0) | Err(_) => {
+                        debug!("udp control connection closed");
+                        break;
+                    }
+                    Ok(_) => {}
+                }
+            }
             _ = &mut idle => {
                 debug!("udp client relay idle timeout");
-                return Ok(());
+                break;
             }
         }
     }
@@ -218,17 +244,6 @@ pub fn decode_udp_packet(data: &[u8]) -> Option<(std::net::SocketAddr, Vec<u8>)>
 
     let payload = data[offset + 2..offset + 2 + len].to_vec();
     Some((addr, payload))
-}
-
-pub fn encode_server_udp(
-    data: &[u8],
-    addr: &std::net::SocketAddr,
-) -> Result<Vec<u8>, anyhow::Error> {
-    encode_udp_packet(data, addr)
-}
-
-pub fn decode_server_udp(data: &[u8]) -> Option<(std::net::SocketAddr, Vec<u8>)> {
-    decode_udp_packet(data)
 }
 
 #[cfg(test)]

@@ -1,6 +1,4 @@
-use super::{
-    coalesce_encoded_frames, ActivityTracker, Session, SessionConfig, STREAM_CHANNEL_CAPACITY,
-};
+use super::{coalesce_encoded_frames, Session, SessionConfig, STREAM_CHANNEL_CAPACITY};
 use crate::server::ServerSessionHandler;
 use futures::poll;
 use kanotls_tunnel::common::{derive_psk, NOISE_PARAMS};
@@ -12,7 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 #[test]
 fn coalesce_encoded_frames_packs_adjacent_small_frames() {
     let frames = vec![vec![1u8; 7], vec![2u8; 7], vec![3u8; 7]];
-    let out = coalesce_encoded_frames(&frames, 32);
+    let out = coalesce_encoded_frames(frames, 32);
 
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].len(), 21);
@@ -21,21 +19,11 @@ fn coalesce_encoded_frames_packs_adjacent_small_frames() {
 #[test]
 fn coalesce_encoded_frames_respects_packet_limit() {
     let frames = vec![vec![1u8; 20], vec![2u8; 20], vec![3u8; 8]];
-    let out = coalesce_encoded_frames(&frames, 32);
+    let out = coalesce_encoded_frames(frames, 32);
 
     assert_eq!(out.len(), 2);
     assert_eq!(out[0].len(), 20);
     assert_eq!(out[1].len(), 28);
-}
-
-#[tokio::test]
-async fn activity_tracker_wakes_waiters_after_write_activity() {
-    let tracker = ActivityTracker::new();
-    tracker.record_write_activity();
-
-    tokio::time::timeout(Duration::from_millis(10), tracker.notify.notified())
-        .await
-        .expect("activity notification should be delivered");
 }
 
 fn test_session_config(is_client: bool) -> SessionConfig {
@@ -44,6 +32,7 @@ fn test_session_config(is_client: bool) -> SessionConfig {
         max_streams_per_session: 32,
         idle_timeout_secs: 30,
         traffic_script: None,
+        post_script_off: false,
     }
 }
 
@@ -275,7 +264,7 @@ async fn cancelled_warm_open_stream_cleans_up_peer_orphan() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(client.active_stream_count().await, 0);
-    assert!(client.pending_data.lock().await.is_empty());
+    assert_eq!(client.pending_data.lock().await.len(), 0);
     assert!(client.pending_fin.lock().await.is_empty());
 
     client.force_close();
@@ -579,12 +568,14 @@ async fn idle_session_times_out() {
         max_streams_per_session: 32,
         idle_timeout_secs: 1,
         traffic_script: None,
+        post_script_off: false,
     };
     let server_config = SessionConfig {
         is_client: false,
         max_streams_per_session: 32,
         idle_timeout_secs: 1,
         traffic_script: None,
+        post_script_off: false,
     };
     let (client, server) = session_pair_with_config(client_config, server_config).await;
 
@@ -611,12 +602,14 @@ async fn active_session_does_not_timeout_with_open_streams() {
         max_streams_per_session: 32,
         idle_timeout_secs: 1,
         traffic_script: None,
+        post_script_off: false,
     };
     let server_config = SessionConfig {
         is_client: false,
         max_streams_per_session: 32,
         idle_timeout_secs: 1,
         traffic_script: None,
+        post_script_off: false,
     };
     let (client, server) = session_pair_with_config(client_config, server_config).await;
 
@@ -1116,7 +1109,7 @@ async fn concurrent_bidirectional_bulk_transfer_keeps_session_usable() {
 // silently discarded, and concurrent stream data is not corrupted.
 #[tokio::test]
 async fn cmd_padding_request_triggers_split_replies_and_preserves_stream_data() {
-    use super::TrafficClass;
+    use super::{FlushBehavior, TrafficClass};
     let (client, server) = session_pair().await;
 
     // Open a stream to have live channel capacity during the test.
@@ -1141,11 +1134,12 @@ async fn cmd_padding_request_triggers_split_replies_and_preserves_stream_data() 
     stream.wait_open().await.expect("stream opens");
 
     // Fire a CMD_PADDING request from server → client with m=3.
-    // The client should emit 3 independently-sized reply frames.
-    let padding_frame = crate::frame::Frame::padding_request(3);
+    // The client queues its reply frames as one merged control write.
+    let mut encoded = Vec::new();
+    crate::frame::encode_padding_request_into(&mut encoded, 3);
     server
         .session
-        .write_frame(&padding_frame, TrafficClass::Control)
+        .write_encoded_payload(encoded, FlushBehavior::Immediate, TrafficClass::Control)
         .await
         .expect("server sends padding request");
 
@@ -1198,11 +1192,11 @@ async fn cmd_padding_reply_flag_is_silently_absorbed() {
 
     // Inject a reply-flagged CMD_PADDING into the data path (simulates a
     // stray reply that reached the sender's read loop). It must be ignored.
-    let reply_frame = crate::frame::Frame::padding_reply(64);
-    let encoded = reply_frame.encode().expect("padding reply encodes");
+    let mut encoded = Vec::new();
+    crate::frame::encode_padding_reply_into(&mut encoded, 64);
     server
         .session
-        .write_encoded_payload(&encoded, FlushBehavior::Immediate, TrafficClass::Control)
+        .write_encoded_payload(encoded, FlushBehavior::Immediate, TrafficClass::Control)
         .await
         .expect("server injects stray reply");
 
@@ -1215,4 +1209,640 @@ async fn cmd_padding_reply_flag_is_silently_absorbed() {
 
     client.force_close();
     server.session.force_close();
+}
+
+// CMD_PADDING 请求里的 m 必须被钳制到 16：从裸 tunnel 端注入 m=255 的请求，
+// 逐帧解码对端回包，统计 reply（flag==1）数量必须恰好为 16。
+#[tokio::test]
+async fn cmd_padding_request_with_large_m_is_capped_at_16_replies() {
+    use super::split_snowy;
+    use bytes::BytesMut;
+    use kanotls_tunnel::FlowDirection;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (client_tunnel, server_tunnel) = snowy_stream_pair().await;
+    let client = Arc::new(Session::new(client_tunnel, test_session_config(true), None));
+    let client_read_loop = client.clone();
+    tokio::spawn(async move {
+        let _ = client_read_loop.run_read_loop().await;
+    });
+
+    let (mut server_read, mut server_write) = split_snowy(server_tunnel);
+
+    // Hand-inject a padding request with m=255 from the raw server end.
+    let mut request = Vec::new();
+    crate::frame::encode_padding_request_into(&mut request, 255);
+    server_write
+        .with_stream(|stream| {
+            let state = stream.control_state();
+            let size = stream.next_control_size(state, FlowDirection::S2C);
+            stream.prepare_control_record(&request, size)
+        })
+        .expect("server prepares padding request record");
+    server_write.flush().await.expect("server flushes request");
+
+    // The client must answer with at most 16 CMD_PADDING replies, merged
+    // into control records. Decode frames from the raw stream and count.
+    let mut buf = BytesMut::with_capacity(65536);
+    let mut read_buf = vec![0u8; 16384];
+    let mut replies = 0usize;
+    let collect = async {
+        loop {
+            let n = server_read.read(&mut read_buf).await.expect("server reads");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&read_buf[..n]);
+            while let Some(frame) = crate::frame::Frame::decode(&mut buf) {
+                if frame.cmd == crate::frame::CMD_PADDING && frame.payload.first() == Some(&1) {
+                    replies += 1;
+                }
+            }
+            if replies >= 16 {
+                break;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(2), collect).await;
+    assert_eq!(replies, 16, "m=255 must be clamped to 16 replies");
+
+    // No further padding frames may be in flight beyond the clamp.
+    if let Ok(Ok(n)) =
+        tokio::time::timeout(Duration::from_millis(200), server_read.read(&mut read_buf)).await
+    {
+        buf.extend_from_slice(&read_buf[..n]);
+        while let Some(frame) = crate::frame::Frame::decode(&mut buf) {
+            assert_ne!(
+                frame.cmd,
+                crate::frame::CMD_PADDING,
+                "unexpected extra padding frame beyond the 16-reply clamp"
+            );
+        }
+    }
+
+    client.force_close();
+}
+
+// Auto 应答解耦回归：连续 Auto 写入只等入队，不等懒冲刷周期（5ms）。
+// 10 次写入的总耗时应远小于 10 个懒冲刷周期（50ms）。块大小取 8KB：
+// 总量 80KB 不触发 256KB 立即冲刷，debug 构建下整体加密耗时也低于一个
+// 懒冲刷周期，计时量的才是应答路径本身。
+#[tokio::test]
+async fn auto_writes_do_not_wait_for_lazy_flush() {
+    let (client, server) = session_pair().await;
+
+    let mut stream = client.open_stream().await.expect("stream opens");
+    stream
+        .write_early(b"auto-ack.example:443")
+        .await
+        .expect("client writes target");
+    let (_sid, mut server_stream) =
+        tokio::time::timeout(Duration::from_secs(1), server.accept_stream())
+            .await
+            .expect("server accepts stream")
+            .expect("server accepts stream");
+    assert_eq!(
+        server_stream.read().await,
+        Some(b"auto-ack.example:443".to_vec())
+    );
+    server_stream
+        .send_synack()
+        .await
+        .expect("server sends SYNACK");
+    stream.wait_open().await.expect("stream opens");
+
+    // Drain the server side so socket buffers never stall the writer loop.
+    let drain = tokio::spawn(async move {
+        while server_stream.read().await.is_some() {}
+    });
+
+    let chunk = vec![0x5Au8; 8 * 1024];
+    let started = std::time::Instant::now();
+    for _ in 0..10 {
+        stream.write(&chunk).await.expect("client writes chunk");
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(25),
+        "10 auto writes took {:?}; Auto acks must not wait for the 5ms lazy flush",
+        elapsed
+    );
+
+    client.force_close();
+    server.session.force_close();
+    drop(drain);
+}
+
+// M9 回归：buffered_stream_bytes 对 data channel 与 pending_data 采用同一
+// 口径。填满 channel 后继续到达的帧进入 pending_data，两者都必须计入总量；
+// 全部消费后计数器必须精确归零，不允许下溢回绕或滞留。
+#[tokio::test(flavor = "current_thread")]
+async fn buffered_stream_bytes_returns_to_zero_after_pending_drain() {
+    let (client, server) = session_pair().await;
+
+    let mut stream = client.open_stream().await.expect("stream opens");
+    stream
+        .write_early(b"counter.example:443")
+        .await
+        .expect("client sends target");
+    let (_sid, server_stream) =
+        tokio::time::timeout(Duration::from_secs(1), server.accept_stream())
+            .await
+            .expect("server accepts stream before timeout")
+            .expect("server accepts stream");
+    server_stream
+        .send_synack()
+        .await
+        .expect("server sends synack");
+    stream.wait_open().await.expect("stream opens");
+
+    let frame_count = STREAM_CHANNEL_CAPACITY + 8;
+    let frame_size = 32 * 1024;
+    let total = frame_count * frame_size;
+    let send_task = tokio::spawn(async move {
+        let mut server_stream = server_stream;
+        for idx in 0..frame_count {
+            server_stream
+                .write(&vec![idx as u8; frame_size])
+                .await
+                .expect("server writes frame");
+        }
+        server_stream.close().await.expect("server closes stream");
+    });
+
+    // channel 装满后仍有 8 帧滞留在 pending_data：总量必须覆盖两者。
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client.buffered_stream_bytes() < total {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("channel and pending bytes are both accounted");
+
+    for idx in 0..frame_count {
+        let data = tokio::time::timeout(Duration::from_secs(5), stream.read())
+            .await
+            .expect("client read returns before timeout")
+            .expect("stream stays open until all data is read");
+        assert_eq!(data.len(), frame_size);
+        assert_eq!(data[0], idx as u8);
+    }
+    assert_eq!(stream.read().await, None);
+    assert_eq!(client.buffered_stream_bytes(), 0);
+    send_task.await.expect("server send task completes");
+
+    client.force_close();
+    server.session.force_close();
+}
+
+// M9 回归：Stream 携带未读数据被 drop 时，已入账字节必须随清理释放，
+// 不允许正向泄漏。
+#[tokio::test(flavor = "current_thread")]
+async fn buffered_stream_bytes_released_when_stream_dropped_unread() {
+    let (client, server) = session_pair().await;
+
+    let mut stream = client.open_stream().await.expect("stream opens");
+    stream
+        .write_early(b"drop-counter.example:443")
+        .await
+        .expect("client sends target");
+    let (_sid, server_stream) =
+        tokio::time::timeout(Duration::from_secs(1), server.accept_stream())
+            .await
+            .expect("server accepts stream before timeout")
+            .expect("server accepts stream");
+    server_stream
+        .send_synack()
+        .await
+        .expect("server sends synack");
+    stream.wait_open().await.expect("stream opens");
+
+    server_stream
+        .write(&vec![7u8; 16 * 1024])
+        .await
+        .expect("server writes unread data");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while client.buffered_stream_bytes() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("unread bytes are accounted");
+
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while client.buffered_stream_bytes() != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("dropping the stream releases accounted bytes");
+
+    client.force_close();
+    server.session.force_close();
+}
+
+// M10 回归：超过 data channel 容量的 pre-SYNACK 数据 + FIN 部分投递时，
+// FIN 必须随剩余数据一起保留，消费者读完全部数据后读到 EOF。
+#[tokio::test(flavor = "current_thread")]
+async fn pre_synack_overflow_data_and_fin_are_delivered_before_eof() {
+    let (client, server) = session_pair().await;
+
+    let mut stream = client.open_stream().await.expect("stream opens");
+    let sid = stream.stream_id;
+
+    // 模拟 SYNACK 到达前积压的状态：数据量超过 channel 容量，末尾带 FIN。
+    let frame_count = STREAM_CHANNEL_CAPACITY + 8;
+    for idx in 0..frame_count {
+        assert!(client.store_pending_data(sid, vec![idx as u8; 64]).await);
+    }
+    client.store_pending_fin(sid).await;
+
+    client.flush_client_pending_stream(sid).await;
+
+    for idx in 0..frame_count {
+        let data = tokio::time::timeout(Duration::from_secs(1), stream.read())
+            .await
+            .expect("client read returns before timeout")
+            .expect("data is delivered before eof");
+        assert_eq!(data, vec![idx as u8; 64]);
+    }
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), stream.read())
+            .await
+            .expect("eof is delivered before timeout"),
+        None
+    );
+    assert_eq!(client.buffered_stream_bytes(), 0);
+
+    client.force_close();
+    server.session.force_close();
+}
+
+// M11 回归：两条流在同一会话上并发首开时，SETTINGS 由写循环随首个
+// control 请求前置，后提交的 SYN 不会被对端以 "settings not received"
+// 拒绝，两条流都必须 SYNACK 成功。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_first_opens_on_fresh_session_both_succeed() {
+    let (client, server) = session_pair().await;
+
+    let client_a = client.clone();
+    let open_a = tokio::spawn(async move {
+        let mut stream = client_a.open_stream().await.expect("stream A opens");
+        stream
+            .write_early(b"a.example:443")
+            .await
+            .expect("stream A writes target");
+        stream
+    });
+    let client_b = client.clone();
+    let open_b = tokio::spawn(async move {
+        let mut stream = client_b.open_stream().await.expect("stream B opens");
+        stream
+            .write_early(b"b.example:443")
+            .await
+            .expect("stream B writes target");
+        stream
+    });
+    let mut stream_a = open_a.await.expect("stream A task joins");
+    let mut stream_b = open_b.await.expect("stream B task joins");
+
+    let mut targets = Vec::new();
+    for _ in 0..2 {
+        let (_sid, mut server_stream) =
+            tokio::time::timeout(Duration::from_secs(2), server.accept_stream())
+                .await
+                .expect("server accepts stream before timeout")
+                .expect("server accepts stream");
+        let target = tokio::time::timeout(Duration::from_secs(2), server_stream.read())
+            .await
+            .expect("server reads target before timeout")
+            .expect("target payload arrives");
+        server_stream
+            .send_synack()
+            .await
+            .expect("server sends synack");
+        targets.push(target);
+    }
+    targets.sort();
+    assert_eq!(
+        targets,
+        vec![b"a.example:443".to_vec(), b"b.example:443".to_vec()]
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), stream_a.wait_open())
+        .await
+        .expect("stream A wait_open returns before timeout")
+        .expect("stream A opens");
+    tokio::time::timeout(Duration::from_secs(2), stream_b.wait_open())
+        .await
+        .expect("stream B wait_open returns before timeout")
+        .expect("stream B opens");
+    assert!(client.pending_client_settings.lock().await.is_none());
+
+    client.force_close();
+    server.session.force_close();
+}
+
+// W3 稳态 H2 骨架共用的裸服务端搭建：client 跑完整 Session（读循环注入
+// 骨架帧），server 端用 split_snowy 裸收发，便于逐帧解码统计 padding。
+// 返回 (client, stream, server_read, server_write, buf, read_buf)：流已
+// SYNACK 打开，client 的 SETTINGS/SYN 突发已被消费。
+#[allow(clippy::type_complexity)]
+async fn raw_server_session_with_open_stream(
+    client_config: SessionConfig,
+    target: &'static [u8],
+) -> (
+    Arc<Session>,
+    crate::Stream,
+    super::SplitReadHalf,
+    super::SplitWriteHalf,
+    bytes::BytesMut,
+    Vec<u8>,
+) {
+    use super::split_snowy;
+    use kanotls_tunnel::FlowDirection;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (client_tunnel, server_tunnel) = snowy_stream_pair().await;
+    let client = Arc::new(Session::new(client_tunnel, client_config, None));
+    let client_read_loop = client.clone();
+    tokio::spawn(async move {
+        let _ = client_read_loop.run_read_loop().await;
+    });
+    let (mut server_read, mut server_write) = split_snowy(server_tunnel);
+
+    let mut stream = client.open_stream().await.expect("stream opens");
+    stream.write_early(target).await.expect("client writes target");
+
+    let mut buf = bytes::BytesMut::with_capacity(65536);
+    let mut read_buf = vec![0u8; 16384];
+    let mut sid = None;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while sid.is_none() {
+            let n = server_read.read(&mut read_buf).await.expect("server reads");
+            assert!(n > 0, "tunnel closed before client SYN");
+            buf.extend_from_slice(&read_buf[..n]);
+            while let Some(frame) = crate::frame::Frame::decode(&mut buf) {
+                if frame.cmd == crate::frame::CMD_SYN {
+                    sid = Some(frame.stream_id);
+                }
+            }
+        }
+    })
+    .await
+    .expect("client SYN arrives before timeout");
+    let sid = sid.unwrap();
+
+    let synack = crate::frame::Frame::new(crate::frame::CMD_SYNACK, sid, vec![])
+        .encode()
+        .expect("synack encodes");
+    server_write
+        .with_stream(|stream| {
+            let state = stream.control_state();
+            let size = stream.next_control_size(state, FlowDirection::S2C);
+            stream.prepare_control_record(&synack, size)
+        })
+        .expect("server prepares synack");
+    server_write.flush().await.expect("server flushes synack");
+    stream.wait_open().await.expect("stream opens");
+
+    (client, stream, server_read, server_write, buf, read_buf)
+}
+
+// W3(a)：bulk 接收端按分发字节数回注 WINDOW_UPDATE 尺寸的 flag=1 padding；
+// 在 bulk 发送方（裸 server 端）统计到的 reply 帧数量必须达到阈值/块数
+// 推算出的预期量级，且流数据完好。
+#[tokio::test]
+async fn bulk_transfer_triggers_window_update_padding_on_sender_side() {
+    use super::H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES;
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const THRESHOLD: usize = 8 * 1024;
+    const CHUNK: usize = 8 * 1024;
+    const CHUNKS: usize = 32;
+    const TOTAL: usize = THRESHOLD * CHUNKS;
+    H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES.store(THRESHOLD, Ordering::Relaxed);
+
+    let (client, mut stream, mut server_read, mut server_write, mut buf, mut read_buf) =
+        raw_server_session_with_open_stream(test_session_config(true), b"wu-bulk.example:443")
+            .await;
+    let sid = stream.stream_id;
+
+    let pattern = |i: usize| -> u8 { ((i * 31 + 7) % 251) as u8 };
+    let send_task = tokio::spawn(async move {
+        let mut sent = 0usize;
+        while sent < TOTAL {
+            let mut chunk = vec![0u8; CHUNK];
+            for (j, b) in chunk.iter_mut().enumerate() {
+                *b = pattern(sent + j);
+            }
+            let mut frame_bytes = Vec::new();
+            crate::frame::Frame::encode_psh_into(&mut frame_bytes, sid, &chunk)
+                .expect("psh encodes");
+            server_write
+                .with_stream(|stream| {
+                    let wire = SnowyStream::data_record_wire_len(frame_bytes.len());
+                    stream.prepare_data_record(&frame_bytes, wire)
+                })
+                .expect("server prepares bulk record");
+            server_write.flush().await.expect("server flushes bulk");
+            sent += CHUNK;
+        }
+    });
+
+    let reader = tokio::spawn(async move {
+        let mut received = 0usize;
+        let mut ok = true;
+        while received < TOTAL {
+            let Some(data) = stream.read().await else {
+                ok = false;
+                break;
+            };
+            for (j, &b) in data.iter().enumerate() {
+                if b != pattern(received + j) {
+                    ok = false;
+                    break;
+                }
+            }
+            received += data.len();
+            if !ok {
+                break;
+            }
+        }
+        (received, ok)
+    });
+
+    // 每收到 CHUNK(=THRESHOLD) 字节，client 读循环恰好越过一次阈值，
+    // 预期恰好 CHUNKS 条 flag=1 padding；留少量余量防计时边界。
+    let mut replies = 0usize;
+    let collect = async {
+        while replies < CHUNKS {
+            let n = server_read.read(&mut read_buf).await.expect("server reads");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&read_buf[..n]);
+            while let Some(frame) = crate::frame::Frame::decode(&mut buf) {
+                if frame.cmd == crate::frame::CMD_PADDING && frame.payload.first() == Some(&1) {
+                    replies += 1;
+                }
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(5), collect).await;
+
+    let (received, ok) = tokio::time::timeout(Duration::from_secs(10), reader)
+        .await
+        .expect("bulk reader joins before timeout")
+        .expect("bulk reader completes");
+    send_task.await.expect("bulk sender joins");
+
+    assert!(ok, "bulk payload corrupted under h2 skeleton injection");
+    assert_eq!(received, TOTAL, "received byte count must equal sent");
+    assert!(
+        replies >= CHUNKS * 3 / 4,
+        "expected ~{} window-update padding frames on the bulk sender side, got {}",
+        CHUNKS,
+        replies
+    );
+
+    H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES.store(0, Ordering::Relaxed);
+    client.force_close();
+}
+
+// W3(c)：post_script_off=true 时阈值覆写也不得引出任何注入帧。
+#[tokio::test]
+async fn post_script_off_disables_h2_skeleton_injection() {
+    use super::H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES;
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const THRESHOLD: usize = 8 * 1024;
+    const CHUNK: usize = 8 * 1024;
+    const CHUNKS: usize = 32;
+    const TOTAL: usize = THRESHOLD * CHUNKS;
+    H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES.store(THRESHOLD, Ordering::Relaxed);
+
+    let mut client_config = test_session_config(true);
+    client_config.post_script_off = true;
+    let (client, mut stream, mut server_read, mut server_write, mut buf, mut read_buf) =
+        raw_server_session_with_open_stream(client_config, b"wu-gated.example:443").await;
+    let sid = stream.stream_id;
+
+    let send_task = tokio::spawn(async move {
+        let mut sent = 0usize;
+        while sent < TOTAL {
+            let chunk = vec![0x5Au8; CHUNK];
+            let mut frame_bytes = Vec::new();
+            crate::frame::Frame::encode_psh_into(&mut frame_bytes, sid, &chunk)
+                .expect("psh encodes");
+            server_write
+                .with_stream(|stream| {
+                    let wire = SnowyStream::data_record_wire_len(frame_bytes.len());
+                    stream.prepare_data_record(&frame_bytes, wire)
+                })
+                .expect("server prepares bulk record");
+            server_write.flush().await.expect("server flushes bulk");
+            sent += CHUNK;
+        }
+    });
+
+    let reader = tokio::spawn(async move {
+        let mut received = 0usize;
+        while received < TOTAL {
+            let Some(data) = stream.read().await else {
+                break;
+            };
+            received += data.len();
+        }
+        received
+    });
+
+    // 从建流后即开始统计任何 CMD_PADDING；bulk 收完后再空闲 500ms 收尾。
+    let counter = tokio::spawn(async move {
+        let mut padding_frames = 0usize;
+        loop {
+            match tokio::time::timeout(Duration::from_millis(500), server_read.read(&mut read_buf))
+                .await
+            {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    buf.extend_from_slice(&read_buf[..n]);
+                    while let Some(frame) = crate::frame::Frame::decode(&mut buf) {
+                        if frame.cmd == crate::frame::CMD_PADDING {
+                            padding_frames += 1;
+                        }
+                    }
+                }
+                Ok(Err(e)) => panic!("server read error: {}", e),
+                Err(_) => break,
+            }
+        }
+        padding_frames
+    });
+
+    let received = tokio::time::timeout(Duration::from_secs(10), reader)
+        .await
+        .expect("bulk reader joins before timeout")
+        .expect("bulk reader completes");
+    send_task.await.expect("bulk sender joins");
+    let padding_frames = tokio::time::timeout(Duration::from_secs(5), counter)
+        .await
+        .expect("padding counter joins before timeout")
+        .expect("padding counter completes");
+
+    assert_eq!(received, TOTAL, "bulk transfer must complete with gating on");
+    assert_eq!(
+        padding_frames, 0,
+        "post_script_off must disable all h2 skeleton padding injection"
+    );
+
+    H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES.store(0, Ordering::Relaxed);
+    client.force_close();
+}
+
+// W3(b)：会话活跃期按采样间隔发出 flag=0 m=1 的 PING 尺寸 padding 请求。
+#[tokio::test]
+async fn h2_ping_padding_is_emitted_on_the_sampled_interval() {
+    use super::{split_snowy, H2_PING_INTERVAL_OVERRIDE_MS};
+    use bytes::BytesMut;
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncReadExt;
+
+    H2_PING_INTERVAL_OVERRIDE_MS.store(50, Ordering::Relaxed);
+
+    let (client_tunnel, server_tunnel) = snowy_stream_pair().await;
+    let client = Arc::new(Session::new(client_tunnel, test_session_config(true), None));
+    let client_read_loop = client.clone();
+    tokio::spawn(async move {
+        let _ = client_read_loop.run_read_loop().await;
+    });
+    let (mut server_read, _server_write) = split_snowy(server_tunnel);
+
+    let mut buf = BytesMut::with_capacity(65536);
+    let mut read_buf = vec![0u8; 16384];
+    let mut pings = 0usize;
+    let collect = async {
+        while pings == 0 {
+            let n = server_read.read(&mut read_buf).await.expect("server reads");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&read_buf[..n]);
+            while let Some(frame) = crate::frame::Frame::decode(&mut buf) {
+                if frame.cmd == crate::frame::CMD_PADDING && frame.payload.first() == Some(&0) {
+                    pings += 1;
+                }
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(2), collect)
+        .await
+        .expect("h2 ping padding request arrives before timeout");
+    assert!(pings >= 1, "expected at least one h2 ping padding request");
+
+    H2_PING_INTERVAL_OVERRIDE_MS.store(0, Ordering::Relaxed);
+    client.force_close();
 }

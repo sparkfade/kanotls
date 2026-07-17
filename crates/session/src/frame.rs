@@ -42,27 +42,6 @@ impl Frame {
         Self::new(CMD_FIN, stream_id, vec![])
     }
 
-    /// Build a CMD_PADDING request frame. `m` dictates how many reply chunks
-    /// the receiver must emit. Junk payload is filled from the entropy pool.
-    pub fn padding_request(m: u8) -> Self {
-        let junk_len = 32 + (m as usize).saturating_mul(16).min(192);
-        let mut payload = vec![0u8; junk_len + 2];
-        payload[0] = 0u8;
-        payload[1] = m;
-        kanotls_tunnel::fill_from_pool(&mut payload[2..]);
-        Self::new(CMD_PADDING, 0, payload)
-    }
-
-    /// Build a CMD_PADDING reply frame. Junk payload from the entropy pool.
-    pub fn padding_reply(junk_len: usize) -> Self {
-        let len = junk_len.max(16);
-        let mut payload = vec![0u8; len + 2];
-        payload[0] = 1u8;
-        payload[1] = 0u8;
-        kanotls_tunnel::fill_from_pool(&mut payload[2..]);
-        Self::new(CMD_PADDING, 0, payload)
-    }
-
     pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
         if self.payload.len() > MAX_PAYLOAD_LEN {
             anyhow::bail!(
@@ -132,39 +111,48 @@ impl Frame {
     }
 }
 
-pub(crate) fn coalesce_encoded_frames(frames: &[Vec<u8>], max_packet_len: usize) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut current = Vec::new();
-
-    for frame in frames {
-        if frame.len() > max_packet_len {
-            if !current.is_empty() {
-                out.push(std::mem::replace(
-                    &mut current,
-                    Vec::with_capacity(max_packet_len),
-                ));
-            }
-            out.push(frame.clone());
-            continue;
-        }
-
-        if current.len() + frame.len() > max_packet_len && !current.is_empty() {
-            out.push(std::mem::replace(
-                &mut current,
-                Vec::with_capacity(max_packet_len),
-            ));
-        }
-        current.extend_from_slice(frame);
-    }
-
-    if !current.is_empty() {
-        out.push(current);
-    }
-
-    out
+/// Append an encoded CMD_PADDING request frame to `dst`: 7-byte header
+/// (cmd=CMD_PADDING, stream_id=0) + `[flag=0, m]` + entropy-pool junk,
+/// written in a single resize. `m` dictates how many reply chunks the
+/// receiver must emit.
+pub fn encode_padding_request_into(dst: &mut Vec<u8>, m: u8) {
+    let junk_len = 32 + (m as usize).saturating_mul(16).min(192);
+    encode_padding_frame_into(dst, 0, m, junk_len);
 }
 
-pub(crate) fn coalesce_encoded_frames_owned(
+/// Append an encoded CMD_PADDING reply frame to `dst`: 7-byte header
+/// (cmd=CMD_PADDING, stream_id=0) + `[flag=1, 0]` + entropy-pool junk,
+/// written in a single resize. `junk_len` is clamped to a minimum of 16.
+pub fn encode_padding_reply_into(dst: &mut Vec<u8>, junk_len: usize) {
+    encode_padding_frame_into(dst, 1, 0, junk_len.max(16));
+}
+
+fn encode_padding_frame_into(dst: &mut Vec<u8>, flag: u8, m: u8, junk_len: usize) {
+    let payload_len = junk_len + 2;
+    let start = dst.len();
+    dst.resize(start + FRAME_HEADER_SIZE + payload_len, 0);
+    dst[start] = CMD_PADDING;
+    dst[start + 1..start + 5].copy_from_slice(&0u32.to_be_bytes());
+    dst[start + 5..start + 7].copy_from_slice(&(payload_len as u16).to_be_bytes());
+    dst[start + 7] = flag;
+    dst[start + 8] = m;
+    kanotls_tunnel::fill_from_pool(&mut dst[start + FRAME_HEADER_SIZE + 2..]);
+}
+
+/// Encode `data` into a sequence of CMD_PSH frames for `stream_id`, chunked
+/// to MAX_PAYLOAD_LEN. Empty input yields no frames (callers emit an explicit
+/// empty PSH themselves where the protocol needs one).
+pub(crate) fn encode_psh_frames(stream_id: u32, data: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
+    let mut packets = Vec::with_capacity(data.len().div_ceil(MAX_PAYLOAD_LEN));
+    for chunk in data.chunks(MAX_PAYLOAD_LEN) {
+        let mut pkt = Vec::with_capacity(Frame::encoded_len(chunk.len()));
+        Frame::encode_psh_into(&mut pkt, stream_id, chunk)?;
+        packets.push(pkt);
+    }
+    Ok(packets)
+}
+
+pub(crate) fn coalesce_encoded_frames(
     frames: Vec<Vec<u8>>,
     max_packet_len: usize,
 ) -> Vec<Vec<u8>> {

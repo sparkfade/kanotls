@@ -39,17 +39,18 @@ async fn parse_http_inbound_inner(
         let method = parts[0].to_string();
         let target = parts[1].to_string();
 
-        let mut headers = line;
+        // 只累计头部块字节数做上限检查，不保存内容。
+        let mut header_block_len = line.len();
         loop {
             line = String::new();
             let n = read_limited_line(&mut reader, &mut line, MAX_REQUEST_LINE).await?;
             if n <= 2 {
                 break;
             }
-            if headers.len() + line.len() > MAX_HEADER_BLOCK {
+            header_block_len += line.len();
+            if header_block_len > MAX_HEADER_BLOCK {
                 anyhow::bail!("http header block too large");
             }
-            headers.push_str(&line);
         }
         (method, target)
     };

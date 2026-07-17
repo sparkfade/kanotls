@@ -5,9 +5,7 @@ use kanotls_proto::socks5::{
     parse_socks5_inbound, relay_socks5_connect, write_socks5_connect_success,
     write_socks5_udp_success, Socks5Request,
 };
-use kanotls_session::{
-    ClientPool, ClientPoolConnectOptions, PoolBehaviorConfig, SessionConfig, Stream,
-};
+use kanotls_session::{ClientPool, ClientPoolConnectOptions, PoolBehaviorConfig, SessionConfig};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -25,10 +23,6 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
         config.inbounds.len(),
         config.outbounds.len()
     );
-
-    if config.outbounds.is_empty() {
-        anyhow::bail!("no outbounds configured");
-    }
 
     validate_client_routing_runtime(&config)?;
 
@@ -110,12 +104,18 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
         .session
         .as_ref()
         .and_then(|s| s.traffic_script.clone());
+    let post_script_off = outbound
+        .settings
+        .session
+        .as_ref()
+        .is_some_and(|s| s.post_script_shaping.as_deref() == Some("off"));
     let pool = Arc::new(ClientPool::new(
         SessionConfig::with_script(
             true,
             max_streams_per_session,
             idle_timeout_secs,
             traffic_script,
+            post_script_off,
         ),
         ClientPoolConnectOptions {
             server_addr: server_addr.clone(),
@@ -151,9 +151,11 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
                 protocol, listen_addr, selected_outbound_tag
             );
 
+            let mut accept_error_delay = Duration::from_millis(10);
             loop {
                 match listener.accept().await {
                     Ok((local, addr)) => {
+                        accept_error_delay = Duration::from_millis(10);
                         if let Err(e) = local.set_nodelay(true) {
                             debug!("failed to enable TCP_NODELAY for {}: {}", addr, e);
                         }
@@ -188,6 +190,8 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
                     }
                     Err(e) => {
                         error!("accept error on {}: {}", listen_addr, e);
+                        tokio::time::sleep(accept_error_delay).await;
+                        accept_error_delay = (accept_error_delay * 2).min(Duration::from_secs(1));
                     }
                 }
             }
@@ -212,10 +216,7 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
 }
 
 fn validate_client_routing_runtime(config: &ClientConfig) -> anyhow::Result<()> {
-    if config.outbounds.is_empty() {
-        return Ok(());
-    }
-
+    // 配置校验已保证 outbounds 非空。
     let first_tag = config.outbounds[0].tag.as_deref();
 
     for rule in config
@@ -260,13 +261,14 @@ async fn handle_socks5_connection(
     local: tokio::net::TcpStream,
     pool: &Arc<ClientPool>,
 ) -> anyhow::Result<()> {
+    let client_ip = local.peer_addr()?.ip();
     match parse_socks5_inbound(local).await? {
         Socks5Request::Connect {
             local_reader,
             mut local_writer,
             target,
         } => {
-            let mut stream = create_or_reuse_stream(pool).await?;
+            let mut stream = pool.open_stream().await?;
             stream.defer_target(target.as_bytes());
             write_socks5_connect_success(&mut local_writer).await?;
             let (tx, rx) = relay_socks5_connect(local_reader, local_writer, stream).await?;
@@ -279,13 +281,14 @@ async fn handle_socks5_connection(
             target,
         } => {
             let udp_addr = udp.local_addr()?;
-            let mut stream = create_or_reuse_stream(pool).await?;
+            let mut stream = pool.open_stream().await?;
             stream.write_early(target.as_bytes()).await?;
             stream.wait_open().await?;
             write_socks5_udp_success(&mut local_writer, udp_addr).await?;
-            let control = (local_reader, local_writer);
-            let result = kanotls_proto::uot::relay_udp_client_mode(stream, udp).await;
-            drop(control);
+            let result =
+                kanotls_proto::uot::relay_udp_client_mode(stream, udp, client_ip, local_reader)
+                    .await;
+            drop(local_writer);
             result?;
         }
     }
@@ -297,15 +300,11 @@ async fn handle_http_connection(
     pool: &Arc<ClientPool>,
 ) -> anyhow::Result<()> {
     let req = parse_http_inbound(local).await?;
-    let mut stream = create_or_reuse_stream(pool).await?;
+    let mut stream = pool.open_stream().await?;
     stream.defer_target(req.target.as_bytes());
     let mut local_writer = req.local_writer;
     write_http_connect_success(&mut local_writer).await?;
     let (tx, rx) = relay_http_connect(req.local_reader, local_writer, stream).await?;
     debug!("http relay done: tx={} rx={}", tx, rx);
     Ok(())
-}
-
-async fn create_or_reuse_stream(pool: &Arc<ClientPool>) -> anyhow::Result<Stream> {
-    pool.open_stream().await
 }
