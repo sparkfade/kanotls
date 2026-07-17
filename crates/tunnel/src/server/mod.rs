@@ -22,11 +22,14 @@ use crate::common::{
     TLS_RECORD_HEADER_LEN,
 };
 use crate::utils::{
-    client_hello_key_share_range, client_hello_random_and_session_id_ranges, constant_time_eq,
-    derive_counter_mac, extract_client_hello_server_name, mask_mac_flags,
-    unmask_noise_ephemeral_key,
+    client_hello_random_and_session_id_ranges, constant_time_eq, derive_counter_mac,
+    extract_client_hello_server_name, mask_mac_flags, unmask_noise_ephemeral_key,
 };
 
+/// Classification of a pre-auth failure. Only `CapacityLimited` carries branch
+/// semantics (it selects the dedicated capacity-limited path inside
+/// `emit_pre_auth_failure`); the other variants just document which check
+/// rejected the handshake and are otherwise handled identically.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum FailureClass {
     NonTlsFirstRecord,
@@ -49,14 +52,7 @@ pub async fn server_accept(
     let handshake_permit = match HANDSHAKE_LIMITER.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            emit_shaped_failure(
-                tcp,
-                Vec::new(),
-                camouflage_host,
-                camouflage_port,
-                FailureClass::CapacityLimited,
-            )
-            .await;
+            emit_shaped_failure(tcp).await;
             anyhow::bail!("server handshake limit reached")
         }
     };
@@ -71,8 +67,7 @@ pub async fn server_accept(
     let mut rx_buf = Vec::new();
     let initial_deadline =
         tokio::time::Instant::now() + Duration::from_secs(SERVER_HANDSHAKE_TIMEOUT_SECS);
-    let (typ, rec_len) = match read_initial_client_record(&mut tcp, &mut rx_buf, initial_deadline)
-        .await
+    let (typ, _) = match read_initial_client_record(&mut tcp, &mut rx_buf, initial_deadline).await
     {
         Ok(res) => res,
         Err(e) => {
@@ -85,7 +80,7 @@ pub async fn server_accept(
             if !rx_buf.is_empty() && !is_oversized_initial_record_error(&e) {
                 emit_pre_auth_failure(tcp, rx_buf, camouflage_host, camouflage_port, class).await;
             } else {
-                emit_shaped_failure(tcp, rx_buf, camouflage_host, camouflage_port, class).await;
+                emit_shaped_failure(tcp).await;
             }
             anyhow::bail!("Failed to read initial TLS record: {}", e)
         }
@@ -104,12 +99,8 @@ pub async fn server_accept(
         anyhow::bail!("First record is not a TLS Handshake");
     }
 
-    if rx_buf.len() != TLS_RECORD_HEADER_LEN + rec_len {
-        anyhow::bail!("unexpected initial record buffer length");
-    }
     let client_hello_server_name = extract_client_hello_server_name(&rx_buf).map(str::to_owned);
     let pld = &mut rx_buf[..];
-    let _key_share_range = client_hello_key_share_range(pld);
     let mut replay_check: Option<ReplayCheck> = None;
 
     let is_auth_valid = if let Some((random_range, session_id_range)) =
@@ -121,8 +112,6 @@ pub async fn server_accept(
             let mut random_copy = [0u8; 32];
             random_copy.copy_from_slice(random);
             client_noise_tag.copy_from_slice(&session_id[..16]);
-
-            let _flags = session_id[31];
 
             let recovered_e =
                 unmask_noise_ephemeral_key(&random_copy, &derived_psk, &client_noise_tag);
@@ -260,7 +249,6 @@ pub async fn server_accept(
     };
 
     let mut noise_state = Some(noise);
-    let _has_cache = has_complete_camouflage_cache(camouflage_host, camouflage_port, &rx_buf).await;
 
     if let Some(ref check) = replay_check {
         if !commit_counter_replay(check) {
@@ -285,33 +273,29 @@ pub async fn server_accept(
         rx_buf.clone(),
     );
 
-    let pre_read_tls = consume_client_flight3_ghost(&mut tcp, &mut noise).await?;
+    consume_client_flight3_ghost(&mut tcp, &mut noise).await?;
 
-    Ok(SnowyStream::new_with_permit_and_pre_read_tls(
-        tcp,
-        noise,
-        Some(_session_permit),
-        pre_read_tls,
-    ))
+    Ok(SnowyStream::new_with_permit(tcp, noise, Some(_session_permit)))
 }
 
 pub(super) async fn consume_client_flight3_ghost(
     tcp: &mut TcpStream,
     noise: &mut snow::TransportState,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<()> {
     let max_wire = max_flight3_total_wire_len();
     let mut wire = vec![0u8; max_wire];
     let deadline = tokio::time::Instant::now() + Duration::from_secs(SERVER_HANDSHAKE_TIMEOUT_SECS);
-    let remaining_timeout = deadline - tokio::time::Instant::now();
 
     let ccs_len = FLIGHT3_CCS_RECORD.len();
     let fin_record_len = FLIGHT3_FINISHED_RECORD_LEN;
     let minimum_needed = ccs_len + fin_record_len + TLS_RECORD_HEADER_LEN;
 
+    // Reads are capped at `minimum_needed`, so this loop never consumes a byte
+    // of the first upload TLS record that may immediately follow Flight 3.
     let mut total_read = 0usize;
     while total_read < minimum_needed {
-        let n = tokio::time::timeout(
-            remaining_timeout,
+        let n = tokio::time::timeout_at(
+            deadline,
             tcp.read(&mut wire[total_read..minimum_needed]),
         )
         .await
@@ -347,20 +331,9 @@ pub(super) async fn consume_client_flight3_ghost(
         )
         .map_err(|e| anyhow::anyhow!("failed to decrypt Flight 3 Finished ghost: {}", e))?;
 
+    // total_read == minimum_needed == h2_start + TLS_RECORD_HEADER_LEN here,
+    // so the H2 ghost record header is already in the buffer.
     let h2_start = fin_end;
-    while total_read < h2_start + TLS_RECORD_HEADER_LEN {
-        let n = tokio::time::timeout(
-            remaining_timeout,
-            tcp.read(&mut wire[total_read..h2_start + TLS_RECORD_HEADER_LEN]),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("timeout reading H2 ghost header"))??;
-        if n == 0 {
-            anyhow::bail!("unexpected eof reading H2 ghost");
-        }
-        total_read += n;
-    }
-
     if wire[h2_start] != 0x17 {
         anyhow::bail!("invalid client Flight 3: H2 ghost record type mismatch");
     }
@@ -373,15 +346,10 @@ pub(super) async fn consume_client_flight3_ghost(
     }
     let h2_total = TLS_RECORD_HEADER_LEN + h2_payload_len;
     let h2_end = h2_start + h2_total;
-    let pre_read_tls = if total_read > h2_end {
-        wire[h2_end..total_read].to_vec()
-    } else {
-        Vec::new()
-    };
     wire.resize(h2_end, 0);
 
     while total_read < h2_end {
-        let n = tokio::time::timeout(remaining_timeout, tcp.read(&mut wire[total_read..h2_end]))
+        let n = tokio::time::timeout_at(deadline, tcp.read(&mut wire[total_read..h2_end]))
             .await
             .map_err(|_| anyhow::anyhow!("timeout reading H2 ghost record"))??;
         if n == 0 {
@@ -403,7 +371,7 @@ pub(super) async fn consume_client_flight3_ghost(
         "Consumed client Flight 3 ghost: CCS(6) + Finished({}) + H2({})",
         FLIGHT3_FINISHED_RECORD_LEN, h2_plaintext_len
     );
-    Ok(pre_read_tls)
+    Ok(())
 }
 
 pub(super) async fn resolve_allowed_camouflage(
@@ -461,8 +429,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     use crate::utils::{
-        derive_counter_cache_key, derive_counter_mask, stable_client_hello_fingerprint,
-        xor_u64_bytes,
+        client_hello_key_share_range, derive_counter_cache_key, derive_counter_mask,
+        stable_client_hello_fingerprint, xor_u64_bytes,
     };
 
     lazy_static! {
@@ -602,20 +570,13 @@ mod tests {
             client_tcp.flush().await.unwrap();
         });
 
-        let pre_read_tls = consume_client_flight3_ghost(&mut server_tcp, &mut server_noise)
+        consume_client_flight3_ghost(&mut server_tcp, &mut server_noise)
             .await
             .unwrap();
-        assert!(
-            pre_read_tls.is_empty(),
-            "Flight 3 reader should not over-read the first upload TLS record"
-        );
 
-        let mut stream = SnowyStream::new_with_permit_and_pre_read_tls(
-            server_tcp,
-            server_noise,
-            None,
-            pre_read_tls,
-        );
+        // If the Flight 3 reader had consumed any byte of the first upload TLS
+        // record, this read would hang or return corrupted data.
+        let mut stream = SnowyStream::new_with_permit(server_tcp, server_noise, None);
         let mut got = vec![0u8; upload_payload.len()];
         tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut got))
             .await
@@ -640,8 +601,7 @@ mod tests {
             client_stream.shutdown().await.unwrap();
         });
 
-        let mut server_stream =
-            SnowyStream::new_with_permit_and_pre_read_tls(server_tcp, server_noise, None, vec![]);
+        let mut server_stream = SnowyStream::new_with_permit(server_tcp, server_noise, None);
 
         let mut got = vec![0u8; payload.len()];
         server_stream
@@ -686,8 +646,7 @@ mod tests {
         injector.flush().await.unwrap();
 
         // 4) Server 端 SnowyStream 第一次 read 必须返回 InvalidData (AEAD 失败)。
-        let mut server_stream =
-            SnowyStream::new_with_permit_and_pre_read_tls(server_tcp, server_noise, None, vec![]);
+        let mut server_stream = SnowyStream::new_with_permit(server_tcp, server_noise, None);
         let mut buf = vec![0u8; 256];
         let first = tokio::time::timeout(Duration::from_secs(3), server_stream.read(&mut buf))
             .await
@@ -754,8 +713,7 @@ mod tests {
             client_stream.shutdown().await.unwrap();
         });
 
-        let mut server_stream =
-            SnowyStream::new_with_permit_and_pre_read_tls(server_tcp, server_noise, None, vec![]);
+        let mut server_stream = SnowyStream::new_with_permit(server_tcp, server_noise, None);
 
         let mut total = 0usize;
         let mut buf = vec![0u8; 16384];
@@ -788,20 +746,19 @@ mod tests {
         writer.await.unwrap();
     }
 
-    async fn expect_shaped_close_or_alert(client: &mut TcpStream) {
+    /// All failure paths close silently (TCP FIN via shutdown); no code path
+    /// emits a TLS alert anymore, so the client must observe a clean EOF with
+    /// zero application bytes.
+    async fn expect_shaped_close(client: &mut TcpStream) {
         let mut buf = [0u8; 7];
         let read = tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf))
             .await
             .expect("failure path should not hang indefinitely")
             .unwrap();
-        if read == 0 {
-            return;
-        }
-        if read >= 7 {
-            assert_eq!(buf[..3], [0x15, 0x03, 0x03]);
-            assert_eq!(buf[3..5], [0x00, 0x02]);
-            assert_eq!(buf[5], 0x02);
-        }
+        assert_eq!(
+            read, 0,
+            "shaped failure must close silently without emitting any bytes"
+        );
     }
 
     fn test_public_ip(idx: usize) -> IpAddr {
@@ -856,19 +813,109 @@ mod tests {
         }
     }
 
+    fn pooled(profile: CamouflageProfile) -> PooledProfile {
+        PooledProfile {
+            profile,
+            fetched_at: Instant::now(),
+        }
+    }
+
     #[tokio::test]
     async fn sample_camouflage_profile_prefers_complete_variants() {
         let profile = sample_camouflage_profile(&CamouflageProfilePool {
             profiles: vec![
-                test_camouflage_profile(vec![0x16, 0x03, 0x03], vec![]),
-                test_camouflage_profile(vec![0x16, 0x03, 0x03], vec![53, 1024]),
-                test_camouflage_profile(vec![], vec![90]),
-            ],
+                pooled(test_camouflage_profile(vec![0x16, 0x03, 0x03], vec![])),
+                pooled(test_camouflage_profile(vec![0x16, 0x03, 0x03], vec![53, 1024])),
+                pooled(test_camouflage_profile(vec![], vec![90])),
+            ]
+            .into_iter()
+            .collect(),
         })
         .unwrap();
 
         assert_eq!(camouflage_profile_rank(&profile), 3);
         assert_eq!(&*profile.app_data_sizes, &[53, 1024][..]);
+    }
+
+    #[tokio::test]
+    async fn camouflage_pool_lookup_returns_one_of_the_stored_variants() {
+        let key = "pool-member.example:443:deadbeef";
+        let expected: Vec<Vec<usize>> = vec![vec![53], vec![90, 128], vec![256, 512, 1024]];
+        for sizes in &expected {
+            store_camouflage_profile(
+                key.to_string(),
+                test_camouflage_profile(vec![0x16, 0x03, 0x03], sizes.clone()),
+            )
+            .await;
+        }
+
+        for _ in 0..16 {
+            let profile = get_cached_camouflage_profile_entry(key)
+                .await
+                .expect("pool is populated");
+            assert!(
+                expected
+                    .iter()
+                    .any(|sizes| sizes.as_slice() == &*profile.app_data_sizes),
+                "lookup must return one of the pooled samples, got {:?}",
+                profile.app_data_sizes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn camouflage_pool_full_replaces_oldest_variant() {
+        let mut pool = None;
+        for idx in 0..MAX_CAMOUFLAGE_PROFILE_VARIANTS + 1 {
+            pool = Some(push_profile_variant(
+                pool,
+                test_camouflage_profile(vec![0x16, 0x03, 0x03], vec![53 + idx]),
+            ));
+        }
+
+        let pool = pool.unwrap();
+        assert_eq!(pool.profiles.len(), MAX_CAMOUFLAGE_PROFILE_VARIANTS);
+        let retained: Vec<usize> = pool
+            .profiles
+            .iter()
+            .map(|entry| entry.profile.app_data_sizes[0])
+            .collect();
+        assert!(
+            !retained.contains(&53),
+            "the oldest sample must be evicted once the pool is full"
+        );
+        for idx in 1..MAX_CAMOUFLAGE_PROFILE_VARIANTS + 1 {
+            assert!(
+                retained.contains(&(53 + idx)),
+                "newer sample {} must be retained",
+                53 + idx
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn camouflage_pool_lookup_miss_semantics_unchanged() {
+        let client_hello = vec![
+            0x16, 0x03, 0x01, 0x00, 0x7d, 0x01, 0x00, 0x00, 0x79, 0x03, 0x03, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0x00, 0x02, 0x13, 0x01, 0x01, 0x00, 0x00, 0x2a, 0x00, 0x33, 0x00, 0x26, 0x00, 0x24,
+            0x00, 0x1d, 0x00, 0x20, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        ];
+
+        assert!(
+            lookup_cached_camouflage_profile("never-cached.example", 443, &client_hello)
+                .await
+                .is_none(),
+            "lookup against an uncached key must keep returning None"
+        );
+        assert!(
+            get_cached_camouflage_profile_entry("never-cached.example:443:deadbeef")
+                .await
+                .is_none(),
+            "empty pool must keep the existing miss semantics"
+        );
     }
 
     #[tokio::test]
@@ -1168,7 +1215,7 @@ mod tests {
             .expect("server_accept should finish the shaped failure path")
             .expect("server_accept task should join");
         assert!(result.is_err());
-        expect_shaped_close_or_alert(&mut client).await;
+        expect_shaped_close(&mut client).await;
         assert_pre_auth_fallback_state_clean();
     }
 
@@ -1205,7 +1252,7 @@ mod tests {
                 .expect("server_accept should finish once fallback accounting unblocks")
                 .expect("server_accept task should join");
             assert!(result.is_err());
-            expect_shaped_close_or_alert(&mut client).await;
+            expect_shaped_close(&mut client).await;
             assert_pre_auth_fallback_state_clean();
         }
     }
@@ -1294,26 +1341,6 @@ mod tests {
         drop(global_permits);
         drop(replacement);
         assert_pre_auth_fallback_state_clean();
-    }
-
-    #[test]
-    fn pre_auth_fallback_is_used_for_all_pre_commit_failures() {
-        assert!(should_try_pre_auth_fallback(
-            FailureClass::NonTlsFirstRecord
-        ));
-        assert!(should_try_pre_auth_fallback(
-            FailureClass::InvalidFirstRecord
-        ));
-        assert!(should_try_pre_auth_fallback(FailureClass::MissingSni));
-        assert!(should_try_pre_auth_fallback(FailureClass::SniMismatch));
-        assert!(should_try_pre_auth_fallback(FailureClass::AuthFailed));
-        assert!(should_try_pre_auth_fallback(FailureClass::HandshakeTimeout));
-        assert!(should_try_pre_auth_fallback(FailureClass::CapacityLimited));
-    }
-
-    #[test]
-    fn sni_mismatch_is_pre_auth_fallback_eligible() {
-        assert!(should_try_pre_auth_fallback(FailureClass::SniMismatch));
     }
 
     #[test]

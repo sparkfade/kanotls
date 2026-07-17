@@ -71,25 +71,7 @@ async fn read_payload_with_deadline(
     len: usize,
     deadline: tokio::time::Instant,
 ) -> std::io::Result<()> {
-    let mut remaining = len;
-    let mut chunk = [0u8; 2048];
-
-    while remaining > 0 {
-        let want = remaining.min(chunk.len());
-        let read = tokio::time::timeout_at(deadline, stream.read(&mut chunk[..want]))
-            .await
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS read deadline exceeded")
-            })??;
-        if read == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "unexpected eof while reading TLS record",
-            ));
-        }
-        buf.extend_from_slice(&chunk[..read]);
-        remaining -= read;
-    }
-
-    Ok(())
+    let start = buf.len();
+    buf.resize(start + len, 0);
+    read_exact_with_deadline(stream, &mut buf[start..], deadline).await
 }
