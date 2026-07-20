@@ -4,7 +4,7 @@ use futures::future::BoxFuture;
 use futures::FutureExt;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::MissedTickBehavior;
@@ -12,7 +12,6 @@ use tracing::{debug, warn};
 
 const MIN_INITIAL_CONNECTIONS: usize = 1;
 const MAX_INITIAL_CONNECTIONS: usize = 3;
-const DEFAULT_MIN_ACTIVE_CONNECTIONS: usize = 4;
 const IDLE_DRAIN_SECS: u64 = 30;
 const DEFAULT_MONITOR_INTERVAL_MS: u64 = 500;
 const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 15;
@@ -48,7 +47,6 @@ struct ResolvedPoolBehavior {
     seed: u64,
     target_pool_size: usize,
     initial_connection_count: usize,
-    min_active_connections: usize,
     spawn_cluster_len: u64,
 }
 
@@ -58,7 +56,6 @@ pub struct PoolBehaviorConfig {
     max_target_pool_size: usize,
     min_initial_connections: usize,
     max_initial_connections: usize,
-    min_active_connections: usize,
     min_startup_jitter_ms: u64,
     max_startup_jitter_ms: u64,
     soft_ttl_secs: u64,
@@ -81,7 +78,6 @@ impl PoolBehaviorConfig {
             max_target_pool_size: max_target,
             min_initial_connections: MIN_INITIAL_CONNECTIONS,
             max_initial_connections: MAX_INITIAL_CONNECTIONS,
-            min_active_connections: DEFAULT_MIN_ACTIVE_CONNECTIONS,
             min_startup_jitter_ms: min_jitter,
             max_startup_jitter_ms: max_jitter,
             soft_ttl_secs: soft_ttl,
@@ -107,13 +103,8 @@ impl PoolBehaviorConfig {
             seed,
             target_pool_size,
             initial_connection_count,
-            min_active_connections: self.min_active_connections(target_pool_size),
             spawn_cluster_len: seeded_u64_inclusive(derive_seed(seed, 0x14), 2, 4),
         }
-    }
-
-    fn min_active_connections(&self, target_pool_size: usize) -> usize {
-        self.min_active_connections.min(target_pool_size.max(1))
     }
 
     fn lifecycle(&self) -> PoolLifecycle {
@@ -172,7 +163,6 @@ struct PoolInner<C: TunnelConnector> {
     target_pool_size: usize,
     max_live_connections: usize,
     initial_connection_count: usize,
-    min_active_connections: usize,
     bootstrap_started: AtomicBool,
     acquire_waiters: AtomicUsize,
     next_spawn_slot: AtomicU64,
@@ -224,7 +214,7 @@ impl ConnectionState {
 
 pub trait PoolSession: Send + Sync {
     fn open_stream(&self) -> BoxFuture<'_, Result<Stream, anyhow::Error>>;
-    fn active_streams(&self) -> BoxFuture<'_, usize>;
+    fn active_streams(&self) -> usize;
     fn buffered_stream_bytes(&self) -> usize;
     fn is_alive(&self) -> bool;
     fn is_closing(&self) -> bool;
@@ -276,7 +266,6 @@ impl<C: TunnelConnector> ClientPool<C> {
             target_pool_size: resolved_behavior.target_pool_size,
             max_live_connections,
             initial_connection_count: resolved_behavior.initial_connection_count,
-            min_active_connections: resolved_behavior.min_active_connections,
             bootstrap_started: AtomicBool::new(false),
             acquire_waiters: AtomicUsize::new(0),
             next_spawn_slot: AtomicU64::new(0),
@@ -371,7 +360,6 @@ impl<C: TunnelConnector> PoolInner<C> {
                 target_pool_size = self.target_pool_size,
                 max_live_connections = self.max_live_connections,
                 initial_connection_count = self.initial_connection_count,
-                min_active_connections = self.min_active_connections,
                 "starting browser-mimicking tunnel pool"
             );
         }
@@ -402,7 +390,7 @@ impl<C: TunnelConnector> PoolInner<C> {
                 continue;
             }
 
-            let active_streams = entry.handle.active_streams().await;
+            let active_streams = entry.handle.active_streams();
             total_active_streams = total_active_streams.saturating_add(active_streams);
 
             if active_streams > 0 {
@@ -557,11 +545,6 @@ impl<C: TunnelConnector> PoolInner<C> {
 
         self.connection_ready.notify_waiters();
         self.monitor_notify.notify_waiters();
-
-        let pool = Arc::downgrade(self);
-        tokio::spawn(async move {
-            run_connection_lifecycle(pool, connection).await;
-        });
     }
 
     async fn run_monitor(self: Arc<Self>) {
@@ -569,6 +552,7 @@ impl<C: TunnelConnector> PoolInner<C> {
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         interval.tick().await;
 
+        let mut idle_since: HashMap<u64, Instant> = HashMap::new();
         loop {
             tokio::select! {
                 _ = interval.tick() => {}
@@ -576,7 +560,54 @@ impl<C: TunnelConnector> PoolInner<C> {
             }
 
             self.prune_dead_connections().await;
+            self.drive_connection_lifecycles(&mut idle_since).await;
             self.schedule_replenishment_if_needed().await;
+        }
+    }
+
+    /// 连接生命周期统一由 monitor 驱动（原先每连接一个专属任务）：
+    /// soft_ttl 到期与持续空闲（active_streams==0 超过 idle_timeout）进入
+    /// Draining；Draining 且流排空即关闭；对端已 closing 的连接立即关闭。
+    /// 判定粒度为 monitor tick，与旧实现一致。
+    async fn drive_connection_lifecycles(&self, idle_since: &mut HashMap<u64, Instant>) {
+        let entries = self.connection_entries().await;
+        idle_since.retain(|seq, _| entries.iter().any(|entry| entry.seq == *seq));
+
+        for entry in entries {
+            if entry.state() == ConnectionState::Closed || !entry.handle.is_alive() {
+                continue;
+            }
+
+            if entry.handle.is_closing() {
+                self.force_close_connection(entry.seq, "session closing")
+                    .await;
+                continue;
+            }
+
+            let active_streams = entry.handle.active_streams();
+            match entry.state() {
+                ConnectionState::Active => {
+                    if active_streams > 0 {
+                        idle_since.remove(&entry.seq);
+                    } else {
+                        let started = idle_since.entry(entry.seq).or_insert_with(Instant::now);
+                        if started.elapsed() >= entry.idle_timeout {
+                            self.mark_draining(entry.seq, "idle timeout expired").await;
+                            continue;
+                        }
+                    }
+                    if entry.created_at.elapsed() >= entry.soft_ttl {
+                        self.mark_draining(entry.seq, "soft ttl expired").await;
+                    }
+                }
+                ConnectionState::Draining => {
+                    if active_streams == 0 {
+                        self.force_close_connection(entry.seq, "drain complete")
+                            .await;
+                    }
+                }
+                ConnectionState::Closed => {}
+            }
         }
     }
 
@@ -607,7 +638,7 @@ impl<C: TunnelConnector> PoolInner<C> {
                 continue;
             }
 
-            let active_streams = entry.handle.active_streams().await;
+            let active_streams = entry.handle.active_streams();
             if active_streams >= self.session_config.max_streams_per_session {
                 continue;
             }
@@ -730,14 +761,13 @@ impl<C: TunnelConnector> PoolInner<C> {
                 snapshot.live += 1;
                 snapshot.total_active_streams = snapshot
                     .total_active_streams
-                    .saturating_add(entry.handle.active_streams().await);
+                    .saturating_add(entry.handle.active_streams());
             }
         }
         snapshot.pending_spawns = self.pending_spawns.load(Ordering::Relaxed);
         snapshot.acquire_waiters = self.acquire_waiters.load(Ordering::Relaxed);
         snapshot.target_pool_size = self.target_pool_size;
         snapshot.max_live_connections = self.max_live_connections;
-        snapshot.min_active_connections = self.min_active_connections;
         snapshot
     }
 }
@@ -795,70 +825,6 @@ struct ConnectionScore {
     seq: u64,
 }
 
-async fn run_connection_lifecycle<S: PoolSession>(
-    pool: Weak<PoolInner<impl TunnelConnector<Session = S>>>,
-    connection: Arc<PooledConnection<S>>,
-) {
-    let soft_ttl = tokio::time::sleep(connection.soft_ttl);
-    tokio::pin!(soft_ttl);
-
-    let monitor_interval = pool
-        .upgrade()
-        .map(|inner| inner.behavior.monitor_interval)
-        .unwrap_or_else(|| Duration::from_millis(DEFAULT_MONITOR_INTERVAL_MS));
-    let mut interval = tokio::time::interval(monitor_interval);
-    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    interval.tick().await;
-
-    let mut idle_since = None;
-    let mut soft_ttl_applied = false;
-
-    loop {
-        tokio::select! {
-            _ = &mut soft_ttl, if !soft_ttl_applied => {
-                if let Some(pool) = pool.upgrade() {
-                    pool.mark_draining(connection.seq, "soft ttl expired").await;
-                }
-                soft_ttl_applied = true;
-            }
-            _ = interval.tick() => {}
-        }
-
-        let Some(pool) = pool.upgrade() else {
-            break;
-        };
-
-        if !connection.handle.is_alive() || connection.handle.is_closing() {
-            pool.force_close_connection(connection.seq, "session ended")
-                .await;
-            break;
-        }
-
-        let active_streams = connection.handle.active_streams().await;
-        match connection.state() {
-            ConnectionState::Active => {
-                if active_streams == 0 {
-                    let started = idle_since.get_or_insert_with(Instant::now);
-                    if started.elapsed() >= connection.idle_timeout {
-                        pool.mark_draining(connection.seq, "idle timeout expired")
-                            .await;
-                    }
-                } else {
-                    idle_since = None;
-                }
-            }
-            ConnectionState::Draining => {
-                if active_streams == 0 {
-                    pool.force_close_connection(connection.seq, "drain complete")
-                        .await;
-                    break;
-                }
-            }
-            ConnectionState::Closed => break,
-        }
-    }
-}
-
 impl TunnelConnector for DefaultConnector {
     type Session = LivePoolSession;
 
@@ -894,8 +860,8 @@ impl PoolSession for LivePoolSession {
         async move { self.session.open_stream().await }.boxed()
     }
 
-    fn active_streams(&self) -> BoxFuture<'_, usize> {
-        async move { self.session.active_stream_count().await }.boxed()
+    fn active_streams(&self) -> usize {
+        self.session.active_stream_count()
     }
 
     fn buffered_stream_bytes(&self) -> usize {
@@ -1015,7 +981,6 @@ struct TestPoolSnapshot {
     acquire_waiters: usize,
     target_pool_size: usize,
     max_live_connections: usize,
-    min_active_connections: usize,
 }
 
 #[cfg(test)]
@@ -1081,8 +1046,8 @@ mod tests {
             async move { anyhow::bail!("fake session does not open streams") }.boxed()
         }
 
-        fn active_streams(&self) -> BoxFuture<'_, usize> {
-            async move { self.active_streams.load(Ordering::Relaxed) }.boxed()
+        fn active_streams(&self) -> usize {
+            self.active_streams.load(Ordering::Relaxed)
         }
 
         fn buffered_stream_bytes(&self) -> usize {
@@ -1138,7 +1103,6 @@ mod tests {
             max_target_pool_size: 3,
             min_initial_connections: 1,
             max_initial_connections: 1,
-            min_active_connections: 2,
             min_startup_jitter_ms: 5,
             max_startup_jitter_ms: 5,
             soft_ttl_secs: 1,
@@ -1170,7 +1134,6 @@ mod tests {
         let mut behavior = test_behavior();
         behavior.min_target_pool_size = 1;
         behavior.max_target_pool_size = 1;
-        behavior.min_active_connections = 0;
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 5;
 
@@ -1216,7 +1179,6 @@ mod tests {
         let mut behavior = test_behavior();
         behavior.min_target_pool_size = 1;
         behavior.max_target_pool_size = 1;
-        behavior.min_active_connections = 0;
         behavior.monitor_interval = Duration::from_millis(10);
 
         let pool = TestPool::new_with_behavior_for_test(
@@ -1241,11 +1203,8 @@ mod tests {
             .await
             .insert(connection.seq, connection.clone());
 
-        let pool_inner = Arc::downgrade(&pool.inner);
-        tokio::spawn(async move {
-            run_connection_lifecycle(pool_inner, connection).await;
-        });
-
+        // 生命周期由全局 monitor（10ms tick）统一驱动：soft_ttl 20ms 到期
+        // 后进入 Draining，活跃流排空后被关闭并移出映射。
         tokio::time::sleep(Duration::from_millis(70)).await;
         let state = pool
             .inner
@@ -1277,7 +1236,6 @@ mod tests {
         let mut behavior = test_behavior();
         behavior.min_target_pool_size = 2;
         behavior.max_target_pool_size = 2;
-        behavior.min_active_connections = 0;
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 5;
 
@@ -1305,7 +1263,6 @@ mod tests {
         let mut behavior = test_behavior();
         behavior.min_target_pool_size = 2;
         behavior.max_target_pool_size = 2;
-        behavior.min_active_connections = 0;
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 5;
 
@@ -1349,7 +1306,6 @@ mod tests {
         let snapshot = pool.snapshot().await;
         assert_eq!(snapshot.target_pool_size, 3);
         assert_eq!(snapshot.max_live_connections, 4);
-        assert_eq!(snapshot.min_active_connections, 2);
         assert_eq!(snapshot.active, 1);
         assert_eq!(snapshot.draining, 0);
         assert_eq!(snapshot.pending_spawns, 0);
@@ -1425,7 +1381,6 @@ mod tests {
         let mut behavior = test_behavior();
         behavior.min_target_pool_size = 2;
         behavior.max_target_pool_size = 2;
-        behavior.min_active_connections = 2;
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 5;
 
@@ -1456,7 +1411,6 @@ mod tests {
         let mut behavior = test_behavior();
         behavior.min_target_pool_size = 1;
         behavior.max_target_pool_size = 1;
-        behavior.min_active_connections = 0;
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 0;
 
@@ -1481,7 +1435,6 @@ mod tests {
         let mut behavior = test_behavior();
         behavior.min_target_pool_size = 1;
         behavior.max_target_pool_size = 1;
-        behavior.min_active_connections = 1;
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 0;
 
@@ -1524,7 +1477,6 @@ mod tests {
         let mut behavior = test_behavior();
         behavior.min_target_pool_size = 2;
         behavior.max_target_pool_size = 2;
-        behavior.min_active_connections = 0;
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 0;
 
@@ -1559,7 +1511,6 @@ mod tests {
         let mut behavior = test_behavior();
         behavior.min_target_pool_size = 1;
         behavior.max_target_pool_size = 1;
-        behavior.min_active_connections = 1;
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 5;
 
@@ -1605,7 +1556,6 @@ mod tests {
         let mut behavior = test_behavior();
         behavior.min_target_pool_size = 3;
         behavior.max_target_pool_size = 3;
-        behavior.min_active_connections = 2;
         behavior.min_initial_connections = 1;
         behavior.max_initial_connections = 1;
 
@@ -1642,7 +1592,6 @@ mod tests {
         let mut behavior = test_behavior();
         behavior.min_target_pool_size = 2;
         behavior.max_target_pool_size = 2;
-        behavior.min_active_connections = 1;
         behavior.min_initial_connections = 1;
         behavior.max_initial_connections = 1;
         behavior.idle_drain_secs = 5;
@@ -1673,7 +1622,6 @@ mod tests {
         let mut behavior = test_behavior();
         behavior.min_target_pool_size = 2;
         behavior.max_target_pool_size = 2;
-        behavior.min_active_connections = 2;
         behavior.soft_ttl_secs = 5;
         behavior.idle_drain_secs = 5;
 

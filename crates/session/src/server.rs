@@ -1,10 +1,9 @@
 use crate::frame::{Frame, CMD_SYNACK};
 use crate::session::{
-    subtract_buffered_stream_bytes, PendingAcceptFlushResult, PendingData, Session, SessionConfig,
-    StreamHandle, TrafficClass,
+    register_stream_locked, unregister_stream_locked, BufferedPayload, PendingAcceptFlushResult,
+    PendingData, Session, SessionConfig, StreamHandle, TrafficClass,
 };
 use kanotls_tunnel::SnowyStream;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::warn;
@@ -66,7 +65,12 @@ impl ServerSessionHandler {
             pending_notify: pending_notify.clone(),
         };
 
-        self.session.streams.write().await.insert(sid, handle);
+        register_stream_locked(
+            &mut *self.session.streams.write().await,
+            &self.session.capacity_stream_count,
+            sid,
+            handle,
+        );
         if self.session.release_pending_open_reservation(sid).await {
             self.session.release_inbound_stream_reservation();
         }
@@ -88,7 +92,6 @@ impl ServerSessionHandler {
                 ),
                 write_closed: false,
                 closed: matches!(flush_result, PendingAcceptFlushResult::ClosedLocally),
-                buffered_stream_bytes: self.session.buffered_stream_bytes.clone(),
                 pending_data: self.session.pending_data.clone(),
                 pending_notify,
             },
@@ -102,13 +105,12 @@ impl ServerSessionHandler {
 
 pub struct ServerStream {
     pub sid: u32,
-    data_rx: mpsc::Receiver<Vec<u8>>,
+    data_rx: mpsc::Receiver<BufferedPayload>,
     fin_rx: mpsc::Receiver<()>,
     session: Arc<Session>,
     read_closed: bool,
     write_closed: bool,
     closed: bool,
-    buffered_stream_bytes: Arc<AtomicUsize>,
     pending_data: Arc<Mutex<PendingData>>,
     pending_notify: Arc<Notify>,
 }
@@ -116,9 +118,8 @@ pub struct ServerStream {
 impl ServerStream {
     pub async fn read(&mut self) -> Option<Vec<u8>> {
         loop {
-            if let Ok(data) = self.data_rx.try_recv() {
-                subtract_buffered_stream_bytes(&self.buffered_stream_bytes, data.len());
-                return Some(data);
+            if let Ok(payload) = self.data_rx.try_recv() {
+                return Some(payload.into_vec());
             }
             if let Some(data) = self.try_drain_pending_data() {
                 return Some(data);
@@ -128,11 +129,8 @@ impl ServerStream {
             }
 
             tokio::select! {
-                data = self.data_rx.recv() => {
-                    if let Some(ref d) = data {
-                        subtract_buffered_stream_bytes(&self.buffered_stream_bytes, d.len());
-                    }
-                    return data;
+                payload = self.data_rx.recv() => {
+                    return payload.map(BufferedPayload::into_vec);
                 }
                 _ = self.pending_notify.notified() => {
                     continue;
@@ -150,21 +148,11 @@ impl ServerStream {
     fn try_drain_pending_data(&self) -> Option<Vec<u8>> {
         let mut pending = self.pending_data.try_lock().ok()?;
         let queue = pending.get_mut(self.sid)?;
-        let data = queue.pop_front()?;
-        subtract_buffered_stream_bytes(&self.buffered_stream_bytes, data.len());
+        let payload = queue.pop_front()?;
         if queue.is_empty() {
             pending.remove(self.sid);
         }
-        Some(data)
-    }
-
-    // data channel 中已入账但未读的字节随流关闭一并丢弃，按量扣减。
-    fn discard_unread_channel_bytes(&mut self) {
-        let mut drained = 0usize;
-        while let Ok(data) = self.data_rx.try_recv() {
-            drained += data.len();
-        }
-        subtract_buffered_stream_bytes(&self.buffered_stream_bytes, drained);
+        Some(payload.into_vec())
     }
 
     pub async fn write(&self, data: &[u8]) -> Result<(), anyhow::Error> {
@@ -195,7 +183,11 @@ impl ServerStream {
 
     pub async fn close(&mut self) -> Result<(), anyhow::Error> {
         if self.closed {
-            self.session.streams.write().await.remove(&self.sid);
+            unregister_stream_locked(
+                &mut *self.session.streams.write().await,
+                &self.session.capacity_stream_count,
+                self.sid,
+            );
             return Ok(());
         }
 
@@ -204,7 +196,6 @@ impl ServerStream {
         } else {
             self.close_write().await
         };
-        self.discard_unread_channel_bytes();
         self.session.finish_closing_stream(self.sid).await;
         self.closed = true;
         result
@@ -213,8 +204,6 @@ impl ServerStream {
 
 impl Drop for ServerStream {
     fn drop(&mut self) {
-        // data channel 中已入账但未读的字节随接收端销毁被丢弃，按量扣减。
-        self.discard_unread_channel_bytes();
         if self.closed {
             return;
         }
