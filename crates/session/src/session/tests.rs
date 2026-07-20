@@ -263,7 +263,7 @@ async fn cancelled_warm_open_stream_cleans_up_peer_orphan() {
     );
 
     tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(client.active_stream_count().await, 0);
+    assert_eq!(client.active_stream_count(), 0);
     assert_eq!(client.pending_data.lock().await.len(), 0);
     assert!(client.pending_fin.lock().await.is_empty());
 
@@ -523,7 +523,7 @@ async fn dropped_submitted_stream_clears_pending_client_buffers() {
 
     assert!(!client.pending_data.lock().await.contains(sid));
     assert!(!client.pending_fin.lock().await.contains(&sid));
-    assert_eq!(client.active_stream_count().await, 0);
+    assert_eq!(client.active_stream_count(), 0);
 
     client.force_close();
     server.session.force_close();
@@ -677,7 +677,7 @@ async fn late_data_and_fin_after_local_close_are_ignored_without_warnings() {
     })
     .await
     .expect("closing tombstone clears after peer fin");
-    assert_eq!(server.session.active_stream_count().await, 0);
+    assert_eq!(server.session.active_stream_count(), 0);
     assert!(server.session.closing_streams.lock().await.is_empty());
 
     client.force_close();
@@ -1221,7 +1221,11 @@ async fn cmd_padding_request_with_large_m_is_capped_at_16_replies() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (client_tunnel, server_tunnel) = snowy_stream_pair().await;
-    let client = Arc::new(Session::new(client_tunnel, test_session_config(true), None));
+    // 关闭稳态 H2 骨架：并行的 H2 测试会临时覆写全局 PING 间隔，
+    // 骨架关闭后本测试的 padding 计数不受跨测试干扰。
+    let mut config = test_session_config(true);
+    config.post_script_off = true;
+    let client = Arc::new(Session::new(client_tunnel, config, None));
     let client_read_loop = client.clone();
     tokio::spawn(async move {
         let _ = client_read_loop.run_read_loop().await;
@@ -1283,12 +1287,11 @@ async fn cmd_padding_request_with_large_m_is_capped_at_16_replies() {
     client.force_close();
 }
 
-// Auto 应答解耦回归：连续 Auto 写入只等入队，不等懒冲刷周期（5ms）。
-// 10 次写入的总耗时应远小于 10 个懒冲刷周期（50ms）。块大小取 8KB：
-// 总量 80KB 不触发 256KB 立即冲刷，debug 构建下整体加密耗时也低于一个
-// 懒冲刷周期，计时量的才是应答路径本身。
+// Auto 应答解耦回归：Auto 写入只等写循环入队，不等本批数据的 socket
+// 冲刷完成。取 64KB 块：低于 128KB bulk 阈值，脚本整形逐条小记录发出
+// （含采样延迟），整批耗时应答路径百毫秒级；而入队应答是亚毫秒级。
 #[tokio::test]
-async fn auto_writes_do_not_wait_for_lazy_flush() {
+async fn auto_write_returns_before_shaped_emission_completes() {
     let (client, server) = session_pair().await;
 
     let mut stream = client.open_stream().await.expect("stream opens");
@@ -1316,15 +1319,13 @@ async fn auto_writes_do_not_wait_for_lazy_flush() {
         while server_stream.read().await.is_some() {}
     });
 
-    let chunk = vec![0x5Au8; 8 * 1024];
+    let chunk = vec![0x5Au8; 64 * 1024];
     let started = std::time::Instant::now();
-    for _ in 0..10 {
-        stream.write(&chunk).await.expect("client writes chunk");
-    }
+    stream.write(&chunk).await.expect("client writes chunk");
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_millis(25),
-        "10 auto writes took {:?}; Auto acks must not wait for the 5ms lazy flush",
+        "auto write took {:?}; Auto acks must not wait for shaped emission",
         elapsed
     );
 
@@ -1454,7 +1455,15 @@ async fn pre_synack_overflow_data_and_fin_are_delivered_before_eof() {
     // 模拟 SYNACK 到达前积压的状态：数据量超过 channel 容量，末尾带 FIN。
     let frame_count = STREAM_CHANNEL_CAPACITY + 8;
     for idx in 0..frame_count {
-        assert!(client.store_pending_data(sid, vec![idx as u8; 64]).await);
+        assert!(client
+            .store_pending_data(
+                sid,
+                crate::session::BufferedPayload::new(
+                    vec![idx as u8; 64],
+                    &client.buffered_stream_bytes
+                )
+            )
+            .await);
     }
     client.store_pending_fin(sid).await;
 

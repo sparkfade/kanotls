@@ -84,9 +84,52 @@ impl SplitWriteHalf {
     }
 }
 
+/// 入账缓冲载荷：创建即计入 buffered_stream_bytes，被消费者取走
+/// （into_vec）或被丢弃（Drop）时恰好扣减一次，杜绝手工记账漏减。
+#[derive(Debug)]
+pub(crate) struct BufferedPayload {
+    data: Vec<u8>,
+    counter: Arc<AtomicUsize>,
+    accounted: bool,
+}
+
+impl BufferedPayload {
+    pub(crate) fn new(data: Vec<u8>, counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(data.len(), Ordering::Relaxed);
+        Self {
+            data,
+            counter: counter.clone(),
+            accounted: true,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// 数据离开缓冲交付应用层：按口径扣减后返回原始字节。
+    pub(crate) fn into_vec(mut self) -> Vec<u8> {
+        self.release();
+        std::mem::take(&mut self.data)
+    }
+
+    fn release(&mut self) {
+        if self.accounted {
+            self.accounted = false;
+            subtract_buffered_stream_bytes(&self.counter, self.data.len());
+        }
+    }
+}
+
+impl Drop for BufferedPayload {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct PendingData {
-    queues: HashMap<u32, VecDeque<Vec<u8>>>,
+    queues: HashMap<u32, VecDeque<BufferedPayload>>,
 }
 
 impl PendingData {
@@ -94,7 +137,7 @@ impl PendingData {
         self.queues.contains_key(&sid)
     }
 
-    pub fn remove(&mut self, sid: u32) -> Option<VecDeque<Vec<u8>>> {
+    pub fn remove(&mut self, sid: u32) -> Option<VecDeque<BufferedPayload>> {
         self.queues.remove(&sid)
     }
 
@@ -106,11 +149,11 @@ impl PendingData {
         self.queues.len()
     }
 
-    pub fn entry(&mut self, sid: u32) -> &mut VecDeque<Vec<u8>> {
+    pub fn entry(&mut self, sid: u32) -> &mut VecDeque<BufferedPayload> {
         self.queues.entry(sid).or_default()
     }
 
-    pub fn get_mut(&mut self, sid: u32) -> Option<&mut VecDeque<Vec<u8>>> {
+    pub fn get_mut(&mut self, sid: u32) -> Option<&mut VecDeque<BufferedPayload>> {
         self.queues.get_mut(&sid)
     }
 
@@ -118,7 +161,7 @@ impl PendingData {
         self.queues
             .values()
             .flat_map(|q| q.iter())
-            .map(Vec::len)
+            .map(BufferedPayload::len)
             .sum()
     }
 }
@@ -132,11 +175,6 @@ const STREAM_CHANNEL_CAPACITY: usize = 32;
 const MAX_SESSION_REASSEMBLY_BYTES: usize = 1024 * 1024;
 const WRITE_CHANNEL_CAPACITY: usize = 64;
 const MAX_STREAM_OVERFLOW_BYTES: usize = 2 * 1024 * 1024;
-
-const LAZY_FLUSH_MS: u64 = 5;
-/// 懒冲刷定时器的“禁用”姿态：重置到遥远未来，等价于关闭，
-/// 避免 pending 为空期间残留过期 deadline。
-const LAZY_FLUSH_DISABLED: Duration = Duration::from_secs(3600);
 
 /// 稳态 H2 行为骨架（post-script steady state）：真实 HTTP/2 接收端按消费
 /// 字节数回发 WINDOW_UPDATE，并偶发 PING/PING-ACK 对。内容加密不可见，
@@ -152,6 +190,10 @@ const H2_PING_MAX_INTERVAL_SECS: u64 = 150;
 pub(crate) static H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES: AtomicUsize =
     AtomicUsize::new(0);
 pub(crate) static H2_PING_INTERVAL_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// H2 骨架关闭时的定时器“禁用”姿态：分支被 select guard 屏蔽，deadline
+/// 只需足够遥远。
+const H2_TIMER_DISABLED: Duration = Duration::from_secs(3600);
 
 /// `prepare_control_record` 的最小 wire 开销：block 长度前缀 + TLS record
 /// 头 + AEAD tag + inner content type。junk_len 按此反解，使整条控制记录
@@ -199,6 +241,7 @@ pub struct Session {
     read_half: Mutex<Option<SplitReadHalf>>,
     pub(crate) writer: SharedTunnelWriter,
     pub(crate) streams: Arc<RwLock<HashMap<u32, StreamHandle>>>,
+    pub(crate) capacity_stream_count: Arc<AtomicUsize>,
     pub(crate) next_stream_id: AtomicU32,
     pub(crate) is_client: bool,
     pub(crate) max_streams_per_session: usize,
@@ -220,14 +263,14 @@ pub struct Session {
 
 #[derive(Debug, Default)]
 struct PendingOpenStream {
-    buffered_data: Vec<Vec<u8>>,
+    buffered_data: Vec<BufferedPayload>,
     buffered_fin: bool,
     reservation_released: bool,
 }
 
 #[derive(Debug)]
 pub(crate) struct StreamHandle {
-    pub data_tx: mpsc::Sender<Vec<u8>>,
+    pub data_tx: mpsc::Sender<BufferedPayload>,
     pub fin_tx: mpsc::Sender<()>,
     pub synack_tx: Option<oneshot::Sender<Vec<u8>>>,
     pub read_closed: bool,
@@ -235,7 +278,7 @@ pub(crate) struct StreamHandle {
 }
 
 enum PshDispatch {
-    Deliver(mpsc::Sender<Vec<u8>>, Arc<Notify>),
+    Deliver(mpsc::Sender<BufferedPayload>, Arc<Notify>),
     SynackPending,
     Closing,
     NotFound,
@@ -251,10 +294,10 @@ pub(crate) enum PendingAcceptFlushResult {
 struct PendingStreamHandleGuard {
     stream_id: u32,
     streams: Arc<RwLock<HashMap<u32, StreamHandle>>>,
+    capacity_stream_count: Arc<AtomicUsize>,
     pending_data: Arc<Mutex<PendingData>>,
     pending_fin: Arc<Mutex<HashSet<u32>>>,
     closing_streams: Arc<Mutex<HashSet<u32>>>,
-    buffered_stream_bytes: Arc<AtomicUsize>,
     cleanup: Option<SubmittedOpenCleanup>,
     armed: bool,
 }
@@ -360,18 +403,24 @@ impl Session {
             config.post_script_off,
             pending_client_settings.clone(),
         ));
+        // 空闲拆除仅服务端生效（见 run_read_loop）：客户端无需抖动采样。
         let idle_timeout_with_jitter_secs = {
             let base = config.idle_timeout_secs.max(1);
-            let jitter_max = (base / 10).max(1);
-            use rand::Rng;
-            let mut rng = rand::thread_rng();
-            base + rng.gen_range(0..=jitter_max)
+            if config.is_client {
+                base
+            } else {
+                let jitter_max = (base / 10).max(1);
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+                base + rng.gen_range(0..=jitter_max)
+            }
         };
 
         Self {
             read_half: Mutex::new(Some(read_half)),
             writer: writer.clone(),
             streams: Arc::new(RwLock::new(HashMap::new())),
+            capacity_stream_count: Arc::new(AtomicUsize::new(0)),
             next_stream_id: AtomicU32::new(if config.is_client { 1 } else { 0 }),
             is_client: config.is_client,
             max_streams_per_session: config.max_streams_per_session,
@@ -431,21 +480,20 @@ impl Session {
         self.idle_timeout_with_jitter_secs
     }
 
-    pub fn buffered_stream_bytes(&self) -> usize {
-        self.buffered_stream_bytes.load(Ordering::Relaxed)
+    pub fn buffered_stream_bytes(&self) -> usize {        self.buffered_stream_bytes.load(Ordering::Relaxed)
     }
 
-    pub(crate) async fn active_stream_count(&self) -> usize {
-        let mut streams = self.streams.write().await;
-        Self::prune_orphaned_streams_locked(&mut streams);
-        streams.len()
+    /// 池选择/补涓热路径使用的无锁计数：与 streams 映射中 read_closed=false
+    /// 的条目数保持一致（注册 +1，read_closed 置位或移除 -1）。
+    pub fn active_stream_count(&self) -> usize {
+        self.capacity_stream_count.load(Ordering::Relaxed)
     }
 
     async fn is_idle_timeout_eligible(&self) -> bool {
         {
             let mut streams = self.streams.write().await;
-            Self::prune_orphaned_streams_locked(&mut streams);
-            if count_capacity_streams_locked(&streams) > 0 {
+            Self::prune_orphaned_streams_locked(&mut streams, &self.capacity_stream_count);
+            if self.active_stream_count() > 0 {
                 return false;
             }
         }
@@ -458,13 +506,17 @@ impl Session {
     }
 
     pub(crate) async fn clear_pending_client_stream_state(&self, sid: u32) {
-        let removed = self.pending_data.lock().await.remove(sid);
-        subtract_pending_data_bytes(removed, &self.buffered_stream_bytes);
+        // 移除的入账载荷随队列丢弃自动回账。
+        self.pending_data.lock().await.remove(sid);
         self.pending_fin.lock().await.remove(&sid);
     }
 
     pub(crate) async fn remove_stream_state(&self, sid: u32) {
-        self.streams.write().await.remove(&sid);
+        unregister_stream_locked(
+            &mut *self.streams.write().await,
+            &self.capacity_stream_count,
+            sid,
+        );
         self.clear_pending_client_stream_state(sid).await;
     }
 
@@ -515,10 +567,10 @@ impl Session {
         let mut handle_guard = PendingStreamHandleGuard {
             stream_id: sid,
             streams: self.streams.clone(),
+            capacity_stream_count: self.capacity_stream_count.clone(),
             pending_data: self.pending_data.clone(),
             pending_fin: self.pending_fin.clone(),
             closing_streams: self.closing_streams.clone(),
-            buffered_stream_bytes: self.buffered_stream_bytes.clone(),
             cleanup: None,
             armed: true,
         };
@@ -526,11 +578,16 @@ impl Session {
 
         {
             let mut streams = self.streams.write().await;
-            Self::prune_orphaned_streams_locked(&mut streams);
-            if count_capacity_streams_locked(&streams) >= self.max_streams_per_session {
+            Self::prune_orphaned_streams_locked(&mut streams, &self.capacity_stream_count);
+            if self.active_stream_count() >= self.max_streams_per_session {
                 anyhow::bail!("max streams per session reached");
             }
-            streams.insert(sid, handle);
+            register_stream_locked(
+                &mut streams,
+                &self.capacity_stream_count,
+                sid,
+                handle,
+            );
         }
 
         if !has_deferred_open {
@@ -542,7 +599,11 @@ impl Session {
             {
                 Ok(pending_write) => pending_write,
                 Err(e) => {
-                    self.streams.write().await.remove(&sid);
+                    unregister_stream_locked(
+                        &mut *self.streams.write().await,
+                        &self.capacity_stream_count,
+                        sid,
+                    );
                     self.clear_pending_client_stream_state(sid).await;
                     self.writer.close();
                     return Err(e);
@@ -565,6 +626,7 @@ impl Session {
             },
             writer: self.writer.clone(),
             streams: self.streams.clone(),
+            capacity_stream_count: self.capacity_stream_count.clone(),
             pending_data: self.pending_data.clone(),
             pending_fin: self.pending_fin.clone(),
             closing_streams: self.closing_streams.clone(),
@@ -577,7 +639,6 @@ impl Session {
                     early_data_submitted: false,
                 }
             },
-            buffered_stream_bytes: self.buffered_stream_bytes.clone(),
         }))
     }
 
@@ -648,15 +709,24 @@ impl Session {
 
         let mut settings_received = self.is_client;
 
+        // 空闲拆除仅服务端生效：池化客户端的空闲连接由连接池的 idle drain
+        // 统一管理（drain 后 force_close 本 session），session 层不再重复
+        // 维护一套永远更晚触发的空闲定时器。
+        let idle_teardown_enabled = !self.is_client;
         let idle_duration = Duration::from_secs(self.idle_timeout_with_jitter_secs);
         let idle_timeout = tokio::time::sleep(idle_duration);
         tokio::pin!(idle_timeout);
 
-        // 稳态 H2 骨架状态：post_script_off 时整体关闭。
+        // 稳态 H2 骨架状态：post_script_off 时整体关闭（定时器取禁用姿态，
+        // 分支被 guard 屏蔽）。
         let h2_skeleton_enabled = !self.post_script_off;
         let mut bytes_since_window_update = 0usize;
         let mut window_update_threshold = sample_h2_window_update_threshold();
-        let h2_ping_timer = tokio::time::sleep(sample_h2_ping_interval());
+        let h2_ping_timer = tokio::time::sleep(if h2_skeleton_enabled {
+            sample_h2_ping_interval()
+        } else {
+            H2_TIMER_DISABLED
+        });
         tokio::pin!(h2_ping_timer);
 
         loop {
@@ -670,7 +740,7 @@ impl Session {
                     debug!("session close requested during read loop");
                     break;
                 }
-                _ = &mut idle_timeout => {
+                _ = &mut idle_timeout, if idle_teardown_enabled => {
                     if self.is_idle_timeout_eligible().await {
                         debug!("session idle for {}s, tearing down", self.idle_timeout_with_jitter_secs);
                         break;
@@ -772,6 +842,7 @@ impl Session {
 
         self.force_close();
         self.streams.write().await.clear();
+        self.capacity_stream_count.store(0, Ordering::Relaxed);
         self.pending_open_streams.lock().await.clear();
         self.pending_data.lock().await.clear();
         self.pending_fin.lock().await.clear();
@@ -803,7 +874,6 @@ impl Session {
                 {
                     return Ok(());
                 }
-                let payload_len = frame.payload.len();
                 let dispatch = {
                     self.streams
                         .read()
@@ -825,8 +895,11 @@ impl Session {
                 };
                 match dispatch {
                     PshDispatch::SynackPending => {
-                        self.store_pending_data(frame.stream_id, frame.payload)
-                            .await;
+                        self.store_pending_data(
+                            frame.stream_id,
+                            BufferedPayload::new(frame.payload, &self.buffered_stream_bytes),
+                        )
+                        .await;
                     }
                     PshDispatch::Closing => {
                         trace!(
@@ -846,12 +919,11 @@ impl Session {
                             .map(|guard| guard.contains(frame.stream_id))
                             .unwrap_or(true);
 
+                        let payload =
+                            BufferedPayload::new(frame.payload, &self.buffered_stream_bytes);
                         if !has_pending {
-                            match data_tx.try_send(frame.payload) {
-                                Ok(()) => {
-                                    self.buffered_stream_bytes
-                                        .fetch_add(payload_len, Ordering::Relaxed);
-                                }
+                            match data_tx.try_send(payload) {
+                                Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(payload)) => {
                                     if self.store_pending_data(frame.stream_id, payload).await {
                                         notify.notify_one();
@@ -871,10 +943,7 @@ impl Session {
                                 }
                             }
                         } else {
-                            if self
-                                .store_pending_data(frame.stream_id, frame.payload)
-                                .await
-                            {
+                            if self.store_pending_data(frame.stream_id, payload).await {
                                 notify.notify_one();
                             } else {
                                 warn!(
@@ -979,7 +1048,10 @@ impl Session {
                         .await
                         .get_mut(&frame.stream_id)
                         .map(|handle| {
-                            handle.read_closed = true;
+                            mark_stream_read_closed_locked(
+                                handle,
+                                &self.capacity_stream_count,
+                            );
                             handle.fin_tx.clone()
                         })
                 };
@@ -1063,7 +1135,9 @@ impl Session {
         Ok(())
     }
 
-    async fn store_pending_data(&self, sid: u32, payload: Vec<u8>) -> bool {
+    /// payload 入账发生在 BufferedPayload::new；此处只做限量检查与入队，
+    /// 拒绝时 payload 随作用域丢弃自动回账。
+    async fn store_pending_data(&self, sid: u32, payload: BufferedPayload) -> bool {
         let mut pending = self.pending_data.lock().await;
         let total_bytes: usize = pending.total_bytes();
         if total_bytes.saturating_add(payload.len()) > MAX_PENDING_STREAM_BYTES {
@@ -1080,7 +1154,7 @@ impl Session {
         }
 
         let queue = pending.entry(sid);
-        let stream_bytes: usize = queue.iter().map(Vec::len).sum();
+        let stream_bytes: usize = queue.iter().map(BufferedPayload::len).sum();
         if stream_bytes.saturating_add(payload.len()) > MAX_STREAM_OVERFLOW_BYTES {
             warn!(
                 stream_id = sid,
@@ -1095,12 +1169,7 @@ impl Session {
             );
             return false;
         }
-        // 与投递进 data channel 的路径同口径：入队 pending 即计入缓冲总量，
-        // 后续由消费者或清理路径扣减，保证每字节恰好加一次减一次。
-        let payload_len = payload.len();
         queue.push_back(payload);
-        self.buffered_stream_bytes
-            .fetch_add(payload_len, Ordering::Relaxed);
         true
     }
 
@@ -1121,7 +1190,7 @@ impl Session {
         let total_bytes: usize = pending
             .values()
             .flat_map(|stream| stream.buffered_data.iter())
-            .map(Vec::len)
+            .map(BufferedPayload::len)
             .sum();
         let Some(stream) = pending.get_mut(&sid) else {
             return false;
@@ -1143,12 +1212,12 @@ impl Session {
             return true;
         }
 
-        // 与 store_pending_data 同口径：pre-accept 缓冲也计入总量，
-        // flush_pending_accept_stream 投递时只是转移，不再重复累加。
-        let payload_len = payload.len();
-        stream.buffered_data.push(payload);
-        self.buffered_stream_bytes
-            .fetch_add(payload_len, Ordering::Relaxed);
+        // pre-accept 缓冲同样由 BufferedPayload 入账；
+        // flush_pending_accept_stream 投递时只是转移所有权。
+        stream.buffered_data.push(BufferedPayload::new(
+            payload,
+            &self.buffered_stream_bytes,
+        ));
         true
     }
 
@@ -1179,8 +1248,7 @@ impl Session {
     }
 
     async fn try_reserve_inbound_stream(&self) -> bool {
-        let streams = self.streams.read().await;
-        let active = count_capacity_streams_locked(&streams);
+        let active = self.active_stream_count();
         loop {
             let pending = self.pending_inbound_streams.load(Ordering::Relaxed);
             if active.saturating_add(pending) >= self.max_streams_per_session {
@@ -1227,7 +1295,7 @@ impl Session {
     pub(crate) async fn flush_pending_accept_stream(
         &self,
         sid: u32,
-        data_tx: mpsc::Sender<Vec<u8>>,
+        data_tx: mpsc::Sender<BufferedPayload>,
         fin_tx: mpsc::Sender<()>,
     ) -> PendingAcceptFlushResult {
         let mut delivered_data = false;
@@ -1248,18 +1316,15 @@ impl Session {
             };
 
             // buffered_data 在 store_pending_open_data 时已入账，投递进
-            // data channel 只是转移所有权，不再重复累加。
+            // data channel 只是转移所有权；投递失败被丢弃时由 Drop 自动回账。
             let mut payloads = pending_data.into_iter();
             while let Some(payload) = payloads.next() {
-                if let Err(err) = data_tx.try_send(payload) {
+                if data_tx.try_send(payload).is_err() {
                     warn!(
                         stream_id = sid,
                         "closing stream: receiver queue full while flushing pending accept data"
                     );
-                    // 未投递的字节随流关闭被丢弃，扣减对应的已入账总量。
-                    let dropped =
-                        err.into_inner().len() + payloads.map(|p| p.len()).sum::<usize>();
-                    subtract_buffered_stream_bytes(&self.buffered_stream_bytes, dropped);
+                    drop(payloads);
                     let _ = self.close_stream(sid).await;
                     self.pending_open_streams.lock().await.remove(&sid);
                     return PendingAcceptFlushResult::ClosedLocally;
@@ -1271,12 +1336,16 @@ impl Session {
                 let _ = fin_tx.try_send(());
                 if delivered_data {
                     if let Some(handle) = self.streams.write().await.get_mut(&sid) {
-                        handle.read_closed = true;
+                        mark_stream_read_closed_locked(handle, &self.capacity_stream_count);
                     }
                     self.pending_open_streams.lock().await.remove(&sid);
                     return PendingAcceptFlushResult::PeerHalfClosed;
                 }
-                self.streams.write().await.remove(&sid);
+                unregister_stream_locked(
+                    &mut *self.streams.write().await,
+                    &self.capacity_stream_count,
+                    sid,
+                );
                 self.pending_open_streams.lock().await.remove(&sid);
                 return PendingAcceptFlushResult::PeerClosed;
             }
@@ -1304,10 +1373,10 @@ impl Session {
         };
 
         let mut all_delivered = true;
-        let mut remaining: Vec<Vec<u8>> = Vec::new();
+        let mut remaining: Vec<BufferedPayload> = Vec::new();
 
-        // pending_data 在入队时已入账，投递进 data channel 只是转移，
-        // 不再重复累加；只有投递失败被丢弃时才需要扣减。
+        // pending_data 在入队时已入账，投递进 data channel 只是转移；
+        // 投递失败被丢弃的条目由 Drop 自动回账。
         while let Some(payload) = pending_data.pop_front() {
             if all_delivered {
                 match data_tx.try_send(payload) {
@@ -1321,10 +1390,9 @@ impl Session {
                             stream_id = sid,
                             "closing stream: receiver closed while flushing pre-SYNACK data"
                         );
-                        let dropped = payload.len()
-                            + remaining.iter().map(Vec::len).sum::<usize>()
-                            + pending_data.iter().map(Vec::len).sum::<usize>();
-                        subtract_buffered_stream_bytes(&self.buffered_stream_bytes, dropped);
+                        drop(payload);
+                        drop(remaining);
+                        drop(pending_data);
                         let _ = self.close_stream(sid).await;
                         return;
                     }
@@ -1347,7 +1415,11 @@ impl Session {
         if pending_fin {
             if all_delivered {
                 let _ = fin_tx.try_send(());
-                self.streams.write().await.remove(&sid);
+                unregister_stream_locked(
+                    &mut *self.streams.write().await,
+                    &self.capacity_stream_count,
+                    sid,
+                );
                 self.clear_closing_stream(sid).await;
             } else {
                 // 数据未全部投递时 FIN 不能丢：重新挂回 pending_fin，由消费者
@@ -1488,11 +1560,6 @@ impl SessionWriter {
         let mut responders: Vec<oneshot::Sender<Result<(), String>>> = Vec::new();
         let mut shaper = TrafficShaper::new(direction, traffic_script.as_deref(), post_script_off);
 
-        // 懒冲刷定时器固定化：循环外创建，仅在 pending 由空转非空时复位到
-        // now + LAZY_FLUSH_MS；drive_shaper 排空后复位到遥远未来（等价禁用）。
-        let lazy_flush = tokio::time::sleep(LAZY_FLUSH_DISABLED);
-        tokio::pin!(lazy_flush);
-
         loop {
             if close_requested.load(Ordering::Relaxed) {
                 break;
@@ -1538,7 +1605,6 @@ impl SessionWriter {
                             &mut shaper,
                             &mut write_half,
                             &mut responders,
-                            &mut lazy_flush,
                             direction,
                         )
                         .await
@@ -1595,45 +1661,25 @@ impl SessionWriter {
                         break;
                     }
 
-                    let was_empty = pending.is_empty();
-                    let flush = request.flush;
+                    // 合批只在同一事件循环回合内发生：收首包后排空队列中
+                    // 已到达的写请求，随即整批交给 shaper 冲刷。相比旧的
+                    // 5ms 懒冲刷定时器，小帧不再承担固定延迟；高负载下写
+                    // 请求在 drive_shaper await 期间自然积压，合批效果不变。
                     Self::queue_bulk_request(&mut pending, &mut responders, request);
-
-                    if was_empty && !pending.is_empty() {
-                        lazy_flush.as_mut().reset(
-                            tokio::time::Instant::now() + Duration::from_millis(LAZY_FLUSH_MS),
-                        );
+                    while let Ok(request) = bulk_rx.try_recv() {
+                        Self::queue_bulk_request(&mut pending, &mut responders, request);
                     }
 
-                    if flush == FlushBehavior::Immediate
-                        || pending.len() >= crate::MAX_PENDING_FLUSH_SIZE
-                    {
-                        if Self::drain_pending_and_respond(
+                    if !pending.is_empty()
+                        && Self::drain_pending_and_respond(
                             &mut pending,
                             &mut shaper,
                             &mut write_half,
                             &mut responders,
-                            &mut lazy_flush,
                             direction,
                         )
                         .await
                         .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-                _ = &mut lazy_flush, if !pending.is_empty() => {
-                    if Self::drain_pending_and_respond(
-                        &mut pending,
-                        &mut shaper,
-                        &mut write_half,
-                        &mut responders,
-                        &mut lazy_flush,
-                        direction,
-                    )
-                    .await
-                    .is_err()
                     {
                         break;
                     }
@@ -1650,16 +1696,14 @@ impl SessionWriter {
         let _ = write_half.shutdown().await;
     }
 
-    /// 三个写循环分支共用的“排空 + 收尾”序列：drive_shaper 排空 pending，
-    /// 发出 fake 帧，应答全部 Immediate 等待者，并把懒冲刷定时器复位到
-    /// 禁用姿态。失败时已入队的 responder 以同一错误应答，错误消息返回给
-    /// 调用方做分支专属处理。
+    /// 两个写循环分支共用的“排空 + 收尾”序列：drive_shaper 排空 pending，
+    /// 发出 fake 帧，并应答全部 Immediate 等待者。失败时已入队的
+    /// responder 以同一错误应答，错误消息返回给调用方做分支专属处理。
     async fn drain_pending_and_respond(
         pending: &mut Vec<u8>,
         shaper: &mut TrafficShaper,
         write_half: &mut SplitWriteHalf,
         responders: &mut Vec<oneshot::Sender<Result<(), String>>>,
-        lazy_flush: &mut Pin<&mut tokio::time::Sleep>,
         direction: FlowDirection,
     ) -> Result<(), String> {
         match Self::drive_shaper(pending, shaper, write_half).await {
@@ -1668,9 +1712,6 @@ impl SessionWriter {
                 for responder in responders.drain(..) {
                     let _ = responder.send(Ok(()));
                 }
-                lazy_flush
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + LAZY_FLUSH_DISABLED);
                 Ok(())
             }
             Err(e) => {
@@ -1848,15 +1889,14 @@ impl Drop for PendingStreamHandleGuard {
             .streams
             .try_write()
             .map(|mut guard| {
-                guard.remove(&stream_id);
+                unregister_stream_locked(&mut guard, &self.capacity_stream_count, stream_id);
             })
             .is_ok();
         let pending_data_done = self
             .pending_data
             .try_lock()
             .map(|mut pending| {
-                let removed = pending.remove(stream_id);
-                subtract_pending_data_bytes(removed, &self.buffered_stream_bytes);
+                pending.remove(stream_id);
             })
             .is_ok();
         let pending_fin_done = self
@@ -1877,14 +1917,17 @@ impl Drop for PendingStreamHandleGuard {
             return;
         }
         let streams = self.streams.clone();
+        let capacity_stream_count = self.capacity_stream_count.clone();
         let pending_data = self.pending_data.clone();
         let pending_fin = self.pending_fin.clone();
-        let buffered_stream_bytes = self.buffered_stream_bytes.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                streams.write().await.remove(&stream_id);
-                let removed = pending_data.lock().await.remove(stream_id);
-                subtract_pending_data_bytes(removed, &buffered_stream_bytes);
+                unregister_stream_locked(
+                    &mut *streams.write().await,
+                    &capacity_stream_count,
+                    stream_id,
+                );
+                pending_data.lock().await.remove(stream_id);
                 pending_fin.lock().await.remove(&stream_id);
             });
         }
@@ -1892,8 +1935,18 @@ impl Drop for PendingStreamHandleGuard {
 }
 
 impl Session {
-    fn prune_orphaned_streams_locked(streams: &mut HashMap<u32, StreamHandle>) {
-        streams.retain(|_, handle| !stream_handle_is_orphaned(handle));
+    fn prune_orphaned_streams_locked(
+        streams: &mut HashMap<u32, StreamHandle>,
+        capacity_stream_count: &AtomicUsize,
+    ) {
+        streams.retain(|_, handle| {
+            let orphaned = stream_handle_is_orphaned(handle);
+            if orphaned {
+                // orphan 必然是 read_closed=false（见判定函数），入账一次。
+                capacity_stream_count.fetch_sub(1, Ordering::Relaxed);
+            }
+            !orphaned
+        });
     }
 }
 
@@ -1910,11 +1963,40 @@ fn stream_handle_is_orphaned(handle: &StreamHandle) -> bool {
             .unwrap_or(true)
 }
 
-fn count_capacity_streams_locked(streams: &HashMap<u32, StreamHandle>) -> usize {
-    streams
-        .values()
-        .filter(|handle| !handle.read_closed)
-        .count()
+/// 向 streams 映射注册新流：映射与 capacity_stream_count 保持同增同减。
+pub(crate) fn register_stream_locked(
+    streams: &mut HashMap<u32, StreamHandle>,
+    capacity_stream_count: &AtomicUsize,
+    sid: u32,
+    handle: StreamHandle,
+) {
+    streams.insert(sid, handle);
+    capacity_stream_count.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 从 streams 映射移除流：仅当条目仍计入容量（read_closed=false）时扣减，
+/// 与 read_closed 置位处的扣减互斥，保证每条流恰好扣一次。
+pub(crate) fn unregister_stream_locked(
+    streams: &mut HashMap<u32, StreamHandle>,
+    capacity_stream_count: &AtomicUsize,
+    sid: u32,
+) {
+    if let Some(handle) = streams.remove(&sid) {
+        if !handle.read_closed {
+            capacity_stream_count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// 置位 read_closed 并按口径扣减容量计数（幂等：已置位时不再重复扣）。
+pub(crate) fn mark_stream_read_closed_locked(
+    handle: &mut StreamHandle,
+    capacity_stream_count: &AtomicUsize,
+) {
+    if !handle.read_closed {
+        handle.read_closed = true;
+        capacity_stream_count.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 pub(crate) fn remember_closing_stream_sync(
@@ -1953,17 +2035,6 @@ pub(crate) fn subtract_buffered_stream_bytes(counter: &AtomicUsize, bytes: usize
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_sub(bytes))
     });
-}
-
-/// 从 pending_data 移除整段队列时，扣减其中仍挂在账上的字节数。
-pub(crate) fn subtract_pending_data_bytes(
-    queue: Option<VecDeque<Vec<u8>>>,
-    counter: &AtomicUsize,
-) {
-    if let Some(queue) = queue {
-        let bytes: usize = queue.iter().map(Vec::len).sum();
-        subtract_buffered_stream_bytes(counter, bytes);
-    }
 }
 
 #[cfg(test)]

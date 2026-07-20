@@ -1,7 +1,8 @@
 use crate::frame::{coalesce_encoded_frames, encode_psh_frames, Frame, MAX_PAYLOAD_LEN};
 use crate::session::{
-    remember_closing_stream_sync, subtract_buffered_stream_bytes, subtract_pending_data_bytes,
-    FlushBehavior, PendingData, PendingWrite, SharedTunnelWriter, StreamHandle, TrafficClass,
+    mark_stream_read_closed_locked, remember_closing_stream_sync, unregister_stream_locked,
+    BufferedPayload, FlushBehavior, PendingData, PendingWrite, SharedTunnelWriter, StreamHandle,
+    TrafficClass,
 };
 use anyhow::Error;
 use std::collections::HashMap;
@@ -23,7 +24,7 @@ pub(crate) enum StreamOpenState {
 }
 
 pub(crate) struct StreamParts {
-    pub data_rx: mpsc::Receiver<Vec<u8>>,
+    pub data_rx: mpsc::Receiver<BufferedPayload>,
     pub fin_rx: mpsc::Receiver<()>,
     pub synack_rx: oneshot::Receiver<Vec<u8>>,
 }
@@ -33,22 +34,23 @@ pub(crate) struct StreamInit {
     pub parts: StreamParts,
     pub writer: SharedTunnelWriter,
     pub streams: Arc<RwLock<HashMap<u32, StreamHandle>>>,
+    pub capacity_stream_count: Arc<AtomicUsize>,
     pub pending_data: Arc<Mutex<PendingData>>,
     pub pending_fin: Arc<Mutex<std::collections::HashSet<u32>>>,
     pub closing_streams: Arc<Mutex<std::collections::HashSet<u32>>>,
     pub pending_notify: Arc<Notify>,
     pub open_state: StreamOpenState,
-    pub buffered_stream_bytes: Arc<AtomicUsize>,
 }
 
 pub struct Stream {
     pub stream_id: u32,
-    data_rx: mpsc::Receiver<Vec<u8>>,
+    data_rx: mpsc::Receiver<BufferedPayload>,
     fin_rx: mpsc::Receiver<()>,
     synack_rx: Option<oneshot::Receiver<Vec<u8>>>,
 
     writer: SharedTunnelWriter,
     streams: Arc<RwLock<HashMap<u32, StreamHandle>>>,
+    capacity_stream_count: Arc<AtomicUsize>,
     pending_data: Arc<Mutex<PendingData>>,
     pending_fin: Arc<Mutex<std::collections::HashSet<u32>>>,
     closing_streams: Arc<Mutex<std::collections::HashSet<u32>>>,
@@ -59,7 +61,6 @@ pub struct Stream {
     write_closed: bool,
     closed: bool,
     open_failed: Option<String>,
-    buffered_stream_bytes: Arc<AtomicUsize>,
 }
 
 impl Stream {
@@ -71,6 +72,7 @@ impl Stream {
             synack_rx: Some(init.parts.synack_rx),
             writer: init.writer,
             streams: init.streams,
+            capacity_stream_count: init.capacity_stream_count,
             pending_data: init.pending_data,
             pending_fin: init.pending_fin,
             closing_streams: init.closing_streams,
@@ -81,15 +83,13 @@ impl Stream {
             write_closed: false,
             closed: false,
             open_failed: None,
-            buffered_stream_bytes: init.buffered_stream_bytes,
         }
     }
 
     pub async fn read(&mut self) -> Option<Vec<u8>> {
         loop {
-            if let Ok(data) = self.data_rx.try_recv() {
-                subtract_buffered_stream_bytes(&self.buffered_stream_bytes, data.len());
-                return Some(data);
+            if let Ok(payload) = self.data_rx.try_recv() {
+                return Some(payload.into_vec());
             }
             if let Some(data) = self.try_drain_pending_data() {
                 return Some(data);
@@ -99,11 +99,8 @@ impl Stream {
             }
 
             tokio::select! {
-                data = self.data_rx.recv() => {
-                    if let Some(ref d) = data {
-                        subtract_buffered_stream_bytes(&self.buffered_stream_bytes, d.len());
-                    }
-                    return data;
+                payload = self.data_rx.recv() => {
+                    return payload.map(BufferedPayload::into_vec);
                 }
                 _ = self.pending_notify.notified() => {
                     continue;
@@ -349,9 +346,8 @@ impl Stream {
             self.deferred_target = None;
             self.write_closed = true;
             self.closed = true;
-            self.streams.write().await.remove(&self.stream_id);
+            self.unregister_stream().await;
             self.clear_pending_client_state().await;
-            self.discard_unread_channel_bytes();
             return Ok(());
         }
 
@@ -369,7 +365,7 @@ impl Stream {
 
     pub async fn close(&mut self) -> Result<(), anyhow::Error> {
         if self.closed {
-            self.streams.write().await.remove(&self.stream_id);
+            self.unregister_stream().await;
             self.clear_pending_client_state().await;
             return Ok(());
         }
@@ -380,9 +376,8 @@ impl Stream {
             self.close_write().await
         };
         remember_closing_stream_sync(self.stream_id, &self.closing_streams);
-        self.streams.write().await.remove(&self.stream_id);
+        self.unregister_stream().await;
         self.clear_pending_client_state().await;
-        self.discard_unread_channel_bytes();
         self.closed = true;
         result
     }
@@ -390,9 +385,6 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        // data channel 中已入账但未读的字节随接收端销毁被丢弃，按量扣减。
-        self.discard_unread_channel_bytes();
-
         if self.closed {
             return;
         }
@@ -400,23 +392,25 @@ impl Drop for Stream {
         if self.has_deferred_open() || self.open_failed.is_some() {
             let stream_id = self.stream_id;
             let streams = self.streams.clone();
+            let capacity_stream_count = self.capacity_stream_count.clone();
             let pending_data = self.pending_data.clone();
             let pending_fin = self.pending_fin.clone();
-            let buffered_stream_bytes = self.buffered_stream_bytes.clone();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    streams.write().await.remove(&stream_id);
-                    let removed = pending_data.lock().await.remove(stream_id);
-                    subtract_pending_data_bytes(removed, &buffered_stream_bytes);
+                    unregister_stream_locked(
+                        &mut *streams.write().await,
+                        &capacity_stream_count,
+                        stream_id,
+                    );
+                    pending_data.lock().await.remove(stream_id);
                     pending_fin.lock().await.remove(&stream_id);
                 });
             } else {
                 if let Ok(mut streams) = self.streams.try_write() {
-                    streams.remove(&stream_id);
+                    unregister_stream_locked(&mut streams, &self.capacity_stream_count, stream_id);
                 }
                 if let Ok(mut pending_data) = self.pending_data.try_lock() {
-                    let removed = pending_data.remove(stream_id);
-                    subtract_pending_data_bytes(removed, &self.buffered_stream_bytes);
+                    pending_data.remove(stream_id);
                 }
                 if let Ok(mut pending_fin) = self.pending_fin.try_lock() {
                     pending_fin.remove(&stream_id);
@@ -427,6 +421,7 @@ impl Drop for Stream {
 
         let stream_id = self.stream_id;
         let streams = self.streams.clone();
+        let capacity_stream_count = self.capacity_stream_count.clone();
         let pending_data = self.pending_data.clone();
         let pending_fin = self.pending_fin.clone();
         let closing_streams = self.closing_streams.clone();
@@ -440,17 +435,15 @@ impl Drop for Stream {
             && try_send_fin_frame(stream_id, &writer).is_ok();
         if let Ok(mut streams) = self.streams.try_write() {
             if let Some(handle) = streams.get_mut(&stream_id) {
-                handle.read_closed = true;
+                mark_stream_read_closed_locked(handle, &self.capacity_stream_count);
             }
         }
         if let Ok(mut pending_data) = self.pending_data.try_lock() {
-            let removed = pending_data.remove(stream_id);
-            subtract_pending_data_bytes(removed, &self.buffered_stream_bytes);
+            pending_data.remove(stream_id);
         }
         if let Ok(mut pending_fin) = self.pending_fin.try_lock() {
             pending_fin.remove(&stream_id);
         }
-        let buffered_stream_bytes = self.buffered_stream_bytes.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 if let Some(mut pending_write) = pending_open_write {
@@ -461,9 +454,12 @@ impl Drop for Stream {
                 if !write_closed && !fin_queued {
                     let _ = send_fin_frame(stream_id, writer).await;
                 }
-                streams.write().await.remove(&stream_id);
-                let removed = pending_data.lock().await.remove(stream_id);
-                subtract_pending_data_bytes(removed, &buffered_stream_bytes);
+                unregister_stream_locked(
+                    &mut *streams.write().await,
+                    &capacity_stream_count,
+                    stream_id,
+                );
+                pending_data.lock().await.remove(stream_id);
                 pending_fin.lock().await.remove(&stream_id);
             });
         }
@@ -471,9 +467,17 @@ impl Drop for Stream {
 }
 
 impl Stream {
+    async fn unregister_stream(&self) {
+        unregister_stream_locked(
+            &mut *self.streams.write().await,
+            &self.capacity_stream_count,
+            self.stream_id,
+        );
+    }
+
     async fn clear_pending_client_state(&self) {
-        let removed = self.pending_data.lock().await.remove(self.stream_id);
-        subtract_pending_data_bytes(removed, &self.buffered_stream_bytes);
+        // 移除的入账载荷随队列丢弃自动回账。
+        self.pending_data.lock().await.remove(self.stream_id);
         self.pending_fin.lock().await.remove(&self.stream_id);
     }
 
@@ -486,8 +490,7 @@ impl Stream {
             self.take_queued_pending_fin();
             return None;
         };
-        let data = queue.pop_front()?;
-        subtract_buffered_stream_bytes(&self.buffered_stream_bytes, data.len());
+        let payload = queue.pop_front()?;
         let drained = queue.is_empty();
         if drained {
             pending.remove(self.stream_id);
@@ -496,7 +499,7 @@ impl Stream {
         if drained {
             self.take_queued_pending_fin();
         }
-        Some(data)
+        Some(payload.into_vec())
     }
 
     fn take_queued_pending_fin(&mut self) {
@@ -505,15 +508,6 @@ impl Stream {
                 self.read_closed = true;
             }
         }
-    }
-
-    // data channel 中已入账但未读的字节随流关闭一并丢弃，按量扣减。
-    fn discard_unread_channel_bytes(&mut self) {
-        let mut drained = 0usize;
-        while let Ok(data) = self.data_rx.try_recv() {
-            drained += data.len();
-        }
-        subtract_buffered_stream_bytes(&self.buffered_stream_bytes, drained);
     }
 
     fn deferred_open_frames(&self) -> Option<Vec<Vec<u8>>> {
@@ -567,7 +561,7 @@ impl Stream {
                 Ok(Err(_)) => {
                     self.synack_rx = None;
                     remember_closing_stream_sync(self.stream_id, &self.closing_streams);
-                    self.streams.write().await.remove(&self.stream_id);
+                    self.unregister_stream().await;
                     self.clear_pending_client_state().await;
                     return Err(self
                         .mark_open_failed(anyhow::anyhow!("stream closed before SYNACK"), false));
@@ -576,7 +570,7 @@ impl Stream {
                     self.synack_rx = None;
                     remember_closing_stream_sync(self.stream_id, &self.closing_streams);
                     let _ = send_fin_frame(self.stream_id, self.writer.clone()).await;
-                    self.streams.write().await.remove(&self.stream_id);
+                    self.unregister_stream().await;
                     self.clear_pending_client_state().await;
                     return Err(self
                         .mark_open_failed(anyhow::anyhow!("timed out waiting for SYNACK"), false));
@@ -591,7 +585,7 @@ impl Stream {
             );
             self.open_failed = Some(msg.clone());
             remember_closing_stream_sync(self.stream_id, &self.closing_streams);
-            self.streams.write().await.remove(&self.stream_id);
+            self.unregister_stream().await;
             self.clear_pending_client_state().await;
             anyhow::bail!(msg);
         }

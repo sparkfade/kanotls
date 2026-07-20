@@ -256,6 +256,8 @@ The server validates the target, resolves DNS, and establishes the relay connect
 
 The session read loop (`run_read_loop`) uses a pinned `tokio::time::sleep` timer (`idle_timeout_with_jitter_secs`, default 45 s from config). On each successful read, the timer is reset to `now + idle_duration`. If the timer fires while no active streams, pending inbound streams, or pending open streams exist (`is_idle_timeout_eligible()`), the session tears down gracefully: a Noise-encrypted TLS `close_notify` alert (0x15) is sent, followed by TCP FIN. No application-layer heartbeat (CMD_PING) is sent — kernel TCP keepalive (60 s idle, 30 s interval, 3 retries) serves as the dead-peer detection mechanism instead.
 
+> **Server-side only**: client sessions are lifecycle-managed by the connection pool (idle drain / soft TTL). The idle-teardown branch in `run_read_loop` is gated off client-side via `idle_teardown_enabled = !is_client`.
+
 ---
 
 ## 5. Anti-Active-Probing
