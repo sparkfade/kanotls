@@ -110,11 +110,134 @@ pub fn stable_client_hello_fingerprint(record: &[u8]) -> Option<[u8; 32]> {
     let (random, session_id) = extract_client_hello_random_and_session_id(&mut normalized)?;
     random.fill(0);
     session_id.fill(0);
-    if let Some(key_share) = client_hello_key_share_range(&normalized) {
-        normalized[key_share].fill(0);
-    }
+    normalize_client_hello_key_shares(&mut normalized)?;
+    normalize_client_hello_grease_positions(&mut normalized)?;
     normalize_client_hello_padding_extension(&mut normalized)?;
     Some(hash_with_key(CLIENT_HELLO_FP_CONTEXT, &normalized))
+}
+
+/// RFC 8701 GREASE 值表：pattern 0x?A?A 且高低字节相同，共 16 个。
+/// template.rs 实例化时按连接轮换这些值，指纹归一化需将其全部置零。
+pub(crate) const GREASE_VALUES: [u16; 16] = [
+    0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A, 0x5A5A, 0x6A6A, 0x7A7A, 0x8A8A, 0x9A9A, 0xAAAA, 0xBABA,
+    0xCACA, 0xDADA, 0xEAEA, 0xFAFA,
+];
+
+pub(crate) fn is_grease_value(value: u16) -> bool {
+    GREASE_VALUES.contains(&value)
+}
+
+/// 将 key_share(0x0033) 扩展中所有 share 条目的 key 字节全部置零（不动任何
+/// 长度字段）。实例化每连接随机化 X25519 与辅助 P-256 share，只置零单个
+/// share 会使每条连接指纹唯一。share 结构截断时返回 None。
+fn normalize_client_hello_key_shares(record: &mut [u8]) -> Option<()> {
+    let mut share_ranges = Vec::new();
+    let mut malformed = false;
+    walk_client_hello_extensions(record, |ext_type, entry| {
+        if ext_type != 0x0033 || malformed {
+            return;
+        }
+        let ext_data = entry.start + 4;
+        let ext_end = entry.end;
+        if ext_end - ext_data < 2 {
+            malformed = true;
+            return;
+        }
+        let mut share_cursor = ext_data + 2;
+        while share_cursor + 4 <= ext_end {
+            let share_len =
+                u16::from_be_bytes([record[share_cursor + 2], record[share_cursor + 3]]) as usize;
+            let share_start = share_cursor + 4;
+            let Some(share_end) = share_start.checked_add(share_len) else {
+                malformed = true;
+                return;
+            };
+            if share_end > ext_end {
+                malformed = true;
+                return;
+            }
+            share_ranges.push(share_start..share_end);
+            share_cursor = share_end;
+        }
+    })?;
+    if malformed {
+        return None;
+    }
+    for range in share_ranges {
+        record[range].fill(0);
+    }
+    Some(())
+}
+
+/// 将所有 GREASE 出现位置置零：cipher_suites 列表中的 2 字节值、每个扩展的
+/// 2 字节 ext_type 字段（GREASE 扩展 len 通常为 0，置零 type 不影响遍历）、
+/// supported_groups(0x000a) 扩展 data 内的 group 列表。长度字段一律不动。
+fn normalize_client_hello_grease_positions(record: &mut [u8]) -> Option<()> {
+    const SUPPORTED_GROUPS_EXTENSION_TYPE: u16 = 0x000a;
+
+    let (_, session_id_range) = client_hello_random_and_session_id_ranges(record)?;
+    let cipher_suites_len_start = session_id_range.end;
+    let cipher_suites_len = u16::from_be_bytes([
+        *record.get(cipher_suites_len_start)?,
+        *record.get(cipher_suites_len_start + 1)?,
+    ]) as usize;
+    let suites_start = cipher_suites_len_start.checked_add(2)?;
+    let suites_end = suites_start.checked_add(cipher_suites_len)?;
+    if suites_end > record.len() {
+        return None;
+    }
+    let mut cursor = suites_start;
+    while cursor + 2 <= suites_end {
+        if is_grease_value(u16::from_be_bytes([record[cursor], record[cursor + 1]])) {
+            record[cursor..cursor + 2].fill(0);
+        }
+        cursor += 2;
+    }
+
+    let mut zero_ranges = Vec::new();
+    let mut malformed = false;
+    walk_client_hello_extensions(record, |ext_type, entry| {
+        if malformed {
+            return;
+        }
+        if is_grease_value(ext_type) {
+            zero_ranges.push(entry.start..entry.start + 2);
+            return;
+        }
+        if ext_type != SUPPORTED_GROUPS_EXTENSION_TYPE {
+            return;
+        }
+        let ext_data = entry.start + 4;
+        let ext_end = entry.end;
+        if ext_end - ext_data < 2 {
+            malformed = true;
+            return;
+        }
+        let groups_len = u16::from_be_bytes([record[ext_data], record[ext_data + 1]]) as usize;
+        let Some(groups_end) = ext_data.checked_add(2).and_then(|v| v.checked_add(groups_len))
+        else {
+            malformed = true;
+            return;
+        };
+        if groups_end > ext_end {
+            malformed = true;
+            return;
+        }
+        let mut cursor = ext_data + 2;
+        while cursor + 2 <= groups_end {
+            if is_grease_value(u16::from_be_bytes([record[cursor], record[cursor + 1]])) {
+                zero_ranges.push(cursor..cursor + 2);
+            }
+            cursor += 2;
+        }
+    })?;
+    if malformed {
+        return None;
+    }
+    for range in zero_ranges {
+        record[range].fill(0);
+    }
+    Some(())
 }
 
 /// Validate the ClientHello record shape and walk its extension entries,
@@ -534,6 +657,96 @@ mod tests {
             stable_client_hello_fingerprint(&record_a),
             stable_client_hello_fingerprint(&record_b)
         );
+    }
+
+    #[test]
+    fn stable_client_hello_fingerprint_ignores_grease_and_all_key_shares() {
+        // 合成 ClientHello：cipher_suites、扩展 type、supported_groups 各含一个
+        // GREASE 位置；key_share 含 X25519(32B) 与 P-256(65B) 两个 share。
+        fn build(grease: u16, x25519_share: u8, p256_share: u8) -> Vec<u8> {
+            let mut r = vec![0u8; 211];
+            r[0] = 0x16;
+            r[5] = 0x01;
+            r[43] = 32;
+            r[76] = 0x00;
+            r[77] = 0x04;
+            r[78..80].copy_from_slice(&grease.to_be_bytes());
+            r[80] = 0x13;
+            r[81] = 0x01;
+            r[82] = 0x01;
+            r[84] = 0x00;
+            r[85] = 125;
+            r[86..88].copy_from_slice(&grease.to_be_bytes());
+            r[90] = 0x00;
+            r[91] = 0x0a;
+            r[92] = 0x00;
+            r[93] = 0x06;
+            r[94] = 0x00;
+            r[95] = 0x04;
+            r[96..98].copy_from_slice(&grease.to_be_bytes());
+            r[98] = 0x00;
+            r[99] = 0x1d;
+            r[100] = 0x00;
+            r[101] = 0x33;
+            r[102] = 0x00;
+            r[103] = 0x6b;
+            r[104] = 0x00;
+            r[105] = 0x69;
+            r[106] = 0x00;
+            r[107] = 0x1d;
+            r[108] = 0x00;
+            r[109] = 0x20;
+            r[110..142].fill(x25519_share);
+            r[142] = 0x00;
+            r[143] = 0x17;
+            r[144] = 0x00;
+            r[145] = 0x41;
+            r[146..211].fill(p256_share);
+            r
+        }
+
+        let record_a = build(0x0a0a, 0x11, 0x22);
+        let record_b = build(0xfafa, 0x33, 0x44);
+        assert_eq!(
+            stable_client_hello_fingerprint(&record_a),
+            stable_client_hello_fingerprint(&record_b)
+        );
+
+        // 非 GREASE 差异（cipher suite 0x1302）仍须改变指纹。
+        let mut record_c = record_b.clone();
+        record_c[81] = 0x02;
+        assert_ne!(
+            stable_client_hello_fingerprint(&record_a),
+            stable_client_hello_fingerprint(&record_c)
+        );
+    }
+
+    #[test]
+    fn stable_client_hello_fingerprint_rejects_truncated_key_share() {
+        let mut record = vec![0u8; 100];
+        record[0] = 0x16;
+        record[5] = 0x01;
+        record[43] = 32;
+        record[76] = 0x00;
+        record[77] = 0x02;
+        record[78] = 0x13;
+        record[79] = 0x01;
+        record[80] = 0x01;
+        record[81] = 0x00;
+        record[82] = 0x00;
+        record[83] = 16;
+        record[84] = 0x00;
+        record[85] = 0x33;
+        record[86] = 0x00;
+        record[87] = 12;
+        record[88] = 0x00;
+        record[89] = 10;
+        record[90] = 0x00;
+        record[91] = 0x1d;
+        record[92] = 0x00;
+        record[93] = 0x20;
+
+        assert_eq!(stable_client_hello_fingerprint(&record), None);
     }
 
     #[test]

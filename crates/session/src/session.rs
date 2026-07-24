@@ -1,7 +1,7 @@
 use crate::frame::{
     coalesce_encoded_frames, encode_padding_reply_into, encode_padding_request_into,
     encode_psh_frames, Frame, CMD_FIN, CMD_PADDING, CMD_PSH, CMD_SETTINGS, CMD_SYN, CMD_SYNACK,
-    MAX_PAYLOAD_LEN,
+    FRAME_HEADER_SIZE, MAX_PAYLOAD_LEN,
 };
 use crate::shaper::{ShapePolicy, TrafficShaper};
 use crate::stream::{Stream, StreamInit, StreamOpenState, StreamParts};
@@ -168,13 +168,58 @@ impl PendingData {
 
 pub(crate) type SharedTunnelWriter = Arc<SessionWriter>;
 
+/// 顺序扫描编码缓冲中的帧头，逐帧回调 (cmd, stream_id, frame_len)；缓冲
+/// 可能是多帧合并（control 写）或任意帧拼接（bulk 积压），尾部不足一帧
+/// 时停止。
+fn walk_frame_headers(mut buf: &[u8], mut f: impl FnMut(u8, u32, usize)) {
+    while buf.len() >= FRAME_HEADER_SIZE {
+        let data_len = u16::from_be_bytes([buf[5], buf[6]]) as usize;
+        let frame_len = FRAME_HEADER_SIZE + data_len;
+        if buf.len() < frame_len {
+            break;
+        }
+        f(
+            buf[0],
+            u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]),
+            frame_len,
+        );
+        buf = &buf[frame_len..];
+    }
+}
+
+/// delay 窗口插队判定：请求内全部为真实协议控制帧（SYN/FIN/SETTINGS/
+/// SYNACK）且不触及被钉住的流（在途 control 请求、pending 积压中的
+/// 数据、已暂存写）才允许立即上链；CMD_PADDING（H2 骨架/假响应）与
+/// 其他帧一律不得插队，窗口内的尺寸/时序模型保持原样。
+fn control_write_can_pass_through(request: &WriteRequest, pinned_sids: &HashSet<u32>) -> bool {
+    let mut saw_frame = false;
+    let mut pass = true;
+    for packet in &request.packets {
+        walk_frame_headers(packet, |cmd, sid, _len| {
+            saw_frame = true;
+            if !matches!(cmd, CMD_SYN | CMD_FIN | CMD_SETTINGS | CMD_SYNACK)
+                || pinned_sids.contains(&sid)
+            {
+                pass = false;
+            }
+        });
+    }
+    saw_frame && pass
+}
+
 const MAX_PENDING_STREAM_FRAMES: usize = 1024;
 const MAX_PENDING_STREAM_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PENDING_STREAMS: usize = 1024;
-const STREAM_CHANNEL_CAPACITY: usize = 32;
+const STREAM_CHANNEL_CAPACITY: usize = 128;
 const MAX_SESSION_REASSEMBLY_BYTES: usize = 1024 * 1024;
 const WRITE_CHANNEL_CAPACITY: usize = 64;
 const MAX_STREAM_OVERFLOW_BYTES: usize = 2 * 1024 * 1024;
+
+/// sticky bulk 批量 flush 双上限（先到先 flush）：连续 prepare 最多 K 条
+/// record 且 write_buffer 累计不超过 ~128KB 后统一冲刷一次。仅合并内部
+/// syscall，record 尺寸/顺序与逐条 flush 完全一致。
+const STICKY_BULK_FLUSH_MAX_RECORDS: usize = 8;
+const STICKY_BULK_FLUSH_MAX_BYTES: usize = 128 * 1024;
 
 /// 稳态 H2 行为骨架（post-script steady state）：真实 HTTP/2 接收端按消费
 /// 字节数回发 WINDOW_UPDATE，并偶发 PING/PING-ACK 对。内容加密不可见，
@@ -1104,7 +1149,7 @@ impl Session {
             CMD_PADDING => {
                 let flag = frame.payload.first().copied().unwrap_or(0);
                 if flag == 0 {
-                    let m = frame.payload.get(1).copied().unwrap_or(1).max(1).min(16);
+                    let m = frame.payload.get(1).copied().unwrap_or(1).clamp(1, 16);
                     let total_junk = frame.payload.len().saturating_sub(2).max(32);
                     // 全部 reply 连续写进一个 buffer，作为单个 control
                     // WriteRequest fire-and-forget 提交：只等入队成功，
@@ -1599,54 +1644,54 @@ impl SessionWriter {
                         Self::queue_bulk_request(&mut pending, &mut responders, bulk_request);
                     }
 
+                    let mut deferred_control = Vec::new();
                     if !pending.is_empty() {
-                        if let Err(msg) = Self::drain_pending_and_respond(
+                        // 钉住当前 control 请求触及的流：delay 窗口内同流
+                        // 控制帧不得越过本请求插队（保序论证见 drive_shaper）。
+                        let mut pinned_sids = HashSet::new();
+                        for packet in &request.packets {
+                            walk_frame_headers(packet, |_cmd, sid, _len| {
+                                pinned_sids.insert(sid);
+                            });
+                        }
+                        match Self::drain_pending_and_respond(
                             &mut pending,
                             &mut shaper,
                             &mut write_half,
                             &mut responders,
+                            &mut control_rx,
+                            &pending_client_settings,
                             direction,
+                            pinned_sids,
                         )
                         .await
                         {
-                            let _ = request.response_tx.send(Err(msg));
-                            break;
-                        }
-                    }
-
-                    {
-                        let state = write_half.with_stream(|stream| stream.control_state());
-                        let mut err: Option<String> = None;
-                        for packet in &request.packets {
-                            let result = write_half.with_stream(|stream| {
-                                let size = stream.next_control_size(state, direction);
-                                trace!(
-                                    "control write: frame_cmd=0x{:02x} wire_size={}",
-                                    packet.first().unwrap_or(&0),
-                                    size
-                                );
-                                stream.prepare_control_record(packet, size)
-                            });
-                            if let Err(e) = result {
-                                err = Some(e.to_string());
+                            Ok(deferred) => deferred_control = deferred,
+                            Err(msg) => {
+                                let _ = request.response_tx.send(Err(msg));
                                 break;
                             }
                         }
-                        if let Some(msg) = err {
-                            let _ = request.response_tx.send(Err(msg.clone()));
-                            break;
-                        }
                     }
 
-                    match write_half.flush().await {
-                        Err(e) => {
-                            let msg = e.to_string();
-                            let _ = request.response_tx.send(Err(msg.clone()));
-                            break;
-                        }
-                        Ok(()) => {
-                            let _ = request.response_tx.send(Ok(()));
-                        }
+                    if Self::write_control_request_now(request, &mut write_half, direction)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+
+                    // 窗口内暂存的 control 写按到达顺序补发（排在本请求
+                    // 之后，与旧版“下一事件循环回合再处理”的相对顺序一致）。
+                    if Self::write_deferred_control_requests(
+                        deferred_control,
+                        &mut write_half,
+                        direction,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
                     }
                 }
                 maybe_bulk = bulk_rx.recv() => {
@@ -1670,25 +1715,54 @@ impl SessionWriter {
                         Self::queue_bulk_request(&mut pending, &mut responders, request);
                     }
 
-                    if !pending.is_empty()
-                        && Self::drain_pending_and_respond(
+                    if !pending.is_empty() {
+                        match Self::drain_pending_and_respond(
                             &mut pending,
                             &mut shaper,
                             &mut write_half,
                             &mut responders,
+                            &mut control_rx,
+                            &pending_client_settings,
                             direction,
+                            HashSet::new(),
                         )
                         .await
-                        .is_err()
-                    {
-                        break;
+                        {
+                            Ok(deferred) => {
+                                // 窗口内暂存的 control 写按到达顺序补发。
+                                if Self::write_deferred_control_requests(
+                                    deferred,
+                                    &mut write_half,
+                                    direction,
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
                     }
                 }
             }
         }
 
         if !pending.is_empty() {
-            let _ = Self::drive_shaper(&mut pending, &mut shaper, &mut write_half).await;
+            // 收尾排空不再消费 control 通道（主循环已退出）：喂入一条已
+            // 关闭的通道，delay 窗口行为与旧版一致（安静等到期满）。
+            let (dead_tx, mut dead_rx) = mpsc::channel(1);
+            drop(dead_tx);
+            let _ = Self::drive_shaper(
+                &mut pending,
+                &mut shaper,
+                &mut write_half,
+                &mut dead_rx,
+                &pending_client_settings,
+                direction,
+                HashSet::new(),
+            )
+            .await;
             for responder in responders.drain(..) {
                 let _ = responder.send(Ok(()));
             }
@@ -1697,22 +1771,39 @@ impl SessionWriter {
     }
 
     /// 两个写循环分支共用的“排空 + 收尾”序列：drive_shaper 排空 pending，
-    /// 发出 fake 帧，并应答全部 Immediate 等待者。失败时已入队的
-    /// responder 以同一错误应答，错误消息返回给调用方做分支专属处理。
+    /// 发出 fake 帧，并应答全部 Immediate 等待者。delay 窗口内被暂存的
+    /// control 写随 Ok 一并返回，由调用方按分支语义补发（control 分支
+    /// 排在本请求之后，bulk 分支立即补发）；其 responder 在字节真正
+    /// flush 后才应答。失败时已入队的 responder 以同一错误应答，错误
+    /// 消息返回给调用方做分支专属处理。
+    #[allow(clippy::too_many_arguments)]
     async fn drain_pending_and_respond(
         pending: &mut Vec<u8>,
         shaper: &mut TrafficShaper,
         write_half: &mut SplitWriteHalf,
         responders: &mut Vec<oneshot::Sender<Result<(), String>>>,
+        control_rx: &mut mpsc::Receiver<WriteRequest>,
+        pending_client_settings: &Arc<Mutex<Option<Vec<u8>>>>,
         direction: FlowDirection,
-    ) -> Result<(), String> {
-        match Self::drive_shaper(pending, shaper, write_half).await {
-            Ok(fake_frames) => {
+        pinned_sids: HashSet<u32>,
+    ) -> Result<Vec<WriteRequest>, String> {
+        match Self::drive_shaper(
+            pending,
+            shaper,
+            write_half,
+            control_rx,
+            pending_client_settings,
+            direction,
+            pinned_sids,
+        )
+        .await
+        {
+            Ok((fake_frames, deferred)) => {
                 let _ = Self::emit_fake_frames(write_half, direction, &fake_frames).await;
                 for responder in responders.drain(..) {
                     let _ = responder.send(Ok(()));
                 }
-                Ok(())
+                Ok(deferred)
             }
             Err(e) => {
                 let msg = e.to_string();
@@ -1747,24 +1838,55 @@ impl SessionWriter {
     /// with an on-wire length dictated by the `TrafficShaper`. Unlike the old
     /// `write_all(pending)` dump, plaintext length never maps to wire size:
     /// oversized backlogs are sliced, sub-target backlogs are emitted at their
-    /// shaper-chosen size. Each record is flushed before the next is prepared,
-    /// bounding the encrypt buffer to a single record for memory safety.
+    /// shaper-chosen size.
     ///
     /// The first policy of a drain is sticky: when it allows a full block
     /// (bulk fast path), the entire backlog is carved into capacity-sized
     /// records — the tail at its exact wire length — with zero delay, no fake
-    /// frames, and no per-record policy consultation.
+    /// frames, and no per-record policy consultation. sticky 路径按
+    /// STICKY_BULK_FLUSH_MAX_RECORDS / STICKY_BULK_FLUSH_MAX_BYTES 双上限
+    /// 批量 flush：多次 prepare 在 write_buffer 中自然累积后统一冲刷，
+    /// record 尺寸/顺序与逐条 flush 完全一致，仅减少 syscall 次数。非
+    /// sticky（脚本/Markov/逐条策略）路径保持逐条 flush 不变。批量有界，
+    /// write_buffer 不会无界增长。
     ///
-    /// Returns any CMD_PADDING fake-response frames queued by script rules;
-    /// the caller must emit them on the control path before responding to
-    /// callers.
+    /// 脚本/Markov 策略的 delay 窗口内监听 control 通道：真实协议控制帧
+    /// （SYN/FIN/SETTINGS/SYNACK，且不触及 pinned_sids 与 pending 数据流）
+    /// 立即 prepare+flush 插队上链——真实 H2 端点本就优先控制帧；其余
+    /// control 写（CMD_PADDING 骨架/假响应等）暂存返回，由主循环按到达
+    /// 顺序补发。data record 的尺寸、数量、delay 时长分布严格不变。
+    ///
+    /// Returns (fake_frames, deferred_control_writes)：fake 帧由调用方走
+    /// control 路径发出；暂存的 control 写按到达顺序补发，其 responder
+    /// 必须在字节真正 flush 后才应答 Ok。
+    #[allow(clippy::too_many_arguments)]
     async fn drive_shaper(
         pending: &mut Vec<u8>,
         shaper: &mut TrafficShaper,
         write_half: &mut SplitWriteHalf,
-    ) -> std::io::Result<Vec<Vec<u8>>> {
+        control_rx: &mut mpsc::Receiver<WriteRequest>,
+        pending_client_settings: &Arc<Mutex<Option<Vec<u8>>>>,
+        direction: FlowDirection,
+        mut pinned_sids: HashSet<u32>,
+    ) -> std::io::Result<(Vec<Vec<u8>>, Vec<WriteRequest>)> {
         let mut fake_frames = Vec::new();
+        let mut deferred_control = Vec::new();
         let mut consumed = 0usize;
+
+        // 钉住 pending 积压中的数据流：同流控制帧（如 FIN）不得越过仍在
+        // 积压中的数据插队，否则对端会因 FIN 先至而丢弃其后的数据。
+        // 同时记录全部帧边界偏移：wire 协议没有 record 边界标记，对端把
+        // 各 record 的块载荷拼接后重组帧，插队 control 帧只能落在完整帧
+        // 边界上（旧实现靠“先排空 pending 再写 control”隐式保证）。
+        let mut frame_boundaries = HashSet::new();
+        let mut frame_offset = 0usize;
+        walk_frame_headers(pending, |cmd, sid, frame_len| {
+            if cmd == CMD_PSH {
+                pinned_sids.insert(sid);
+            }
+            frame_offset += frame_len;
+            frame_boundaries.insert(frame_offset);
+        });
 
         let mut first_policy = if pending.is_empty() {
             None
@@ -1774,6 +1896,9 @@ impl SessionWriter {
         let sticky_full_block = first_policy
             .as_ref()
             .is_some_and(|policy| policy.allow_full_block);
+
+        // sticky 批量 flush 记账：自上次 flush 以来累积的 record 条数。
+        let mut batched_records = 0usize;
 
         loop {
             if consumed >= pending.len() {
@@ -1814,7 +1939,18 @@ impl SessionWriter {
             consumed += take;
             shaper.advance();
 
-            write_half.flush().await?;
+            if sticky_full_block {
+                batched_records += 1;
+                let buffered = write_half.with_stream(|stream| stream.buffered_write_len());
+                if batched_records >= STICKY_BULK_FLUSH_MAX_RECORDS
+                    || buffered >= STICKY_BULK_FLUSH_MAX_BYTES
+                {
+                    write_half.flush().await?;
+                    batched_records = 0;
+                }
+            } else {
+                write_half.flush().await?;
+            }
 
             if let Some(fake) = &policy.fake {
                 let mut encoded = Vec::new();
@@ -1823,12 +1959,139 @@ impl SessionWriter {
             }
 
             if policy.delay > Duration::ZERO {
-                tokio::time::sleep(policy.delay).await;
+                Self::wait_shaping_delay(
+                    policy.delay,
+                    frame_boundaries.contains(&consumed),
+                    write_half,
+                    control_rx,
+                    pending_client_settings,
+                    direction,
+                    &mut pinned_sids,
+                    &mut deferred_control,
+                )
+                .await?;
             }
         }
 
+        if sticky_full_block && batched_records > 0 {
+            write_half.flush().await?;
+        }
+
         pending.clear();
-        Ok(fake_frames)
+        Ok((fake_frames, deferred_control))
+    }
+
+    /// 整形 delay 窗口：挂起 data record 节奏期间同时监听 control 通道。
+    /// 窗口内到达的真实协议控制帧立即上链，其余 control 写暂存；deadline
+    /// 不变（等待至 delay 期满），data record 间隔分布严格不变。
+    /// at_frame_boundary：当前 drain 偏移是否恰好落在完整帧边界——只有
+    /// 边界处才允许插队，否则 control 帧会插进某个 PSH 帧的载荷中间，
+    /// 破坏对端帧重组。
+    #[allow(clippy::too_many_arguments)]
+    async fn wait_shaping_delay(
+        delay: Duration,
+        at_frame_boundary: bool,
+        write_half: &mut SplitWriteHalf,
+        control_rx: &mut mpsc::Receiver<WriteRequest>,
+        pending_client_settings: &Arc<Mutex<Option<Vec<u8>>>>,
+        direction: FlowDirection,
+        pinned_sids: &mut HashSet<u32>,
+        deferred: &mut Vec<WriteRequest>,
+    ) -> std::io::Result<()> {
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                _ = &mut sleep => break,
+                maybe_control = control_rx.recv() => {
+                    let Some(mut request) = maybe_control else {
+                        // control 通道已关闭：安静等到窗口期满。
+                        sleep.await;
+                        break;
+                    };
+                    // 与主 control 分支同一口径：客户端首个 control 写请求
+                    // 携带 SETTINGS，并发 deferred open 的 SYN 无法越过
+                    // SETTINGS 先到达对端。
+                    if let Some(settings) = pending_client_settings.lock().await.take() {
+                        request.packets.insert(0, settings);
+                    }
+                    // 已有暂存写时禁止后续插队：控制写在本 drain 内保持严格
+                    // FIFO。否则后到的 SYN 可能越过被暂存的 SETTINGS+SYN 先
+                    // 到达对端，而服务端会丢弃先于 SETTINGS 的 SYN。
+                    if deferred.is_empty()
+                        && at_frame_boundary
+                        && control_write_can_pass_through(&request, pinned_sids)
+                    {
+                        Self::write_control_request_now(request, write_half, direction)
+                            .await
+                            .map_err(std::io::Error::other)?;
+                    } else {
+                        // 暂存请求触及的流一并钉住：后续窗口内同流控制帧
+                        // 不得越过暂存写插队（保持到达顺序）。
+                        for packet in &request.packets {
+                            walk_frame_headers(packet, |_cmd, sid, _len| {
+                                pinned_sids.insert(sid);
+                            });
+                        }
+                        deferred.push(request);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 单条 control 写请求的 prepare + flush + 应答：主 control 分支、
+    /// delay 窗口插队、窗口暂存补发共用同一口径。responder 在字节真正
+    /// flush 完成后才收到 Ok；失败时先应答 Err 再把错误交调用方终止
+    /// 写循环。
+    async fn write_control_request_now(
+        request: WriteRequest,
+        write_half: &mut SplitWriteHalf,
+        direction: FlowDirection,
+    ) -> Result<(), String> {
+        let state = write_half.with_stream(|stream| stream.control_state());
+        for packet in &request.packets {
+            let result = write_half.with_stream(|stream| {
+                let size = stream.next_control_size(state, direction);
+                trace!(
+                    "control write: frame_cmd=0x{:02x} wire_size={}",
+                    packet.first().unwrap_or(&0),
+                    size
+                );
+                stream.prepare_control_record(packet, size)
+            });
+            if let Err(e) = result {
+                let msg = e.to_string();
+                let _ = request.response_tx.send(Err(msg.clone()));
+                return Err(msg);
+            }
+        }
+        match write_half.flush().await {
+            Ok(()) => {
+                let _ = request.response_tx.send(Ok(()));
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let _ = request.response_tx.send(Err(msg.clone()));
+                Err(msg)
+            }
+        }
+    }
+
+    /// 窗口暂存 control 写的补发：按到达顺序逐条 prepare+flush，任一
+    /// 失败即终止（失败请求的 responder 已在 write_control_request_now
+    /// 内应答 Err）。
+    async fn write_deferred_control_requests(
+        deferred: Vec<WriteRequest>,
+        write_half: &mut SplitWriteHalf,
+        direction: FlowDirection,
+    ) -> Result<(), String> {
+        for request in deferred {
+            Self::write_control_request_now(request, write_half, direction).await?;
+        }
+        Ok(())
     }
 
     /// Emit fake-response control frames generated by the shaper.
@@ -1941,8 +2204,9 @@ impl Session {
     ) {
         streams.retain(|_, handle| {
             let orphaned = stream_handle_is_orphaned(handle);
-            if orphaned {
-                // orphan 必然是 read_closed=false（见判定函数），入账一次。
+            // 计数口径：read_closed 句柄在置位时已扣减过容量计数，
+            // prune 时不得重复扣减；仅 read_closed=false 的 orphan 入账。
+            if orphaned && !handle.read_closed {
                 capacity_stream_count.fetch_sub(1, Ordering::Relaxed);
             }
             !orphaned
@@ -1950,10 +2214,10 @@ impl Session {
     }
 }
 
+/// orphan 判定：三个 channel 全部关闭（消费者已走，句柄不再可达）。
+/// read_closed 句柄同样适用——已 read_closed 且 channel 全关的句柄
+/// 残留于 streams 映射会在长连接+大量短流场景下缓慢泄漏。
 fn stream_handle_is_orphaned(handle: &StreamHandle) -> bool {
-    if handle.read_closed {
-        return false;
-    }
     handle.data_tx.is_closed()
         && handle.fin_tx.is_closed()
         && handle

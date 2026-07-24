@@ -12,8 +12,8 @@ use crate::fp::FingerprintPreset;
 use crate::templates;
 use crate::utils::{
     client_hello_random_and_session_id_ranges, derive_counter_mac, derive_counter_mask,
-    extract_client_hello_random_and_session_id, mask_noise_ephemeral_key, xor_u64_bytes,
-    MAX_TLS_RECORD_PAYLOAD_LEN,
+    extract_client_hello_random_and_session_id, is_grease_value, mask_noise_ephemeral_key,
+    xor_u64_bytes, GREASE_VALUES, MAX_TLS_RECORD_PAYLOAD_LEN,
 };
 
 lazy_static! {
@@ -347,15 +347,6 @@ fn ensure_padding_extension_data_zero(
         );
     }
     Ok(())
-}
-
-const GREASE_VALUES: [u16; 16] = [
-    0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A, 0x5A5A, 0x6A6A, 0x7A7A, 0x8A8A, 0x9A9A, 0xAAAA, 0xBABA,
-    0xCACA, 0xDADA, 0xEAEA, 0xFAFA,
-];
-
-fn is_grease_value(ext_type: u16) -> bool {
-    GREASE_VALUES.contains(&ext_type)
 }
 
 fn apply_client_hello_randomization(
@@ -719,7 +710,8 @@ mod tests {
     use crate::templates::FIREFOX_BOOTSTRAP_CLIENT_HELLO;
     use crate::utils::{
         client_hello_key_share_range, client_hello_random_and_session_id_ranges, constant_time_eq,
-        derive_counter_mac, derive_counter_mask, mask_mac_flags, unmask_noise_ephemeral_key,
+        derive_counter_mac, derive_counter_mask, mask_mac_flags, stable_client_hello_fingerprint,
+        unmask_noise_ephemeral_key,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1464,5 +1456,46 @@ mod tests {
             first, second,
             "GREASE value must be re-randomized across connections"
         );
+    }
+
+    #[test]
+    fn stable_fingerprint_is_connection_invariant() {
+        let template =
+            get_or_build_client_hello_template("example.com", Some("firefox"), None, true).unwrap();
+        let derived_psk = common::derive_psk(b"fingerprint-stability-psk");
+        let mut psk_e = [0u8; 48];
+        for (idx, byte) in psk_e.iter_mut().enumerate() {
+            *byte = (idx as u8).wrapping_mul(7).wrapping_add(1);
+        }
+
+        let ch1 = template.instantiate(&derived_psk, &psk_e, 1).unwrap();
+        let ch2 = template.instantiate(&derived_psk, &psk_e, 2).unwrap();
+        assert_ne!(ch1, ch2, "两次实例化必须存在每连接随机字段");
+
+        let fp1 = stable_client_hello_fingerprint(&ch1).expect("fingerprint first ClientHello");
+        let fp2 = stable_client_hello_fingerprint(&ch2).expect("fingerprint second ClientHello");
+        assert_eq!(
+            fp1, fp2,
+            "random/session_id/GREASE/key_share 归一化后指纹必须跨连接稳定"
+        );
+    }
+
+    #[test]
+    fn stable_fingerprint_distinguishes_sni() {
+        let derived_psk = common::derive_psk(b"fingerprint-distinct-psk");
+        let mut psk_e = [0u8; 48];
+        psk_e[..32].fill(3);
+        psk_e[32..48].fill(4);
+
+        let template_a =
+            get_or_build_client_hello_template("example.com", Some("firefox"), None, true).unwrap();
+        let template_b =
+            get_or_build_client_hello_template("example.org", Some("firefox"), None, true).unwrap();
+        let ch_a = template_a.instantiate(&derived_psk, &psk_e, 1).unwrap();
+        let ch_b = template_b.instantiate(&derived_psk, &psk_e, 1).unwrap();
+
+        let fp_a = stable_client_hello_fingerprint(&ch_a).expect("fingerprint example.com");
+        let fp_b = stable_client_hello_fingerprint(&ch_b).expect("fingerprint example.org");
+        assert_ne!(fp_a, fp_b, "不同 SNI 的模板指纹必须不同");
     }
 }
