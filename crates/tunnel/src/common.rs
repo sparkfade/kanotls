@@ -235,6 +235,11 @@ impl SnowyStream {
         ConnectionState::from_control_count(self.control_frame_count)
     }
 
+    /// 已 prepare 尚未 flush 的字节量：session 写循环的批量 flush 决策依据。
+    pub fn buffered_write_len(&self) -> usize {
+        self.write_buffer.len() - self.write_offset
+    }
+
     pub fn next_control_size(&mut self, state: ConnectionState, direction: FlowDirection) -> usize {
         control_size::next_control_size(state, direction, &mut rand::thread_rng())
     }
@@ -420,20 +425,44 @@ impl AsyncRead for SnowyStream {
                                     prefix_data_len,
                                     consumed
                                 );
-                                if len >= BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN {
+                                let data_range = if len
+                                    >= BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN
+                                {
                                     let data_len = u16::from_be_bytes([
                                         this.decrypt_buf[0],
                                         this.decrypt_buf[1],
                                     ]) as usize;
                                     let data_len = data_len
                                         .min(len - BLOCK_LEN_PREFIX_SIZE - INNER_CONTENT_TYPE_LEN);
-                                    this.read_buf_inner.extend_from_slice(
-                                        &this.decrypt_buf[BLOCK_LEN_PREFIX_SIZE
-                                            ..BLOCK_LEN_PREFIX_SIZE + data_len],
-                                    );
-                                } else if len > 0 {
-                                    this.read_buf_inner
-                                        .extend_from_slice(&this.decrypt_buf[..len]);
+                                    BLOCK_LEN_PREFIX_SIZE..BLOCK_LEN_PREFIX_SIZE + data_len
+                                } else {
+                                    0..len
+                                };
+                                if !data_range.is_empty() {
+                                    // 读路径减拷贝：read_buf_inner 为空且调用方
+                                    // buf 有余量时，解密数据直接拷入调用方 buf，
+                                    // 仅把装不下的剩余部分落入 read_buf_inner，
+                                    // 消除常见路径的一次中转拷贝。
+                                    if this.read_offset >= this.read_buf_inner.len()
+                                        && buf.remaining() > 0
+                                    {
+                                        let n = cmp::min(data_range.len(), buf.remaining());
+                                        buf.put_slice(
+                                            &this.decrypt_buf
+                                                [data_range.start..data_range.start + n],
+                                        );
+                                        if n < data_range.len() {
+                                            this.read_buf_inner.extend_from_slice(
+                                                &this.decrypt_buf
+                                                    [data_range.start + n..data_range.end],
+                                            );
+                                        }
+                                        progress = true;
+                                    } else {
+                                        this.read_buf_inner.extend_from_slice(
+                                            &this.decrypt_buf[data_range.clone()],
+                                        );
+                                    }
                                 }
                                 this.tls_rx_offset = frame_end;
                                 if this.tls_rx_offset == this.tls_rx_buf.len() {
@@ -663,4 +692,132 @@ fn encrypt_variable_block(
         .copy_from_slice(&(actual_ct as u16).to_be_bytes());
     write_buffer.truncate(current_len + TLS_RECORD_HEADER_LEN + actual_ct);
     Ok(())
+}
+
+#[cfg(test)]
+mod poll_read_fuzz_tests {
+    use super::*;
+    use crate::common;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    fn build_transport_pair() -> (TransportState, TransportState) {
+        let derived_psk = common::derive_psk(b"poll-read-fuzz");
+        let mut initiator = snow::Builder::new(NOISE_PARAMS.clone())
+            .psk(0, &derived_psk)
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut responder = snow::Builder::new(NOISE_PARAMS.clone())
+            .psk(0, &derived_psk)
+            .unwrap()
+            .build_responder()
+            .unwrap();
+        let mut buf = [0u8; 96];
+        let n = initiator.write_message(&[], &mut buf).unwrap();
+        responder.read_message(&buf[..n], &mut []).unwrap();
+        let n = responder.write_message(&[], &mut buf).unwrap();
+        initiator.read_message(&buf[..n], &mut []).unwrap();
+        (
+            initiator.into_transport_mode().unwrap(),
+            responder.into_transport_mode().unwrap(),
+        )
+    }
+
+    // 随机尺寸 record 序列 + 随机 socket 分片 + 随机读 buf 尺寸：
+    // 验证 poll_read 总能读完全部载荷且顺序完好（不返回假 EOF、不丢字节）。
+    #[tokio::test]
+    async fn poll_read_reassembles_fragmented_record_stream() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+
+        for round in 0..25 {
+            let (mut server_noise, client_noise) = build_transport_pair();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let connect = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+            let (server_tcp, _) = listener.accept().await.unwrap();
+            let client_tcp = connect.await.unwrap();
+
+            // 随机载荷序列：覆盖空载荷、小载荷、整 record、跨界尺寸。
+            let mut expected: Vec<u8> = Vec::new();
+            let mut wire: Vec<u8> = Vec::new();
+            // 直接在内存里加密：手工构造 record 序列。
+            let mut records_plain: Vec<Vec<u8>> = Vec::new();
+            let sizes = [0usize, 1, 2, 3, 63, 100, 1024, 4096, 16381, 777, 16380, 5];
+            let count = rng.gen_range(3..10);
+            for i in 0..count {
+                let sz = sizes[rng.gen_range(0..sizes.len())];
+                let payload: Vec<u8> = (0..sz).map(|j| ((i * 7 + j) % 251) as u8).collect();
+                expected.extend_from_slice(&payload);
+                records_plain.push(payload);
+            }
+            let mut wire_tmp = Vec::new();
+            let mut encrypt_buf = Box::new([0u8; BLOCK_PLAINTEXT_SIZE]);
+            for payload in &records_plain {
+                let target = if rng.gen_bool(0.5) {
+                    common::SnowyStream::data_record_wire_len(payload.len())
+                } else {
+                    BLOCK_PLAINTEXT_SIZE + TLS_RECORD_HEADER_LEN + AEAD_TAG_LEN
+                };
+                let target_plaintext = target
+                    .saturating_sub(TLS_RECORD_HEADER_LEN + AEAD_TAG_LEN)
+                    .max(payload.len() + BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN)
+                    .min(BLOCK_PLAINTEXT_SIZE);
+                encrypt_variable_block(
+                    &mut server_noise,
+                    &mut wire_tmp,
+                    &mut encrypt_buf,
+                    payload,
+                    target_plaintext,
+                    PadFill::Zero,
+                )
+                .unwrap();
+            }
+            wire.extend_from_slice(&wire_tmp);
+
+            // 随机分片写入。
+            let writer = tokio::spawn(async move {
+                let mut server_tcp = server_tcp;
+                let mut off = 0usize;
+                while off < wire.len() {
+                    let (n, do_yield) = {
+                        let mut rng = rand::thread_rng();
+                        (
+                            rng.gen_range(1..=wire.len() - off)
+                                .min(rng.gen_range(1..70000))
+                                .min(wire.len() - off),
+                            rng.gen_bool(0.3),
+                        )
+                    };
+                    tokio::io::AsyncWriteExt::write_all(&mut server_tcp, &wire[off..off + n])
+                        .await
+                        .unwrap();
+                    off += n;
+                    if do_yield {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                server_tcp
+            });
+
+            let mut stream = SnowyStream::new(client_tcp, client_noise);
+            let mut got: Vec<u8> = Vec::new();
+            let read_future = async {
+                while got.len() < expected.len() {
+                    let cap = rng.gen_range(1..70000);
+                    let mut buf = vec![0u8; cap];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    assert!(n > 0, "round {}: spurious EOF at {} bytes", round, got.len());
+                    got.extend_from_slice(&buf[..n]);
+                }
+                got
+            };
+            let got = tokio::time::timeout(std::time::Duration::from_secs(10), read_future)
+                .await
+                .unwrap_or_else(|_| panic!("round {}: read stuck", round));
+            assert_eq!(got, expected, "round {}: payload mismatch", round);
+            let _server_tcp = writer.await.unwrap();
+        }
+    }
 }

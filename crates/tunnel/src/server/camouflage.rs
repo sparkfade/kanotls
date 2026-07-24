@@ -44,6 +44,24 @@ pub(super) const TLS12_DOWNGRADE_SENTINEL: [u8; 8] =
 pub(super) const TLS11_DOWNGRADE_SENTINEL: [u8; 8] =
     [0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x00];
 
+/// RFC 8446 §4.1.3：HelloRetryRequest 的 ServerHello.random 固定为
+/// SHA-256("HelloRetryRequest")。
+pub(super) const HELLO_RETRY_REQUEST_RANDOM: [u8; 32] = [
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8,
+    0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8,
+    0x33, 0x9c,
+];
+
+/// 判断一条 0x16 记录是否为 HelloRetryRequest（handshake type 0x02 且
+/// random 等于 HRR magic）。record 偏移 11..43 = 5 字节 record 头 +
+/// 4 字节 handshake 头 + 2 字节 version 之后。
+pub(super) fn is_hello_retry_request(record: &[u8]) -> bool {
+    if !is_server_hello(record) || record.len() < 43 {
+        return false;
+    }
+    record[11..43] == HELLO_RETRY_REQUEST_RANDOM
+}
+
 lazy_static! {
     pub(super) static ref CAMOUFLAGE_PROFILES: tokio::sync::Mutex<LruCache<String, CamouflageProfilePool>> =
         tokio::sync::Mutex::new(LruCache::new(
@@ -342,6 +360,12 @@ pub(super) fn patch_server_hello_random(server_records: &mut [u8]) {
             let random_start = offset + 11;
             if random_start + 32 > offset + record_total {
                 break;
+            }
+            // 防御性跳过：HelloRetryRequest 的 random 是 RFC 8446 规定的
+            // 固定 magic，重写它会破坏 HRR 的语义识别。
+            if server_records[random_start..random_start + 32] == HELLO_RETRY_REQUEST_RANDOM {
+                offset += record_total;
+                continue;
             }
             use rand::RngCore;
             rng.fill_bytes(&mut fresh_random);
@@ -1078,6 +1102,13 @@ pub(super) async fn read_camouflage_server_records(
 
                 let record = camo_record.as_slice();
                 if c_typ == 0x16 && is_server_hello(record) {
+                    // HRR flight 不可缓存回放：缺第二个 ClientHello，回放会产生
+                    // 异常流。中止本次采样，由上层走失败/冷却路径。
+                    if is_hello_retry_request(record) {
+                        anyhow::bail!(
+                            "camouflage server returned HelloRetryRequest; HRR flights cannot be cached for replay"
+                        );
+                    }
                     found_server_hello = true;
                 }
                 if c_typ == 0x14 {
@@ -1170,4 +1201,60 @@ pub(super) async fn read_camouflage_server_records(
             app_data_sizes: app_data_sizes_arc,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造一条最小 ServerHello 记录（handshake type 0x02，random 可指定），
+    /// session_id echo 长度为 0。
+    fn server_hello_record_with_random(random: &[u8; 32]) -> Vec<u8> {
+        let mut record = vec![0u8; 5 + 4 + 2 + 32 + 1];
+        record[0] = 0x16;
+        record[1] = 0x03;
+        record[2] = 0x03;
+        let body_len = (record.len() - 5) as u16;
+        record[3..5].copy_from_slice(&body_len.to_be_bytes());
+        record[5] = 0x02;
+        record[9] = 0x03;
+        record[10] = 0x03;
+        record[11..43].copy_from_slice(random);
+        record
+    }
+
+    #[test]
+    fn hello_retry_request_random_is_detected() {
+        let hrr = server_hello_record_with_random(&HELLO_RETRY_REQUEST_RANDOM);
+        assert!(is_hello_retry_request(&hrr));
+
+        let normal = server_hello_record_with_random(&[7u8; 32]);
+        assert!(!is_hello_retry_request(&normal));
+
+        let mut not_server_hello = hrr.clone();
+        not_server_hello[5] = 0x01;
+        assert!(!is_hello_retry_request(&not_server_hello));
+    }
+
+    #[test]
+    fn hello_retry_request_magic_matches_rfc8446() {
+        // RFC 8446 §4.1.3: SHA-256("HelloRetryRequest") 的前 8 字节。
+        assert_eq!(&HELLO_RETRY_REQUEST_RANDOM[..4], &[0xcf, 0x21, 0xad, 0x74]);
+        assert_eq!(&HELLO_RETRY_REQUEST_RANDOM[4..8], &[0xe5, 0x9a, 0x61, 0x11]);
+    }
+
+    #[test]
+    fn patch_server_hello_random_skips_hello_retry_request() {
+        let mut records = server_hello_record_with_random(&HELLO_RETRY_REQUEST_RANDOM);
+        patch_server_hello_random(&mut records);
+        assert_eq!(
+            &records[11..43],
+            &HELLO_RETRY_REQUEST_RANDOM,
+            "HRR random 不得被重写"
+        );
+
+        let mut normal = server_hello_record_with_random(&[7u8; 32]);
+        patch_server_hello_random(&mut normal);
+        assert_ne!(&normal[11..43], &[7u8; 32], "普通 SH random 必须被重写");
+    }
 }

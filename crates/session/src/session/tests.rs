@@ -1855,3 +1855,677 @@ async fn h2_ping_padding_is_emitted_on_the_sampled_interval() {
     H2_PING_INTERVAL_OVERRIDE_MS.store(0, Ordering::Relaxed);
     client.force_close();
 }
+
+// M12 回归：read_closed=true 且三个 channel 全关的句柄必须能被 prune
+// （长连接+大量短流场景下 streams 映射不再泄漏）；此类句柄在
+// mark_stream_read_closed_locked 时已扣减过容量计数，prune 不得重复扣减。
+#[test]
+fn prune_removes_read_closed_orphan_without_double_decrement() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let counter = AtomicUsize::new(0);
+    let mut streams = std::collections::HashMap::new();
+
+    let (data_tx, data_rx) = tokio::sync::mpsc::channel(1);
+    let (fin_tx, fin_rx) = tokio::sync::mpsc::channel(1);
+    let (synack_tx, synack_rx) = tokio::sync::oneshot::channel();
+    drop(data_rx);
+    drop(fin_rx);
+    drop(synack_rx);
+    streams.insert(
+        1u32,
+        super::StreamHandle {
+            data_tx,
+            fin_tx,
+            synack_tx: Some(synack_tx),
+            read_closed: true,
+            pending_notify: Arc::new(tokio::sync::Notify::new()),
+        },
+    );
+
+    super::Session::prune_orphaned_streams_locked(&mut streams, &counter);
+    assert!(
+        streams.is_empty(),
+        "read_closed 且 channel 全关的句柄必须被 prune"
+    );
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        0,
+        "read_closed 句柄 prune 不得重复扣减容量计数"
+    );
+}
+
+// M12 回归：read_closed=false 的 orphan 仍被 prune 且容量计数恰好减 1。
+#[test]
+fn prune_removes_open_orphan_and_decrements_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let counter = AtomicUsize::new(1);
+    let mut streams = std::collections::HashMap::new();
+
+    let (data_tx, data_rx) = tokio::sync::mpsc::channel(1);
+    let (fin_tx, fin_rx) = tokio::sync::mpsc::channel(1);
+    drop(data_rx);
+    drop(fin_rx);
+    streams.insert(
+        7u32,
+        super::StreamHandle {
+            data_tx,
+            fin_tx,
+            synack_tx: None,
+            read_closed: false,
+            pending_notify: Arc::new(tokio::sync::Notify::new()),
+        },
+    );
+
+    super::Session::prune_orphaned_streams_locked(&mut streams, &counter);
+    assert!(streams.is_empty());
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+}
+
+// M12 回归：channel 仍有存活者的句柄（无论 read_closed 与否）不得被 prune。
+#[test]
+fn prune_keeps_handles_with_live_channels() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let counter = AtomicUsize::new(2);
+    let mut streams = std::collections::HashMap::new();
+
+    let (data_tx, _data_rx) = tokio::sync::mpsc::channel(1);
+    let (fin_tx, fin_rx) = tokio::sync::mpsc::channel(1);
+    drop(fin_rx);
+    streams.insert(
+        1u32,
+        super::StreamHandle {
+            data_tx,
+            fin_tx,
+            synack_tx: None,
+            read_closed: true,
+            pending_notify: Arc::new(tokio::sync::Notify::new()),
+        },
+    );
+
+    let (data_tx2, _data_rx2) = tokio::sync::mpsc::channel(1);
+    let (fin_tx2, _fin_rx2) = tokio::sync::mpsc::channel(1);
+    let (synack_tx2, _synack_rx2) = tokio::sync::oneshot::channel();
+    streams.insert(
+        2u32,
+        super::StreamHandle {
+            data_tx: data_tx2,
+            fin_tx: fin_tx2,
+            synack_tx: Some(synack_tx2),
+            read_closed: false,
+            pending_notify: Arc::new(tokio::sync::Notify::new()),
+        },
+    );
+
+    super::Session::prune_orphaned_streams_locked(&mut streams, &counter);
+    assert_eq!(streams.len(), 2);
+    assert_eq!(counter.load(Ordering::Relaxed), 2);
+}
+
+// 裸服务端配对：client 端包装成 SnowyStream，server 端保留裸 TcpStream
+// 与 server 端传输态，用于逐字节抓取线上 record 并离线解密比对。
+async fn client_stream_with_raw_server() -> (SnowyStream, TcpStream, snow::TransportState) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener binds");
+    let addr = listener.local_addr().expect("listener has address");
+    let client_task = tokio::spawn(async move {
+        TcpStream::connect(addr)
+            .await
+            .expect("client connects to listener")
+    });
+    let (server_tcp, _) = listener.accept().await.expect("listener accepts client");
+    let client_tcp = client_task.await.expect("client connect task completes");
+    let (client_noise, server_noise) = build_transport_pair();
+    (
+        SnowyStream::new(client_tcp, client_noise),
+        server_tcp,
+        server_noise,
+    )
+}
+
+// 离线解密抓取的线上 record 流：返回 (record wire 尺寸序列, 拼接载荷)。
+fn decrypt_wire_records(
+    wire: &[u8],
+    noise: &mut snow::TransportState,
+) -> (Vec<usize>, Vec<u8>) {
+    let mut sizes = Vec::new();
+    let mut plaintext = Vec::new();
+    let mut block = vec![0u8; kanotls_tunnel::common::BLOCK_PLAINTEXT_SIZE];
+    let mut off = 0usize;
+    while off < wire.len() {
+        assert_eq!(wire[off], 0x17, "record type must be application data");
+        let ct_len = u16::from_be_bytes([wire[off + 3], wire[off + 4]]) as usize;
+        let pt_len = noise
+            .read_message(&wire[off + 5..off + 5 + ct_len], &mut block)
+            .expect("record decrypts");
+        // 块结构：2 字节长度前缀 + 载荷 + padding + 0x17 inner content type。
+        let data_len = u16::from_be_bytes([block[0], block[1]]) as usize;
+        assert!(data_len + 3 <= pt_len);
+        assert_eq!(block[pt_len - 1], 0x17);
+        plaintext.extend_from_slice(&block[2..2 + data_len]);
+        sizes.push(5 + ct_len);
+        off += 5 + ct_len;
+    }
+    (sizes, plaintext)
+}
+
+// W4 回归：sticky bulk 路径的批量 flush 与逐条 flush 必须产生完全一致的
+// record 尺寸/顺序/载荷序列（仅 syscall 合并；不同连接的密文本身不可比，
+// 故离线解密后比对）。
+#[tokio::test]
+async fn sticky_bulk_batched_flush_matches_per_record_byte_stream() {
+    use super::{split_snowy, SessionWriter};
+    use crate::shaper::TrafficShaper;
+    use kanotls_tunnel::FlowDirection;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let cap = SnowyStream::data_record_capacity();
+    let tail = 1234usize;
+    // 9 条满载 record > STICKY_BULK_FLUSH_MAX_RECORDS(8)：触发一次批量
+    // 上限 flush，再触发排空时的收尾 flush。
+    let full_records = 9usize;
+    let total = cap * full_records + tail;
+    let payload: Vec<u8> = (0..total).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+    let expected_wire_bytes = full_records * SnowyStream::max_data_record_wire_len()
+        + SnowyStream::data_record_wire_len(tail);
+
+    // 参考路径（旧行为）：逐条 prepare + flush。
+    let (reference_wire, mut reference_noise) = {
+        let (client, mut raw_server, server_noise) = client_stream_with_raw_server().await;
+        let (_r, mut w) = split_snowy(client);
+        let payload = payload.clone();
+        let writer = tokio::spawn(async move {
+            let mut off = 0usize;
+            while off < payload.len() {
+                let take = (payload.len() - off).min(cap);
+                let wire = if take == cap {
+                    SnowyStream::max_data_record_wire_len()
+                } else {
+                    SnowyStream::data_record_wire_len(take)
+                };
+                w.with_stream(|s| s.prepare_data_record(&payload[off..off + take], wire))
+                    .expect("reference prepares record");
+                w.flush().await.expect("reference flushes record");
+                off += take;
+            }
+        });
+        let mut buf = vec![0u8; expected_wire_bytes];
+        tokio::time::timeout(Duration::from_secs(5), raw_server.read_exact(&mut buf))
+            .await
+            .expect("reference bytes arrive before timeout")
+            .expect("reference read ok");
+        writer.await.expect("reference writer joins");
+        (buf, server_noise)
+    };
+
+    // 新路径：drive_shaper sticky 批量 flush。
+    let (batched_wire, mut batched_noise) = {
+        let (client, mut raw_server, server_noise) = client_stream_with_raw_server().await;
+        let (_r, mut w) = split_snowy(client);
+        let mut shaper = TrafficShaper::new(FlowDirection::C2S, None, false);
+        let mut pending = payload.clone();
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
+        drop(control_tx);
+        let pending_client_settings = Arc::new(tokio::sync::Mutex::new(None));
+        let writer = tokio::spawn(async move {
+            let (fake, deferred) = SessionWriter::drive_shaper(
+                &mut pending,
+                &mut shaper,
+                &mut w,
+                &mut control_rx,
+                &pending_client_settings,
+                FlowDirection::C2S,
+                std::collections::HashSet::new(),
+            )
+            .await
+            .expect("drive_shaper ok");
+            assert!(fake.is_empty(), "sticky 路径不产生 fake 帧");
+            assert!(deferred.is_empty());
+            assert!(pending.is_empty());
+        });
+        let mut buf = vec![0u8; expected_wire_bytes];
+        tokio::time::timeout(Duration::from_secs(5), raw_server.read_exact(&mut buf))
+            .await
+            .expect("batched bytes arrive before timeout")
+            .expect("batched read ok");
+        writer.await.expect("batched writer joins");
+        (buf, server_noise)
+    };
+
+    let (reference_sizes, reference_plain) =
+        decrypt_wire_records(&reference_wire, &mut reference_noise);
+    let (batched_sizes, batched_plain) = decrypt_wire_records(&batched_wire, &mut batched_noise);
+
+    // record 尺寸/顺序完全一致：full_records 条满载 + 1 条精确尺寸尾 record。
+    let mut expected_sizes = vec![SnowyStream::max_data_record_wire_len(); full_records];
+    expected_sizes.push(SnowyStream::data_record_wire_len(tail));
+    assert_eq!(batched_sizes, expected_sizes);
+    assert_eq!(batched_sizes, reference_sizes);
+    // 拼接载荷完全一致且等于原始数据。
+    assert_eq!(reference_plain, payload);
+    assert_eq!(batched_plain, payload);
+}
+
+// W4 回归：prepare_data_record 在 write_buffer 中自然累积，flush 前不出网；
+// 累积语义是批量 flush 正确性的基础。
+#[tokio::test]
+async fn prepare_data_record_accumulates_until_flush() {
+    use super::split_snowy;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (client, mut server) = snowy_stream_pair().await;
+    let (_r, mut w) = split_snowy(client);
+    let payload = vec![0x5Au8; 1000];
+    let wire = SnowyStream::data_record_wire_len(payload.len());
+
+    let after_first = w.with_stream(|s| {
+        s.prepare_data_record(&payload, wire)
+            .expect("prepare first");
+        s.buffered_write_len()
+    });
+    assert_eq!(after_first, wire);
+    let after_second = w.with_stream(|s| {
+        s.prepare_data_record(&payload, wire)
+            .expect("prepare second");
+        s.buffered_write_len()
+    });
+    assert_eq!(after_second, 2 * wire, "prepare 自然累积，flush 前不出网");
+
+    w.flush().await.expect("flush");
+    assert_eq!(w.with_stream(|s| s.buffered_write_len()), 0);
+
+    let mut buf = vec![0u8; 2000];
+    tokio::time::timeout(Duration::from_secs(2), server.read_exact(&mut buf))
+        .await
+        .expect("server reads both records")
+        .expect("server read ok");
+    assert_eq!(buf, vec![0x5Au8; 2000]);
+}
+
+// W5 回归：脚本 delay 窗口内到达的 SYN 在帧边界处立即 prepare+flush（真实
+// H2 端点本就优先控制帧），不等 delay 期满；data record 的尺寸/数量不变。
+#[tokio::test]
+async fn delay_window_passes_through_syn_before_delay_expires() {
+    use super::{split_snowy, FlushBehavior, SessionWriter, WriteRequest};
+    use crate::shaper::TrafficShaper;
+    use kanotls_tunnel::FlowDirection;
+    use tokio::io::AsyncReadExt;
+
+    let (client, server) = snowy_stream_pair().await;
+    let (_cr, mut cw) = split_snowy(client);
+    let (mut sr, _sw) = split_snowy(server);
+
+    // 单规则脚本：policy target 大于整条 pending——唯一 record 恰好落在
+    // 帧边界（policy 切分不越过帧尾），其后的 delay 窗口允许控制帧插队。
+    let mut shaper = TrafficShaper::new(
+        FlowDirection::C2S,
+        Some("Length: 1500, Delay: 200, FakeResponse: 0"),
+        false,
+    );
+
+    let psh = crate::frame::Frame::psh(7, vec![0xAAu8; 1000])
+        .encode()
+        .expect("psh encodes");
+    let syn = crate::frame::Frame::syn(0x2A).encode().expect("syn encodes");
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(8);
+    let pending_client_settings = Arc::new(tokio::sync::Mutex::new(None));
+
+    let expected_len = psh.len() + syn.len();
+    let reader = tokio::spawn(async move {
+        let mut all = Vec::new();
+        let mut buf = vec![0u8; 16384];
+        while all.len() < expected_len {
+            let n = tokio::time::timeout(Duration::from_secs(10), sr.read(&mut buf))
+                .await
+                .expect("server reads before timeout")
+                .expect("server read ok");
+            assert!(n > 0, "tunnel closed early");
+            all.extend_from_slice(&buf[..n]);
+        }
+        all
+    });
+
+    // SYN 在 drive 开始前排入 control 通道：delay 窗口内即被消费。
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    control_tx
+        .send(WriteRequest {
+            packets: vec![syn.clone()],
+            response_tx,
+            flush: FlushBehavior::Immediate,
+        })
+        .await
+        .expect("syn queued");
+
+    let mut pending = psh.clone();
+    let (fake, deferred) = SessionWriter::drive_shaper(
+        &mut pending,
+        &mut shaper,
+        &mut cw,
+        &mut control_rx,
+        &pending_client_settings,
+        FlowDirection::C2S,
+        std::collections::HashSet::new(),
+    )
+    .await
+    .expect("drive_shaper ok");
+
+    assert!(fake.is_empty());
+    // SYN 未被暂存——它已在 delay 窗口内（drive_shaper 返回前）上链，
+    // 否则窗口外没有任何路径能把它的字节写出去。
+    assert!(deferred.is_empty(), "SYN 必须在窗口内插队，不得暂存");
+    assert!(matches!(response_rx.await, Ok(Ok(()))));
+
+    let received = reader.await.expect("reader joins");
+    // 线上序列：完整的 PSH 帧在前，SYN 帧紧随其后落在帧边界上；data
+    // record 的数量/尺寸不变（pending 仍是单 record 排空）。
+    let mut expected = psh.clone();
+    expected.extend_from_slice(&syn);
+    assert_eq!(received, expected);
+}
+
+// W5 回归：delay 窗口未落在帧边界时，SYN 不得插队（会插进 PSH 帧载荷
+// 中间破坏对端帧重组）——暂存后由主循环按到达顺序补发，responder 在
+// 其字节真正 flush 后才应答。
+#[tokio::test]
+async fn delay_window_defers_syn_off_frame_boundary() {
+    use super::{split_snowy, FlushBehavior, SessionWriter, WriteRequest};
+    use crate::shaper::TrafficShaper;
+    use kanotls_tunnel::FlowDirection;
+    use tokio::io::AsyncReadExt;
+
+    let (client, server) = snowy_stream_pair().await;
+    let (_cr, mut cw) = split_snowy(client);
+    let (mut sr, _sw) = split_snowy(server);
+
+    // policy target ~300 字节：1007 字节 PSH 帧被切成多条 record，前几个
+    // delay 窗口都落在帧载荷中间（非边界），SYN 不得插队。
+    let mut shaper = TrafficShaper::new(
+        FlowDirection::C2S,
+        Some("Length: 300, Delay: 100, FakeResponse: 0"),
+        false,
+    );
+
+    let psh = crate::frame::Frame::psh(7, vec![0xAAu8; 1000])
+        .encode()
+        .expect("psh encodes");
+    let syn = crate::frame::Frame::syn(0x2A).encode().expect("syn encodes");
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(8);
+    let pending_client_settings = Arc::new(tokio::sync::Mutex::new(None));
+
+    let expected_len = psh.len() + syn.len();
+    let reader = tokio::spawn(async move {
+        let mut all = Vec::new();
+        let mut buf = vec![0u8; 16384];
+        while all.len() < expected_len {
+            let n = tokio::time::timeout(Duration::from_secs(10), sr.read(&mut buf))
+                .await
+                .expect("server reads before timeout")
+                .expect("server read ok");
+            assert!(n > 0, "tunnel closed early");
+            all.extend_from_slice(&buf[..n]);
+        }
+        all
+    });
+
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    control_tx
+        .send(WriteRequest {
+            packets: vec![syn.clone()],
+            response_tx,
+            flush: FlushBehavior::Immediate,
+        })
+        .await
+        .expect("syn queued");
+
+    let mut pending = psh.clone();
+    let (fake, deferred) = SessionWriter::drive_shaper(
+        &mut pending,
+        &mut shaper,
+        &mut cw,
+        &mut control_rx,
+        &pending_client_settings,
+        FlowDirection::C2S,
+        std::collections::HashSet::new(),
+    )
+    .await
+    .expect("drive_shaper ok");
+
+    assert!(fake.is_empty());
+    assert_eq!(
+        deferred.len(),
+        1,
+        "非帧边界窗口内的 SYN 必须暂存，不得插队"
+    );
+
+    let response_rx = response_rx;
+    tokio::pin!(response_rx);
+    assert!(poll!(&mut response_rx).is_pending());
+
+    // 主循环补发：drive_shaper 返回后按到达顺序处理暂存写。
+    SessionWriter::write_deferred_control_requests(deferred, &mut cw, FlowDirection::C2S)
+        .await
+        .expect("deferred flush ok");
+    assert!(matches!(response_rx.await, Ok(Ok(()))));
+
+    let received = reader.await.expect("reader joins");
+    let mut expected = psh.clone();
+    expected.extend_from_slice(&syn);
+    assert_eq!(received, expected);
+}
+
+// W5 回归：CMD_PADDING（H2 骨架/假响应）在 delay 窗口内不得发出——暂存
+// 后由主循环按到达顺序补发，responder 在其字节真正 flush 后才应答。
+#[tokio::test]
+async fn delay_window_defers_padding_until_after_drain() {
+    use super::{split_snowy, FlushBehavior, SessionWriter, WriteRequest};
+    use crate::shaper::TrafficShaper;
+    use kanotls_tunnel::FlowDirection;
+    use tokio::io::AsyncReadExt;
+
+    let (client, server) = snowy_stream_pair().await;
+    let (_cr, mut cw) = split_snowy(client);
+    let (mut sr, _sw) = split_snowy(server);
+
+    let mut shaper = TrafficShaper::new(
+        FlowDirection::C2S,
+        Some("Length: 300, Delay: 200, FakeResponse: 0"),
+        false,
+    );
+
+    let data = vec![0xAAu8; 1000];
+    let mut padding = Vec::new();
+    crate::frame::encode_padding_request_into(&mut padding, 2);
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(8);
+    let pending_client_settings = Arc::new(tokio::sync::Mutex::new(None));
+
+    let expected_len = data.len() + padding.len();
+    let reader = tokio::spawn(async move {
+        let mut all = Vec::new();
+        let mut buf = vec![0u8; 16384];
+        while all.len() < expected_len {
+            let n = tokio::time::timeout(Duration::from_secs(10), sr.read(&mut buf))
+                .await
+                .expect("server reads before timeout")
+                .expect("server read ok");
+            assert!(n > 0, "tunnel closed early");
+            all.extend_from_slice(&buf[..n]);
+        }
+        all
+    });
+
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    control_tx
+        .send(WriteRequest {
+            packets: vec![padding.clone()],
+            response_tx,
+            flush: FlushBehavior::Immediate,
+        })
+        .await
+        .expect("padding queued");
+
+    let mut pending = data.clone();
+    let (fake, deferred) = SessionWriter::drive_shaper(
+        &mut pending,
+        &mut shaper,
+        &mut cw,
+        &mut control_rx,
+        &pending_client_settings,
+        FlowDirection::C2S,
+        std::collections::HashSet::new(),
+    )
+    .await
+    .expect("drive_shaper ok");
+
+    assert!(fake.is_empty());
+    assert_eq!(deferred.len(), 1, "CMD_PADDING 必须暂存，窗口内不得发出");
+
+    // 暂存写的 responder 在其字节真正 flush 前不得应答。
+    let response_rx = response_rx;
+    tokio::pin!(response_rx);
+    assert!(poll!(&mut response_rx).is_pending());
+
+    // 主循环补发：drive_shaper 返回后按到达顺序处理暂存写。
+    SessionWriter::write_deferred_control_requests(deferred, &mut cw, FlowDirection::C2S)
+        .await
+        .expect("deferred flush ok");
+    assert!(matches!(response_rx.await, Ok(Ok(()))));
+
+    let received = reader.await.expect("reader joins");
+    assert_eq!(received.len(), expected_len);
+    assert_eq!(
+        &received[..data.len()],
+        data.as_slice(),
+        "全部 data record 在前，窗口内未夹带 padding"
+    );
+    assert_eq!(
+        &received[data.len()..],
+        padding.as_slice(),
+        "padding 在 drain 完成后补发"
+    );
+}
+
+// FIFO 回归：窗口 1（非帧边界）内 R1 被暂存后，窗口 2（帧边界）内到达的
+// R2 不得越过 R1 插队——否则 R2 的 SYN 可能先于被暂存的 SETTINGS+SYN
+// 到达对端，而服务端会丢弃先于 SETTINGS 的 SYN。本 drain 内一旦存在
+// 暂存写，控制写必须保持严格 FIFO。
+#[tokio::test]
+async fn delay_window_blocks_pass_through_once_deferred() {
+    use super::{split_snowy, FlushBehavior, SessionWriter, WriteRequest};
+    use crate::shaper::TrafficShaper;
+    use kanotls_tunnel::FlowDirection;
+    use tokio::io::AsyncReadExt;
+
+    let (client, server) = snowy_stream_pair().await;
+    let (_cr, mut cw) = split_snowy(client);
+    let (mut sr, _sw) = split_snowy(server);
+
+    // 单规则脚本：target ∈ [595,840]（随机化缩放后），两条 PSH 帧
+    // （各 507 字节，边界 507/1014）被切成两条 record——record1 消费
+    // ∈ [571,816]（非边界），record2 吞掉剩余（边界）。
+    let mut shaper = TrafficShaper::new(
+        FlowDirection::C2S,
+        Some("Length: 700, Delay: 200, FakeResponse: 0"),
+        false,
+    );
+
+    let psh_a = crate::frame::Frame::psh(7, vec![0xAAu8; 500])
+        .encode()
+        .expect("psh a encodes");
+    let psh_b = crate::frame::Frame::psh(8, vec![0xBBu8; 500])
+        .encode()
+        .expect("psh b encodes");
+    let mut psh = psh_a.clone();
+    psh.extend_from_slice(&psh_b);
+    let syn_a = crate::frame::Frame::syn(0x2A).encode().expect("syn a encodes");
+    let syn_b = crate::frame::Frame::syn(0x2B).encode().expect("syn b encodes");
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(8);
+    let pending_client_settings = Arc::new(tokio::sync::Mutex::new(None));
+
+    let expected_len = psh.len() + syn_a.len() + syn_b.len();
+    // 确定性同步（不依赖墙钟）：record2 在 W1 结束 flush 后 reader 才能
+    // 收满 psh.len() 字节——此刻正是边界窗口 W2 的起点，R2 此时发出
+    // 必落在 W2 内。
+    let psh_len = psh.len();
+    let control_tx2 = control_tx.clone();
+    let syn_b2 = syn_b.clone();
+    let reader = tokio::spawn(async move {
+        let mut all = Vec::new();
+        let mut buf = vec![0u8; 16384];
+        let mut r2_sent = false;
+        while all.len() < expected_len {
+            let n = tokio::time::timeout(Duration::from_secs(10), sr.read(&mut buf))
+                .await
+                .expect("server reads before timeout")
+                .expect("server read ok");
+            assert!(n > 0, "tunnel closed early");
+            all.extend_from_slice(&buf[..n]);
+            if !r2_sent && all.len() >= psh_len {
+                r2_sent = true;
+                let (response_tx_b, _response_rx_b) = tokio::sync::oneshot::channel();
+                control_tx2
+                    .send(WriteRequest {
+                        packets: vec![syn_b2.clone()],
+                        response_tx: response_tx_b,
+                        flush: FlushBehavior::Immediate,
+                    })
+                    .await
+                    .expect("syn b queued");
+            }
+        }
+        all
+    });
+
+    // R1 在 drive 开始前排入：窗口 1（非边界）消费并暂存。
+    let (response_tx_a, response_rx_a) = tokio::sync::oneshot::channel();
+    control_tx
+        .send(WriteRequest {
+            packets: vec![syn_a.clone()],
+            response_tx: response_tx_a,
+            flush: FlushBehavior::Immediate,
+        })
+        .await
+        .expect("syn a queued");
+
+    let mut pending = psh.clone();
+    let (_fake, deferred) = SessionWriter::drive_shaper(
+        &mut pending,
+        &mut shaper,
+        &mut cw,
+        &mut control_rx,
+        &pending_client_settings,
+        FlowDirection::C2S,
+        std::collections::HashSet::new(),
+    )
+    .await
+    .expect("drive_shaper ok");
+
+    assert_eq!(
+        deferred.len(),
+        2,
+        "一旦存在暂存写，后续控制写在本 drain 内不得插队"
+    );
+    assert_eq!(
+        deferred[0].packets,
+        vec![syn_a.clone()],
+        "暂存顺序必须先 R1 后 R2"
+    );
+    assert_eq!(deferred[1].packets, vec![syn_b.clone()]);
+
+    let response_rx_a = response_rx_a;
+    tokio::pin!(response_rx_a);
+    assert!(poll!(&mut response_rx_a).is_pending());
+
+    SessionWriter::write_deferred_control_requests(deferred, &mut cw, FlowDirection::C2S)
+        .await
+        .expect("deferred flush ok");
+    assert!(matches!(response_rx_a.await, Ok(Ok(()))));
+
+    let received = reader.await.expect("reader joins");
+    let mut expected = psh.clone();
+    expected.extend_from_slice(&syn_a);
+    expected.extend_from_slice(&syn_b);
+    assert_eq!(received, expected);
+}
