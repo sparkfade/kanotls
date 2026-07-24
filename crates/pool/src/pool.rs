@@ -1,252 +1,25 @@
-use crate::session::{Session, SessionConfig};
-use crate::stream::Stream;
-use futures::future::BoxFuture;
-use futures::FutureExt;
+use crate::behavior::{PoolBehaviorConfig, PoolBehaviorContext, ResolvedPoolBehavior};
+use crate::connection::{ConnectionState, PooledConnection};
+use crate::{PoolSession, TunnelConnector};
+use kanotls_session::{SessionConfig, Stream};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
 
-const MIN_INITIAL_CONNECTIONS: usize = 1;
-const MAX_INITIAL_CONNECTIONS: usize = 3;
-const IDLE_DRAIN_SECS: u64 = 30;
-const DEFAULT_MONITOR_INTERVAL_MS: u64 = 500;
-const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 15;
-const TIME_OF_DAY_BUCKET_SECS: u64 = 4 * 60 * 60;
 const MIN_STREAMS_PER_CONNECTION_TARGET: usize = 8;
 const MAX_STREAMS_PER_CONNECTION_TARGET: usize = 64;
 
-#[derive(Clone)]
-pub struct ClientPoolConnectOptions {
-    pub server_addr: String,
-    pub sni: String,
-    pub psk: Vec<u8>,
-    pub insecure: bool,
-    pub fingerprint: Option<String>,
-    pub custom_template_bytes: Arc<RwLock<Option<Vec<u8>>>>,
-}
-
-pub struct ClientPool<C: TunnelConnector = DefaultConnector> {
+/// 隧道连接池：泛型于 [`TunnelConnector`]，由装配层注入连接工厂。
+pub struct ClientPool<C: TunnelConnector> {
     inner: Arc<PoolInner<C>>,
 }
 
-#[derive(Clone)]
-struct PoolBehaviorContext {
-    fingerprint_family: String,
-    sni: String,
-    startup_epoch_secs: u64,
-    time_of_day_bucket: u64,
-    random_nonce: u64,
-}
-
-#[derive(Clone)]
-struct ResolvedPoolBehavior {
-    seed: u64,
-    target_pool_size: usize,
-    initial_connection_count: usize,
-    spawn_cluster_len: u64,
-}
-
-#[derive(Clone)]
-pub struct PoolBehaviorConfig {
-    min_target_pool_size: usize,
-    max_target_pool_size: usize,
-    min_initial_connections: usize,
-    max_initial_connections: usize,
-    min_startup_jitter_ms: u64,
-    max_startup_jitter_ms: u64,
-    soft_ttl_secs: u64,
-    idle_drain_secs: u64,
-    monitor_interval: Duration,
-    acquire_timeout: Duration,
-}
-
-impl PoolBehaviorConfig {
-    pub fn from_psk(psk: &[u8], install_salt: &[u8]) -> Self {
-        let h = hash_bytes(0x1337_BEEF, psk);
-        let h = hash_bytes(h, install_salt);
-        let min_target = seeded_usize_inclusive(h, 4, 8);
-        let max_target = seeded_usize_inclusive(h ^ 0x01, min_target + 2, 16);
-        let min_jitter = seeded_u64_inclusive(h ^ 0x02, 50, 300);
-        let max_jitter = seeded_u64_inclusive(h ^ 0x03, min_jitter + 300, 2500);
-        let soft_ttl = seeded_u64_inclusive(h ^ 0x04, 120, 300);
-        Self {
-            min_target_pool_size: min_target,
-            max_target_pool_size: max_target,
-            min_initial_connections: MIN_INITIAL_CONNECTIONS,
-            max_initial_connections: MAX_INITIAL_CONNECTIONS,
-            min_startup_jitter_ms: min_jitter,
-            max_startup_jitter_ms: max_jitter,
-            soft_ttl_secs: soft_ttl,
-            idle_drain_secs: IDLE_DRAIN_SECS,
-            monitor_interval: Duration::from_millis(DEFAULT_MONITOR_INTERVAL_MS),
-            acquire_timeout: Duration::from_secs(DEFAULT_ACQUIRE_TIMEOUT_SECS),
-        }
-    }
-    fn resolve(&self, context: &PoolBehaviorContext) -> ResolvedPoolBehavior {
-        let seed = context.seed();
-        let target_pool_size = seeded_usize_inclusive(
-            derive_seed(seed, 0x10),
-            self.min_target_pool_size,
-            self.max_target_pool_size,
-        );
-        let initial_connection_count = seeded_usize_inclusive(
-            derive_seed(seed, 0x11),
-            self.min_initial_connections.min(target_pool_size.max(1)),
-            self.max_initial_connections.min(target_pool_size.max(1)),
-        );
-
-        ResolvedPoolBehavior {
-            seed,
-            target_pool_size,
-            initial_connection_count,
-            spawn_cluster_len: seeded_u64_inclusive(derive_seed(seed, 0x14), 2, 4),
-        }
-    }
-
-    fn lifecycle(&self) -> PoolLifecycle {
-        PoolLifecycle {
-            soft_ttl: Duration::from_secs(self.soft_ttl_secs),
-            idle_timeout: Duration::from_secs(self.idle_drain_secs),
-        }
-    }
-
-    fn staggered_delays(
-        &self,
-        behavior: &ResolvedPoolBehavior,
-        start_slot: u64,
-        count: usize,
-    ) -> Vec<Duration> {
-        let mut delays = Vec::with_capacity(count);
-        let mut total_ms = 0u64;
-        let burst_gap_max = self
-            .min_startup_jitter_ms
-            .saturating_add(self.max_startup_jitter_ms)
-            .saturating_div(2)
-            .max(self.min_startup_jitter_ms);
-        for idx in 0..count {
-            let slot = start_slot + idx as u64;
-            let gap_seed = derive_seed(behavior.seed ^ slot.rotate_left(11), 0x30);
-            let gap_ms = if (slot + 1).is_multiple_of(behavior.spawn_cluster_len) {
-                seeded_u64_inclusive(gap_seed, burst_gap_max, self.max_startup_jitter_ms)
-            } else {
-                seeded_u64_inclusive(gap_seed, self.min_startup_jitter_ms, burst_gap_max)
-            };
-            total_ms = total_ms.saturating_add(gap_ms);
-            delays.push(Duration::from_millis(total_ms));
-        }
-        delays
-    }
-}
-
-struct PoolLifecycle {
-    soft_ttl: Duration,
-    idle_timeout: Duration,
-}
-
-pub trait TunnelConnector: Send + Sync + 'static {
-    type Session: PoolSession;
-
-    fn connect(&self) -> BoxFuture<'_, Result<Arc<Self::Session>, anyhow::Error>>;
-}
-
-struct PoolInner<C: TunnelConnector> {
-    session_config: SessionConfig,
-    behavior: PoolBehaviorConfig,
-    resolved_behavior: ResolvedPoolBehavior,
-    connector: Arc<C>,
-    connections: RwLock<HashMap<u64, Arc<PooledConnection<C::Session>>>>,
-    next_seq: AtomicU64,
-    target_pool_size: usize,
-    max_live_connections: usize,
-    initial_connection_count: usize,
-    bootstrap_started: AtomicBool,
-    acquire_waiters: AtomicUsize,
-    next_spawn_slot: AtomicU64,
-    pending_spawns: AtomicUsize,
-    selection_tick: AtomicU64,
-    spawn_lock: Mutex<()>,
-    connection_ready: Notify,
-    monitor_notify: Notify,
-}
-
-struct AcquireWaiterGuard<'a> {
-    counter: &'a AtomicUsize,
-}
-
-struct PooledConnection<S: PoolSession> {
-    seq: u64,
-    handle: Arc<S>,
-    state: AtomicU8,
-    soft_ttl: Duration,
-    idle_timeout: Duration,
-    created_at: Instant,
-    last_selected_tick: AtomicU64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConnectionState {
-    Active,
-    Draining,
-    Closed,
-}
-
-impl ConnectionState {
-    fn as_u8(self) -> u8 {
-        match self {
-            Self::Active => 0,
-            Self::Draining => 1,
-            Self::Closed => 2,
-        }
-    }
-
-    fn from_u8(value: u8) -> Self {
-        match value {
-            0 => Self::Active,
-            1 => Self::Draining,
-            _ => Self::Closed,
-        }
-    }
-}
-
-pub trait PoolSession: Send + Sync {
-    fn open_stream(&self) -> BoxFuture<'_, Result<Stream, anyhow::Error>>;
-    fn active_streams(&self) -> usize;
-    fn buffered_stream_bytes(&self) -> usize;
-    fn is_alive(&self) -> bool;
-    fn is_closing(&self) -> bool;
-    fn force_close(&self);
-}
-
-pub struct DefaultConnector {
-    session_config: SessionConfig,
-    connect_options: ClientPoolConnectOptions,
-}
-
-pub struct LivePoolSession {
-    session: Arc<Session>,
-}
-
 impl<C: TunnelConnector> ClientPool<C> {
-    pub async fn open_stream(&self) -> Result<Stream, anyhow::Error> {
-        self.inner.open_stream().await
-    }
-
-    #[cfg(test)]
-    async fn snapshot(&self) -> TestPoolSnapshot {
-        self.inner.test_snapshot().await
-    }
-
-    #[cfg(test)]
-    async fn spawn_connections_for_test(&self, count: usize, staggered: bool) {
-        self.inner.bootstrap_started.store(true, Ordering::Relaxed);
-        self.inner.schedule_spawns(count, staggered).await;
-    }
-
-    fn new_impl(
+    pub fn new(
         session_config: SessionConfig,
         behavior: PoolBehaviorConfig,
         behavior_context: PoolBehaviorContext,
@@ -280,24 +53,45 @@ impl<C: TunnelConnector> ClientPool<C> {
 
         Self { inner }
     }
+
+    pub async fn open_stream(&self) -> Result<Stream, anyhow::Error> {
+        self.inner.open_stream().await
+    }
+
+    #[cfg(test)]
+    async fn snapshot(&self) -> TestPoolSnapshot {
+        self.inner.test_snapshot().await
+    }
+
+    #[cfg(test)]
+    async fn spawn_connections_for_test(&self, count: usize, staggered: bool) {
+        self.inner.bootstrap_started.store(true, Ordering::Relaxed);
+        self.inner.schedule_spawns(count, staggered).await;
+    }
 }
 
-impl ClientPool<DefaultConnector> {
-    pub fn new(
-        session_config: SessionConfig,
-        connect_options: ClientPoolConnectOptions,
-        behavior: PoolBehaviorConfig,
-    ) -> Self {
-        Self::new_impl(
-            session_config.clone(),
-            behavior,
-            PoolBehaviorContext::from_connect_options(&connect_options),
-            Arc::new(DefaultConnector {
-                session_config,
-                connect_options,
-            }),
-        )
-    }
+struct PoolInner<C: TunnelConnector> {
+    session_config: SessionConfig,
+    behavior: PoolBehaviorConfig,
+    resolved_behavior: ResolvedPoolBehavior,
+    connector: Arc<C>,
+    connections: RwLock<HashMap<u64, Arc<PooledConnection<C::Session>>>>,
+    next_seq: AtomicU64,
+    target_pool_size: usize,
+    max_live_connections: usize,
+    initial_connection_count: usize,
+    bootstrap_started: AtomicBool,
+    acquire_waiters: AtomicUsize,
+    next_spawn_slot: AtomicU64,
+    pending_spawns: AtomicUsize,
+    selection_tick: AtomicU64,
+    spawn_lock: Mutex<()>,
+    connection_ready: Notify,
+    monitor_notify: Notify,
+}
+
+struct AcquireWaiterGuard<'a> {
+    counter: &'a AtomicUsize,
 }
 
 impl<C: TunnelConnector> PoolInner<C> {
@@ -628,7 +422,7 @@ impl<C: TunnelConnector> PoolInner<C> {
 
     async fn select_active_connection(&self) -> Option<Arc<PooledConnection<C::Session>>> {
         let entries = self.connection_entries().await;
-        let mut best: Option<(Arc<PooledConnection<C::Session>>, ConnectionScore)> = None;
+        let mut best: Option<(Arc<PooledConnection<C::Session>>, _)> = None;
 
         for entry in entries {
             if entry.state() != ConnectionState::Active
@@ -772,200 +566,9 @@ impl<C: TunnelConnector> PoolInner<C> {
     }
 }
 
-impl<S: PoolSession> PooledConnection<S> {
-    fn score(&self, active_streams: usize, buffered_stream_bytes: usize) -> ConnectionScore {
-        ConnectionScore {
-            active_streams,
-            buffered_stream_bytes,
-            last_selected_tick: self.last_selected_tick.load(Ordering::Relaxed),
-            created_at: self.created_at,
-            seq: self.seq,
-        }
-    }
-
-    fn state(&self) -> ConnectionState {
-        ConnectionState::from_u8(self.state.load(Ordering::Relaxed))
-    }
-
-    fn mark_selected(&self, tick: u64) {
-        self.last_selected_tick.store(tick, Ordering::Relaxed);
-    }
-
-    fn mark_draining(&self) -> bool {
-        self.state
-            .compare_exchange(
-                ConnectionState::Active.as_u8(),
-                ConnectionState::Draining.as_u8(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
-            .is_ok()
-    }
-
-    fn mark_closed(&self) -> bool {
-        let previous = self
-            .state
-            .swap(ConnectionState::Closed.as_u8(), Ordering::Relaxed);
-        previous != ConnectionState::Closed.as_u8()
-    }
-}
-
 impl Drop for AcquireWaiterGuard<'_> {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ConnectionScore {
-    active_streams: usize,
-    buffered_stream_bytes: usize,
-    last_selected_tick: u64,
-    created_at: Instant,
-    seq: u64,
-}
-
-impl TunnelConnector for DefaultConnector {
-    type Session = LivePoolSession;
-
-    fn connect(&self) -> BoxFuture<'_, Result<Arc<LivePoolSession>, anyhow::Error>> {
-        let session_config = self.session_config.clone();
-        let connect_options = self.connect_options.clone();
-        async move {
-            let template_bytes = connect_options.custom_template_bytes.read().await;
-            let tunnel = kanotls_tunnel::client::client_tunnel(
-                &connect_options.server_addr,
-                &connect_options.sni,
-                &connect_options.psk,
-                connect_options.insecure,
-                connect_options.fingerprint.as_deref(),
-                template_bytes.as_deref(),
-            )
-            .await?;
-
-            let session = Arc::new(Session::new(tunnel, session_config, None));
-            let read_loop = session.clone();
-            tokio::spawn(async move {
-                let _ = read_loop.run_read_loop().await;
-            });
-
-            Ok(Arc::new(LivePoolSession { session }))
-        }
-        .boxed()
-    }
-}
-
-impl PoolSession for LivePoolSession {
-    fn open_stream(&self) -> BoxFuture<'_, Result<Stream, anyhow::Error>> {
-        async move { self.session.open_stream().await }.boxed()
-    }
-
-    fn active_streams(&self) -> usize {
-        self.session.active_stream_count()
-    }
-
-    fn buffered_stream_bytes(&self) -> usize {
-        self.session.buffered_stream_bytes()
-    }
-
-    fn is_alive(&self) -> bool {
-        self.session.is_alive()
-    }
-
-    fn is_closing(&self) -> bool {
-        self.session.is_closing()
-    }
-
-    fn force_close(&self) {
-        self.session.force_close();
-    }
-}
-
-impl PoolBehaviorContext {
-    fn from_connect_options(connect_options: &ClientPoolConnectOptions) -> Self {
-        let startup_epoch_secs = current_unix_epoch_secs();
-        Self {
-            fingerprint_family: kanotls_config::normalize_tls_fingerprint(
-                connect_options.fingerprint.as_deref().unwrap_or("firefox"),
-            )
-            .unwrap_or("firefox")
-            .to_string(),
-            sni: connect_options.sni.trim().to_ascii_lowercase(),
-            startup_epoch_secs,
-            time_of_day_bucket: (startup_epoch_secs % 86_400) / TIME_OF_DAY_BUCKET_SECS,
-            random_nonce: rand::random::<u64>(),
-        }
-    }
-
-    #[cfg(test)]
-    fn for_test() -> Self {
-        Self {
-            fingerprint_family: "firefox".to_string(),
-            sni: "example.com".to_string(),
-            startup_epoch_secs: 1_700_000_000,
-            time_of_day_bucket: 3,
-            random_nonce: 0xDEADBEEF,
-        }
-    }
-
-    fn seed(&self) -> u64 {
-        let mut seed = 0xcbf29ce484222325u64;
-        seed = hash_bytes(seed, self.fingerprint_family.as_bytes());
-        seed = hash_bytes(seed, self.sni.as_bytes());
-        seed = hash_u64(seed, self.time_of_day_bucket);
-        seed = hash_u64(seed, self.startup_epoch_secs);
-        seed = hash_u64(seed, self.random_nonce);
-
-        let temporal_salt = current_unix_epoch_secs() / 3600;
-        seed ^= temporal_salt.wrapping_mul(0x9e3779b97f4a7c15);
-
-        seed
-    }
-}
-
-fn current_unix_epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn hash_bytes(mut seed: u64, bytes: &[u8]) -> u64 {
-    for byte in bytes {
-        seed ^= u64::from(*byte);
-        seed = seed.wrapping_mul(0x100000001b3);
-    }
-    seed
-}
-
-fn hash_u64(seed: u64, value: u64) -> u64 {
-    hash_bytes(seed, &value.to_le_bytes())
-}
-
-fn derive_seed(seed: u64, salt: u64) -> u64 {
-    splitmix64(seed ^ salt.wrapping_mul(0x9e3779b97f4a7c15))
-}
-
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
-}
-
-fn seeded_usize_inclusive(seed: u64, min: usize, max: usize) -> usize {
-    if min >= max {
-        min
-    } else {
-        min + (splitmix64(seed) as usize % (max - min + 1))
-    }
-}
-
-fn seeded_u64_inclusive(seed: u64, min: u64, max: u64) -> u64 {
-    if min >= max {
-        min
-    } else {
-        min + (splitmix64(seed) % (max - min + 1))
     }
 }
 
@@ -986,7 +589,11 @@ struct TestPoolSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use crate::behavior::PoolBehaviorContext;
+    use crate::PoolSession;
+    use futures::future::BoxFuture;
+    use futures::FutureExt;
+    use std::sync::atomic::{AtomicU8, AtomicUsize};
 
     type TestPool = ClientPool<FakeConnector>;
 
@@ -1088,7 +695,7 @@ mod tests {
             behavior: PoolBehaviorConfig,
             connector: Arc<FakeConnector>,
         ) -> Self {
-            Self::new_impl(
+            Self::new(
                 session_config,
                 behavior,
                 PoolBehaviorContext::for_test(),

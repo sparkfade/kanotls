@@ -1,20 +1,21 @@
+use crate::connector::{KanotlsConnector, TunnelConnectOptions};
+use crate::{relay, template_watch};
 use kanotls_config::client::load_client_config;
 use kanotls_config::{find_routing_rule, ClientConfig, ClientOutbound};
-use kanotls_proto::http::{parse_http_inbound, relay_http_connect, write_http_connect_success};
-use kanotls_proto::socks5::{
-    parse_socks5_inbound, relay_socks5_connect, write_socks5_connect_success,
-    write_socks5_udp_success, Socks5Request,
-};
-use kanotls_session::{ClientPool, ClientPoolConnectOptions, PoolBehaviorConfig, SessionConfig};
+use kanotls_pool::{ClientPool, PoolBehaviorConfig, PoolBehaviorContext};
+use kanotls_proto::inbound::{InboundKind, InboundRequest};
+use kanotls_session::SessionConfig;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, Semaphore};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 const MAX_CONCURRENT_CLIENT_CONNECTIONS: usize = 4096;
 const MIN_CLIENT_IDLE_TIMEOUT_SECS: u64 = 5;
 const MAX_CLIENT_IDLE_TIMEOUT_SECS: u64 = 3600;
+
+type TunnelPool = ClientPool<KanotlsConnector>;
 
 pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
     let config = load_client_config(config_path)?;
@@ -43,46 +44,13 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
         .or_else(|| Some("firefox".to_string()));
     let tpl_path = outbound.settings.tls.template_path.as_ref();
 
-    const TEMPLATE_RELOAD_INTERVAL_SECS: u64 = 30;
-
     let custom_template_bytes = Arc::new(RwLock::new(match tpl_path {
         Some(path) => Some(kanotls_tunnel::templates::load_and_validate_custom_template(path)?),
         None => None,
     }));
 
     if let Some(path_str) = tpl_path.cloned() {
-        let watcher_bytes = custom_template_bytes.clone();
-        tokio::spawn(async move {
-            let mut ticker =
-                tokio::time::interval(Duration::from_secs(TEMPLATE_RELOAD_INTERVAL_SECS));
-            ticker.tick().await;
-            let mut last_mtime = std::time::SystemTime::UNIX_EPOCH;
-            loop {
-                ticker.tick().await;
-                match tokio::fs::metadata(&path_str).await {
-                    Ok(meta) => match meta.modified() {
-                        Ok(mtime) if mtime > last_mtime => {
-                            last_mtime = mtime;
-                            match kanotls_tunnel::templates::load_and_validate_custom_template(
-                                &path_str,
-                            ) {
-                                Ok(bytes) => {
-                                    *watcher_bytes.write().await = Some(bytes);
-                                    kanotls_tunnel::invalidate_client_hello_template_cache();
-                                    info!("hot-reloaded ClientHello template from {}", path_str);
-                                }
-                                Err(e) => {
-                                    warn!("hot-reload: failed to parse template {}: {} (keeping previous)", path_str, e);
-                                }
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(e) => warn!("hot-reload: failed to read mtime of {}: {}", path_str, e),
-                    },
-                    Err(e) => warn!("hot-reload: failed to stat {}: {}", path_str, e),
-                }
-            }
-        });
+        template_watch::spawn_template_watcher(path_str, custom_template_bytes.clone());
     }
 
     let max_streams_per_session = outbound
@@ -109,30 +77,42 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
         .session
         .as_ref()
         .is_some_and(|s| s.post_script_shaping.as_deref() == Some("off"));
-    let pool = Arc::new(ClientPool::new(
-        SessionConfig::with_script(
-            true,
-            max_streams_per_session,
-            idle_timeout_secs,
-            traffic_script,
-            post_script_off,
-        ),
-        ClientPoolConnectOptions {
-            server_addr: server_addr.clone(),
-            sni: sni.clone(),
-            psk: password.as_bytes().to_vec(),
-            insecure,
-            fingerprint: fingerprint.clone(),
-            custom_template_bytes: custom_template_bytes.clone(),
-        },
+    let session_config = SessionConfig::with_script(
+        true,
+        max_streams_per_session,
+        idle_timeout_secs,
+        traffic_script,
+        post_script_off,
+    );
+    let fingerprint_family = kanotls_config::normalize_tls_fingerprint(
+        fingerprint.as_deref().unwrap_or("firefox"),
+    )
+    .unwrap_or("firefox");
+    let pool = Arc::new(TunnelPool::new(
+        session_config.clone(),
         PoolBehaviorConfig::from_psk(password.as_bytes(), &install_salt),
+        PoolBehaviorContext::new(fingerprint_family, &sni),
+        Arc::new(KanotlsConnector::new(
+            session_config,
+            TunnelConnectOptions {
+                server_addr,
+                sni,
+                psk: password.as_bytes().to_vec(),
+                insecure,
+                fingerprint,
+                custom_template_bytes,
+            },
+        )),
     ));
 
     let mut handles = vec![];
     let connection_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENT_CONNECTIONS));
     for inbound in &config.inbounds {
         let listen_addr = format!("{}:{}", inbound.listen, inbound.port);
-        let protocol = inbound.protocol.clone();
+        let Some(kind) = InboundKind::from_protocol(&inbound.protocol) else {
+            error!("unsupported protocol: {}", inbound.protocol);
+            continue;
+        };
         let inbound_tag = inbound.tag.clone();
         let selected_outbound_tag = select_client_outbound_tag(&config, inbound_tag.as_deref())?;
         let pool_clone = pool.clone();
@@ -148,7 +128,9 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
             };
             info!(
                 "{} proxy listening on {} via outbound {}",
-                protocol, listen_addr, selected_outbound_tag
+                kind.as_str(),
+                listen_addr,
+                selected_outbound_tag
             );
 
             let mut accept_error_delay = Duration::from_millis(10);
@@ -169,21 +151,11 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
                                 continue;
                             }
                         };
-                        let p = protocol.clone();
                         let pool = pool_clone.clone();
 
                         tokio::spawn(async move {
                             let _permit = permit;
-                            let result = match p.as_str() {
-                                "socks5" | "socks" => handle_socks5_connection(local, &pool).await,
-                                "http" => handle_http_connection(local, &pool).await,
-                                _ => {
-                                    error!("unsupported protocol: {}", p);
-                                    return;
-                                }
-                            };
-
-                            if let Err(e) = result {
+                            if let Err(e) = handle_inbound_connection(local, kind, &pool).await {
                                 debug!("proxy error for {}: {}", addr, e);
                             }
                         });
@@ -257,54 +229,32 @@ fn first_outbound_tag(outbounds: &[ClientOutbound]) -> String {
         .unwrap_or_else(|| "<unnamed>".to_string())
 }
 
-async fn handle_socks5_connection(
+async fn handle_inbound_connection(
     local: tokio::net::TcpStream,
-    pool: &Arc<ClientPool>,
+    kind: InboundKind,
+    pool: &Arc<TunnelPool>,
 ) -> anyhow::Result<()> {
     let client_ip = local.peer_addr()?.ip();
-    match parse_socks5_inbound(local).await? {
-        Socks5Request::Connect {
-            local_reader,
-            mut local_writer,
-            target,
-        } => {
+    match kind.handshake(local).await? {
+        InboundRequest::Connect(mut handshake) => {
             let mut stream = pool.open_stream().await?;
-            stream.defer_target(target.as_bytes());
-            write_socks5_connect_success(&mut local_writer).await?;
-            let (tx, rx) = relay_socks5_connect(local_reader, local_writer, stream).await?;
-            debug!("socks5 relay done: tx={} rx={}", tx, rx);
+            stream.defer_target(&handshake.target.encode_wire());
+            handshake.reply_success().await?;
+            let (tx, rx) =
+                relay::relay_tcp_client(handshake.reader, handshake.writer, stream).await?;
+            debug!("{} relay done: tx={} rx={}", kind.as_str(), tx, rx);
         }
-        Socks5Request::UdpAssociate {
-            local_reader,
-            mut local_writer,
-            udp,
-            target,
-        } => {
-            let udp_addr = udp.local_addr()?;
+        InboundRequest::UdpAssociate(mut handshake) => {
             let mut stream = pool.open_stream().await?;
-            stream.write_early(target.as_bytes()).await?;
+            stream.write_early(&handshake.target.encode_wire()).await?;
             stream.wait_open().await?;
-            write_socks5_udp_success(&mut local_writer, udp_addr).await?;
+            handshake.reply_success().await?;
             let result =
-                kanotls_proto::uot::relay_udp_client_mode(stream, udp, client_ip, local_reader)
+                relay::relay_udp_client_mode(stream, handshake.udp, client_ip, handshake.reader)
                     .await;
-            drop(local_writer);
+            drop(handshake.writer);
             result?;
         }
     }
-    Ok(())
-}
-
-async fn handle_http_connection(
-    local: tokio::net::TcpStream,
-    pool: &Arc<ClientPool>,
-) -> anyhow::Result<()> {
-    let req = parse_http_inbound(local).await?;
-    let mut stream = pool.open_stream().await?;
-    stream.defer_target(req.target.as_bytes());
-    let mut local_writer = req.local_writer;
-    write_http_connect_success(&mut local_writer).await?;
-    let (tx, rx) = relay_http_connect(req.local_reader, local_writer, stream).await?;
-    debug!("http relay done: tx={} rx={}", tx, rx);
     Ok(())
 }

@@ -1,4 +1,3 @@
-pub mod client_pool;
 pub mod frame;
 pub mod server;
 pub mod session;
@@ -11,7 +10,6 @@ pub const RELAY_CHUNK_SIZE: usize = 64 * 1024;
 /// 整批切分（bulk fast path）还是按采样尺寸逐条整形发出。
 pub(crate) const MAX_PENDING_FLUSH_SIZE: usize = 256 * 1024;
 
-pub use client_pool::{ClientPool, ClientPoolConnectOptions, PoolBehaviorConfig};
 pub use session::{Session, SessionConfig};
 pub use stream::Stream;
 

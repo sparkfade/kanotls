@@ -1,5 +1,5 @@
 [package]
-name = "kanotls-session"
+name = "kanotls-pool"
 version = "1.2.0"
 edition.workspace = true
 
@@ -8,10 +8,5 @@ tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 rand.workspace = true
-bytes.workspace = true
-kanotls-config = { path = "../config" }
-kanotls-tunnel = { path = "../tunnel" }
-snow.workspace = true
-
-[dev-dependencies]
 futures.workspace = true
+kanotls-session = { path = "../session" }

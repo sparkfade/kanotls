@@ -4,6 +4,7 @@ members = [
     "crates/tunnel",
     "crates/session",
     "crates/proto",
+    "crates/pool",
     "kanotls",
 ]
 resolver = "2"

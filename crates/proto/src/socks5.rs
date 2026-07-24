@@ -1,4 +1,5 @@
-use kanotls_session::Stream;
+use crate::inbound::{InboundRequest, UdpHandshake};
+use crate::target::Host;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
@@ -13,34 +14,20 @@ const REP_SUCCEEDED: u8 = 0x00;
 const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const LOCAL_PROTOCOL_TIMEOUT_SECS: u64 = 10;
 
-pub enum Socks5Request {
-    Connect {
-        local_reader: tokio::net::tcp::OwnedReadHalf,
-        local_writer: tokio::net::tcp::OwnedWriteHalf,
-        target: String,
-    },
-    UdpAssociate {
-        local_reader: tokio::net::tcp::OwnedReadHalf,
-        local_writer: tokio::net::tcp::OwnedWriteHalf,
-        udp: UdpSocket,
-        target: String,
-    },
-}
-
-pub async fn parse_socks5_inbound(
+/// SOCKS5 入站握手（server 侧）：解析 greeting 与请求，
+/// 产出统一握手结构。成功应答由 `InboundRequest::reply_success` 发出。
+pub(crate) async fn handshake(
     local: tokio::net::TcpStream,
-) -> Result<Socks5Request, anyhow::Error> {
+) -> Result<InboundRequest, anyhow::Error> {
     tokio::time::timeout(
         std::time::Duration::from_secs(LOCAL_PROTOCOL_TIMEOUT_SECS),
-        parse_socks5_inbound_inner(local),
+        handshake_inner(local),
     )
     .await
     .map_err(|_| anyhow::anyhow!("socks5 request timeout"))?
 }
 
-async fn parse_socks5_inbound_inner(
-    local: tokio::net::TcpStream,
-) -> Result<Socks5Request, anyhow::Error> {
+async fn handshake_inner(local: tokio::net::TcpStream) -> Result<InboundRequest, anyhow::Error> {
     let (mut reader, mut writer) = local.into_split();
     let mut head = [0u8; 2];
     reader.read_exact(&mut head).await?;
@@ -71,27 +58,23 @@ async fn parse_socks5_inbound_inner(
     let cmd = req[1];
     let atyp = req[3];
 
-    let addr = read_address(atyp, &mut reader).await?;
-    debug!("socks5: cmd={} addr={}:{}", cmd, addr.0, addr.1);
+    let (host, port) = read_address(atyp, &mut reader).await?;
+    debug!("socks5: cmd={} addr={}:{}", cmd, host, port);
 
     match cmd {
-        CMD_CONNECT => {
-            let target = format!("{}:{}", addr.0, addr.1);
-            Ok(Socks5Request::Connect {
-                local_reader: reader,
-                local_writer: writer,
-                target,
-            })
-        }
+        CMD_CONNECT => Ok(InboundRequest::connect_socks5(
+            reader,
+            writer,
+            crate::target::Target::tcp(host, port),
+        )),
         CMD_UDP_ASSOCIATE => {
-            let target = format!("udp:{}:{}", addr.0, addr.1);
             let udp = UdpSocket::bind("127.0.0.1:0").await?;
-            Ok(Socks5Request::UdpAssociate {
-                local_reader: reader,
-                local_writer: writer,
+            Ok(InboundRequest::UdpAssociate(UdpHandshake::socks5(
+                reader,
+                writer,
                 udp,
-                target,
-            })
+                crate::target::Target::udp(host, port),
+            )))
         }
         _ => {
             writer
@@ -102,27 +85,12 @@ async fn parse_socks5_inbound_inner(
     }
 }
 
-pub async fn write_socks5_connect_success(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-) -> Result<(), anyhow::Error> {
-    writer.write_all(&socks_reply(REP_SUCCEEDED)).await?;
-    Ok(())
+pub(crate) fn connect_success_reply() -> Vec<u8> {
+    socks_reply(REP_SUCCEEDED).to_vec()
 }
 
-pub async fn write_socks5_udp_success(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    udp_addr: std::net::SocketAddr,
-) -> Result<(), anyhow::Error> {
-    writer.write_all(&socks_udp_reply(udp_addr)?).await?;
-    Ok(())
-}
-
-pub async fn relay_socks5_connect(
-    local_reader: impl AsyncReadExt + Unpin,
-    local_writer: impl AsyncWriteExt + Unpin,
-    remote: Stream,
-) -> Result<(u64, u64), anyhow::Error> {
-    crate::relay_bidirectional(local_reader, local_writer, remote).await
+pub(crate) fn udp_success_reply(addr: std::net::SocketAddr) -> Result<Vec<u8>, anyhow::Error> {
+    socks_udp_reply(addr)
 }
 
 const METHOD_USER_PASS: u8 = 0x02;
@@ -348,14 +316,14 @@ fn resolve_zero_bind(
 async fn read_address(
     atyp: u8,
     reader: &mut tokio::net::tcp::OwnedReadHalf,
-) -> Result<(String, u16), anyhow::Error> {
+) -> Result<(Host, u16), anyhow::Error> {
     match atyp {
         0x01 => {
             let mut data = [0u8; 6];
             reader.read_exact(&mut data).await?;
-            let ip = format!("{}.{}.{}.{}", data[0], data[1], data[2], data[3]);
+            let ip = std::net::Ipv4Addr::new(data[0], data[1], data[2], data[3]);
             let port = u16::from_be_bytes([data[4], data[5]]);
-            Ok((ip, port))
+            Ok((Host::Ipv4(ip), port))
         }
         0x03 => {
             let mut len = [0u8; 1];
@@ -370,7 +338,7 @@ async fn read_address(
             reader.read_exact(&mut port_buf).await?;
             let domain = String::from_utf8(domain)?;
             let port = u16::from_be_bytes(port_buf);
-            Ok((domain, port))
+            Ok((Host::Domain(domain), port))
         }
         0x04 => {
             let mut data = [0u8; 18];
@@ -379,7 +347,7 @@ async fn read_address(
             octets.copy_from_slice(&data[..16]);
             let ip = std::net::Ipv6Addr::from(octets);
             let port = u16::from_be_bytes([data[16], data[17]]);
-            Ok((format!("[{}]", ip), port))
+            Ok((Host::Ipv6(ip), port))
         }
         _ => anyhow::bail!("unknown socks5 atyp: {}", atyp),
     }

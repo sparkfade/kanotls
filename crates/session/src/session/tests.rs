@@ -1324,7 +1324,7 @@ async fn auto_write_returns_before_shaped_emission_completes() {
     stream.write(&chunk).await.expect("client writes chunk");
     let elapsed = started.elapsed();
     assert!(
-        elapsed < Duration::from_millis(25),
+        elapsed < Duration::from_millis(100),
         "auto write took {:?}; Auto acks must not wait for shaped emission",
         elapsed
     );

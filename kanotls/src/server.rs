@@ -1,48 +1,22 @@
-use anyhow::Context;
+use crate::relay;
 use kanotls_config::server::load_server_config;
 use kanotls_config::{find_routing_rule, ServerConfig};
-use kanotls_proto::socks5::{
-    socks5_handshake, socks5_send_connect, socks5_send_udp_associate, Socks5Target,
-};
-use kanotls_proto::target::{is_blocked_destination, parse_authority_target};
-use kanotls_proto::uot::{
-    decode_socks5_udp, decode_udp_packet, encode_socks5_udp, encode_udp_packet,
-};
+use kanotls_proto::outbound::Outbound;
+use kanotls_proto::target::{Network, Target};
 use kanotls_session::{
     server::{ServerSessionHandler, ServerStream},
-    SessionConfig, RELAY_CHUNK_SIZE,
+    SessionConfig,
 };
 use kanotls_tunnel::{init_entropy_pool, server_accept, validate_camouflage_endpoint};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::Semaphore;
-use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 const MAX_CONCURRENT_SERVER_CONNECTIONS: usize = 4096;
-
-#[derive(Clone)]
-enum ServerOutbound {
-    Direct,
-    Socks5 {
-        address: String,
-        username: Option<String>,
-        password: Option<String>,
-    },
-}
 
 pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
     let config = load_server_config(config_path)?;
@@ -172,13 +146,13 @@ pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
 }
 
 async fn handle_server_conn(
-    tcp: TcpStream,
+    tcp: tokio::net::TcpStream,
     addr: SocketAddr,
     psk: &str,
     camouflage_host: &str,
     camouflage_port: u16,
     session_config: SessionConfig,
-    outbound: ServerOutbound,
+    outbound: Outbound,
 ) -> anyhow::Result<()> {
     let tunnel = server_accept(tcp, psk.as_bytes(), camouflage_host, camouflage_port).await?;
     info!("client {} connected", addr);
@@ -207,7 +181,7 @@ async fn handle_server_conn(
 fn resolve_server_outbound(
     config: &ServerConfig,
     inbound_tag: Option<&str>,
-) -> anyhow::Result<ServerOutbound> {
+) -> anyhow::Result<Outbound> {
     let outbound = match find_routing_rule(config.routing.as_ref(), inbound_tag) {
         Some(rule) => {
             let tag = rule.outbound_tag.as_str();
@@ -233,7 +207,7 @@ fn resolve_server_outbound(
     };
 
     match outbound.protocol.as_str() {
-        "direct" => Ok(ServerOutbound::Direct),
+        "direct" => Ok(Outbound::direct()),
         "socks5" => {
             let s = outbound
                 .settings
@@ -258,30 +232,9 @@ fn resolve_server_outbound(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty());
-            Ok(ServerOutbound::Socks5 {
-                address,
-                username,
-                password,
-            })
+            Ok(Outbound::socks5(address, username, password))
         }
         other => anyhow::bail!("unsupported outbound protocol: {}", other),
-    }
-}
-
-impl std::fmt::Display for ServerOutbound {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ServerOutbound::Direct => write!(f, "direct"),
-            ServerOutbound::Socks5 {
-                address, username, ..
-            } => {
-                if let Some(user) = username {
-                    write!(f, "socks5://{}@{}", user, address)
-                } else {
-                    write!(f, "socks5://{}", address)
-                }
-            }
-        }
     }
 }
 
@@ -289,7 +242,7 @@ async fn handle_server_stream(
     sid: u32,
     mut stream: ServerStream,
     first_data_timeout_secs: u64,
-    outbound: ServerOutbound,
+    outbound: Outbound,
 ) -> anyhow::Result<()> {
     let result =
         handle_server_stream_inner(sid, &mut stream, first_data_timeout_secs, &outbound).await;
@@ -301,7 +254,7 @@ async fn handle_server_stream_inner(
     sid: u32,
     stream: &mut ServerStream,
     first_data_timeout_secs: u64,
-    outbound: &ServerOutbound,
+    outbound: &Outbound,
 ) -> anyhow::Result<()> {
     let first_data = match tokio::time::timeout(
         std::time::Duration::from_secs(first_data_timeout_secs),
@@ -314,355 +267,22 @@ async fn handle_server_stream_inner(
         Err(_) => anyhow::bail!("stream first data timeout"),
     };
 
-    let target = String::from_utf8_lossy(&first_data).to_string();
+    let target = Target::decode_wire(&first_data)?;
     info!("stream {} connect to {}", sid, target);
 
-    if target.starts_with("udp:") {
-        stream.send_synack().await?;
-        match outbound {
-            ServerOutbound::Socks5 {
-                address,
-                username,
-                password,
-            } => {
-                let auth = username.as_deref().zip(password.as_deref());
-                relay_udp_via_socks5(stream, address, auth).await?;
-            }
-            ServerOutbound::Direct => {
-                let local_udp = UdpSocket::bind("0.0.0.0:0").await?;
-                debug!(
-                    "stream {} udp-over-tcp via {}",
-                    sid,
-                    local_udp.local_addr()?
-                );
-                relay_udp_server(stream, local_udp).await?;
-            }
+    match target.network {
+        Network::Udp => {
+            stream.send_synack().await?;
+            let relay = outbound.udp_associate().await?;
+            debug!("stream {} udp-over-tcp via {}", sid, relay.local_addr()?);
+            relay::relay_udp_server(stream, relay).await?;
         }
-    } else {
-        match outbound {
-            ServerOutbound::Socks5 {
-                address,
-                username,
-                password,
-            } => {
-                const SOCKS5_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
-                const SOCKS5_COMMAND_TIMEOUT_SECS: u64 = 10;
-
-                let (host, port) = parse_authority_target(&target)?;
-                if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                    let sock_addr = SocketAddr::new(ip, port);
-                    if is_blocked_destination(&sock_addr) {
-                        anyhow::bail!("blocked destination: {}", sock_addr);
-                    }
-                }
-
-                let socks_target = match host.parse::<std::net::IpAddr>() {
-                    Ok(ip) => Socks5Target::Ip(SocketAddr::new(ip, port)),
-                    Err(_) => Socks5Target::Domain(host.clone(), port),
-                };
-
-                let auth = username.as_deref().zip(password.as_deref());
-
-                let mut remote = tokio::time::timeout(
-                    Duration::from_secs(SOCKS5_HANDSHAKE_TIMEOUT_SECS),
-                    socks5_handshake(address, auth),
-                )
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "socks5 handshake to {} timed out after {}s",
-                        address,
-                        SOCKS5_HANDSHAKE_TIMEOUT_SECS
-                    )
-                })?
-                .with_context(|| format!("socks5 handshake to {} failed", address))?;
-
-                tokio::time::timeout(
-                    Duration::from_secs(SOCKS5_COMMAND_TIMEOUT_SECS),
-                    socks5_send_connect(&mut remote, socks_target),
-                )
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("socks5 CONNECT to {} via {} timed out", target, address)
-                })?
-                .with_context(|| format!("socks5 CONNECT to {} via {} failed", target, address))?;
-                remote.set_nodelay(true)?;
-                stream.send_synack().await?;
-                relay_tcp_server(stream, &mut remote).await?;
-            }
-            ServerOutbound::Direct => {
-                const DIRECT_CONNECT_TIMEOUT_SECS: u64 = 10;
-                let remote_addr = validate_remote_target(&target).await?;
-                let mut remote = tokio::time::timeout(
-                    Duration::from_secs(DIRECT_CONNECT_TIMEOUT_SECS),
-                    TcpStream::connect(remote_addr),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("direct connect to {} timed out", remote_addr))??;
-                remote.set_nodelay(true)?;
-                stream.send_synack().await?;
-                relay_tcp_server(stream, &mut remote).await?;
-            }
+        Network::Tcp => {
+            let mut remote = outbound.connect(&target).await?;
+            stream.send_synack().await?;
+            relay::relay_tcp_server(stream, &mut remote).await?;
         }
     }
 
     Ok(())
-}
-
-async fn validate_remote_target(target: &str) -> anyhow::Result<std::net::SocketAddr> {
-    let (host, port) = parse_authority_target(target)?;
-    let resolved = tokio::net::lookup_host((host.as_str(), port)).await?;
-    let mut first_allowed = None;
-    for addr in resolved {
-        if is_blocked_destination(&addr) {
-            debug!("skipping blocked destination address: {}", addr);
-            continue;
-        }
-        first_allowed.get_or_insert(addr);
-    }
-    first_allowed.ok_or_else(|| anyhow::anyhow!("unable to resolve target host"))
-}
-
-async fn relay_tcp_server(
-    stream: &mut ServerStream,
-    remote: &mut TcpStream,
-) -> Result<(), anyhow::Error> {
-    let mut buf = vec![0u8; RELAY_CHUNK_SIZE];
-    let mut stream_eof = false;
-    let mut remote_eof = false;
-    while !stream_eof || !remote_eof {
-        tokio::select! {
-            data = stream.read(), if !stream_eof => {
-                match data {
-                    Some(d) => {
-                        remote.write_all(&d).await?;
-                    }
-                    None => {
-                        let _ = remote.shutdown().await;
-                        stream_eof = true;
-                    }
-                }
-            }
-            result = remote.read(&mut buf), if !remote_eof => {
-                match result {
-                    Ok(0) => {
-                        let _ = stream.close_write().await;
-                        remote_eof = true;
-                    }
-                    Ok(n) => {
-                        stream.write(&buf[..n]).await?;
-                    }
-                    Err(e) => {
-                        debug!("remote read error: {}", e);
-                        let _ = stream.close_write().await;
-                        remote_eof = true;
-                    }
-                }
-            }
-        }
-    }
-    let _ = stream.close().await;
-    Ok(())
-}
-
-const UDP_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-
-async fn relay_udp_server(
-    stream: &mut ServerStream,
-    local: UdpSocket,
-) -> Result<(), anyhow::Error> {
-    let local = Arc::new(local);
-    let local_recv = local.clone();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(128);
-
-    let recv_task = tokio::spawn(async move {
-        let mut buf = vec![0u8; RELAY_CHUNK_SIZE];
-        while let Ok((n, addr)) = local_recv.recv_from(&mut buf).await {
-            match encode_udp_packet(&buf[..n], &addr) {
-                Ok(packet) => {
-                    if tx.send(packet).await.is_err() {
-                        break;
-                    }
-                }
-                Err(e) => debug!("udp encode error: {}", e),
-            }
-        }
-    });
-
-    // idle 定时器循环外创建：任一方向有流量才重置，持续空闲
-    // UDP_RELAY_IDLE_TIMEOUT 后结束中继。
-    let idle = tokio::time::sleep(UDP_RELAY_IDLE_TIMEOUT);
-    tokio::pin!(idle);
-    loop {
-        tokio::select! {
-            data = stream.read() => {
-                idle.as_mut().reset(Instant::now() + UDP_RELAY_IDLE_TIMEOUT);
-                match data {
-                    Some(d) => {
-                        if let Some((addr, payload)) = decode_udp_packet(&d) {
-                            if is_blocked_destination(&addr) {
-                                debug!("udp blocked: private addr {}", addr);
-                                continue;
-                            }
-                            let _ = local.send_to(&payload, addr).await;
-                        }
-                    }
-                    None => break,
-                }
-            }
-            Some(packet) = rx.recv() => {
-                idle.as_mut().reset(Instant::now() + UDP_RELAY_IDLE_TIMEOUT);
-                if let Err(e) = stream.write(&packet).await {
-                    debug!("udp write error: {}", e);
-                    break;
-                }
-            }
-            _ = &mut idle => {
-                debug!("udp relay idle timeout");
-                break;
-            }
-        }
-    }
-
-    recv_task.abort();
-    Ok(())
-}
-
-async fn relay_udp_via_socks5(
-    stream: &mut ServerStream,
-    socks5_addr: &str,
-    auth: Option<(&str, &str)>,
-) -> Result<(), anyhow::Error> {
-    // 1. establish TCP control channel and get UDP relay address
-    const SOCKS5_UDP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-    let mut tcp_control = tokio::time::timeout(
-        SOCKS5_UDP_HANDSHAKE_TIMEOUT,
-        socks5_handshake(socks5_addr, auth),
-    )
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "socks5 UDP handshake to {} timed out after {}s",
-            socks5_addr,
-            SOCKS5_UDP_HANDSHAKE_TIMEOUT.as_secs()
-        )
-    })??;
-    let relay_addr = tokio::time::timeout(
-        SOCKS5_UDP_HANDSHAKE_TIMEOUT,
-        socks5_send_udp_associate(&mut tcp_control),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("socks5 UDP ASSOCIATE to {} timed out", socks5_addr))??;
-    debug!(
-        "udp via socks5: relay address {} (control {})",
-        relay_addr, socks5_addr
-    );
-
-    // 2. bind local UDP socket for data channel
-    let local_udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-
-    // 3. TCP control channel liveness monitor
-    let control_alive = Arc::new(AtomicBool::new(true));
-    let alive_flag = control_alive.clone();
-    let _control_guard = AbortOnDrop(tokio::spawn(async move {
-        let mut ctrl = tcp_control;
-        let mut buf = [0u8; 1];
-        match ctrl.read(&mut buf).await {
-            Ok(0) | Err(_) => alive_flag.store(false, Ordering::SeqCst),
-            Ok(_) => {}
-        }
-    }));
-
-    // 4. UDP recv task: SOCKS5 relay -> UoT -> kanotls stream
-    let local_recv = local_udp.clone();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(128);
-    let recv_handle = tokio::spawn(async move {
-        let mut buf = vec![0u8; RELAY_CHUNK_SIZE];
-        while let Ok((n, src)) = local_recv.recv_from(&mut buf).await {
-            if src != relay_addr {
-                continue;
-            }
-            if let Some((src_addr, payload)) = decode_socks5_udp(&buf[..n]) {
-                match encode_udp_packet(&payload, &src_addr) {
-                    Ok(packet) => {
-                        if tx.send(packet).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => debug!("udp via socks5 encode error: {}", e),
-                }
-            }
-        }
-    });
-
-    // 5. main relay loop（idle 定时器循环外创建：任一方向有流量才重置，
-    // 持续空闲 UDP_RELAY_IDLE_TIMEOUT 后结束中继）
-    let idle = tokio::time::sleep(UDP_RELAY_IDLE_TIMEOUT);
-    tokio::pin!(idle);
-    loop {
-        tokio::select! {
-            data = stream.read() => {
-                idle.as_mut().reset(Instant::now() + UDP_RELAY_IDLE_TIMEOUT);
-                match data {
-                    Some(d) => {
-                        if let Some((target, payload)) = decode_udp_packet(&d) {
-                            if is_blocked_destination(&target) {
-                                debug!("udp via socks5 blocked: private addr {}", target);
-                                continue;
-                            }
-                            let packet = encode_socks5_udp(&payload, &target);
-                            let _ = local_udp.send_to(&packet, relay_addr).await;
-                        }
-                    }
-                    None => break,
-                }
-            }
-            Some(packet) = rx.recv() => {
-                idle.as_mut().reset(Instant::now() + UDP_RELAY_IDLE_TIMEOUT);
-                if let Err(e) = stream.write(&packet).await {
-                    debug!("udp via socks5 stream write error: {}", e);
-                    break;
-                }
-            }
-            _ = &mut idle => {
-                debug!("udp via socks5 relay idle timeout");
-                break;
-            }
-            _ = tokio::time::sleep(Duration::from_millis(500)), if !control_alive.load(Ordering::SeqCst) => {
-                recv_handle.abort();
-                anyhow::bail!("SOCKS5 UDP control channel closed");
-            }
-        }
-    }
-
-    recv_handle.abort();
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn split_host_port_supports_ipv4_domain_and_ipv6() {
-        assert_eq!(
-            parse_authority_target("example.com:443").unwrap(),
-            ("example.com".to_string(), 443)
-        );
-        assert_eq!(
-            parse_authority_target("1.2.3.4:80").unwrap(),
-            ("1.2.3.4".to_string(), 80)
-        );
-        assert_eq!(
-            parse_authority_target("[2001:db8::1]:443").unwrap(),
-            ("2001:db8::1".to_string(), 443)
-        );
-    }
-
-    #[test]
-    fn split_host_port_rejects_missing_or_zero_port() {
-        assert!(parse_authority_target("example.com").is_err());
-        assert!(parse_authority_target("example.com:0").is_err());
-        assert!(parse_authority_target("[2001:db8::1]:0").is_err());
-    }
 }
