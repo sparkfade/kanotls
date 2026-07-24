@@ -1,5 +1,8 @@
 mod client;
+mod connector;
+mod relay;
 mod server;
+mod template_watch;
 
 use clap::Parser;
 

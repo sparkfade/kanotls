@@ -1,31 +1,27 @@
-use crate::target::parse_authority_target;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use crate::inbound::InboundRequest;
+use crate::target::{parse_authority_target, Host, Target};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::debug;
 
 const MAX_REQUEST_LINE: usize = 8192;
 const MAX_HEADER_BLOCK: usize = 32 * 1024;
 const LOCAL_PROTOCOL_TIMEOUT_SECS: u64 = 10;
 
-pub struct HttpConnectRequest {
-    pub local_reader: tokio::net::tcp::OwnedReadHalf,
-    pub local_writer: tokio::net::tcp::OwnedWriteHalf,
-    pub target: String,
-}
+const CONNECT_SUCCESS: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 
-pub async fn parse_http_inbound(
+/// HTTP CONNECT 入站握手：解析请求行与头部块，产出统一握手结构。
+pub(crate) async fn handshake(
     local: tokio::net::TcpStream,
-) -> Result<HttpConnectRequest, anyhow::Error> {
+) -> Result<InboundRequest, anyhow::Error> {
     tokio::time::timeout(
         std::time::Duration::from_secs(LOCAL_PROTOCOL_TIMEOUT_SECS),
-        parse_http_inbound_inner(local),
+        handshake_inner(local),
     )
     .await
     .map_err(|_| anyhow::anyhow!("http CONNECT request timeout"))?
 }
 
-async fn parse_http_inbound_inner(
-    local: tokio::net::TcpStream,
-) -> Result<HttpConnectRequest, anyhow::Error> {
+async fn handshake_inner(local: tokio::net::TcpStream) -> Result<InboundRequest, anyhow::Error> {
     let (reader_init, mut writer) = local.into_split();
     let mut reader = BufReader::new(reader_init);
 
@@ -66,20 +62,15 @@ async fn parse_http_inbound_inner(
     debug!("http {} request to {}:{}", method, host, port);
 
     let local_reader = reader.into_inner();
-    Ok(HttpConnectRequest {
+    Ok(InboundRequest::connect_http(
         local_reader,
-        local_writer: writer,
-        target: format!("{}:{}", host, port),
-    })
+        writer,
+        Target::tcp(Host::from(host), port),
+    ))
 }
 
-pub async fn write_http_connect_success(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-) -> Result<(), anyhow::Error> {
-    writer
-        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        .await?;
-    Ok(())
+pub(crate) fn connect_success_reply() -> &'static [u8] {
+    CONNECT_SUCCESS
 }
 
 async fn read_limited_line(
@@ -109,14 +100,6 @@ async fn read_limited_line(
             return Ok(total);
         }
     }
-}
-
-pub async fn relay_http_connect(
-    local_reader: impl AsyncReadExt + Unpin,
-    local_writer: impl AsyncWriteExt + Unpin,
-    remote: kanotls_session::Stream,
-) -> Result<(u64, u64), anyhow::Error> {
-    crate::relay_bidirectional(local_reader, local_writer, remote).await
 }
 
 fn parse_connect_target(target: &str) -> Result<(String, u16), anyhow::Error> {

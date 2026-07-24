@@ -517,11 +517,13 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "kanotls"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures",
  "kanotls-config",
+ "kanotls-pool",
  "kanotls-proto",
  "kanotls-session",
  "kanotls-tunnel",
@@ -534,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "kanotls-config"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "rand",
@@ -544,18 +546,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "kanotls-proto"
-version = "1.1.1"
+name = "kanotls-pool"
+version = "1.2.0"
 dependencies = [
  "anyhow",
+ "futures",
  "kanotls-session",
+ "rand",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "kanotls-proto"
+version = "1.2.0"
+dependencies = [
+ "anyhow",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "kanotls-session"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -570,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "kanotls-tunnel"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "blake2",
