@@ -43,6 +43,7 @@ pub fn validate_client_config(config: &ClientConfig, config_path: &str) -> Resul
                 .outbounds
                 .iter()
                 .filter_map(|outbound| outbound.tag.as_deref()),
+            |_| None,
         )?;
     }
 
@@ -86,9 +87,9 @@ fn validate_client_outbound(
 ) -> Result<()> {
     let prefix = format!("outbounds[{}]", idx);
 
-    if outbound.protocol != "tunnel" {
+    if outbound.protocol != "kanotls" {
         bail!(
-            "{}: only 'tunnel' protocol is supported for client outbounds",
+            "{}: only 'kanotls' protocol is supported for client outbounds",
             prefix
         );
     }

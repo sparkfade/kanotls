@@ -20,6 +20,8 @@
 
 映射是确定性的：给定相同的 PSK 和 Noise initiator 状态，产生的 ClientHello 字段相同。服务端通过应用相同的 XOR 掩码恢复 Noise 临时密钥，重建 48 字节的 Noise init 消息（32B `e` + 16B tag），并完成 `NoiseState::read_message()`。
 
+**多用户认证。** 服务端入站配置 `users` 列表（`{name, password}`），每个密码在启动时经 `derive_psk()` 展开为独立的 `derived_psk`。握手时服务端将每个候选 PSK 逐一与 ClientHello 校验——临时密钥解掩、`read_message()`、计数器 MAC——首个全部通过的 PSK 即标识出认证用户（`crates/tunnel/src/server/mod.rs` 中的 `authenticate_client_hello()`）。单次探测仅需若干哈希加一次 AEAD 解密，因此每握手成本随用户数线性增长。识别出的用户名会附加到连接上，路由引擎可通过规则的 `auth_user` 字段按用户分流。
+
 ### 1.2 为什么使用双 Key Share？
 
 `key_share` 扩展包含每连接独立的新鲜随机 X25519 公钥。该密钥用于与参考（伪装）端点完成可见的 TLS 握手。它与 `random` 中的 Noise 密钥**密码学独立**。这防止被动观察者通过统计测试关联两个 32 字节字段——它们来自独立的熵源（`rand::thread_rng` vs `snow::Builder::build_initiator()`）。

@@ -30,6 +30,23 @@ pub fn validate_server_config(config: &ServerConfig, config_path: &str) -> Resul
     }
 
     if let Some(routing) = config.routing.as_ref() {
+        let inbound_user_map: std::collections::HashMap<
+            &str,
+            std::collections::HashSet<String>,
+        > = config
+            .inbounds
+            .iter()
+            .filter_map(|inbound| {
+                let tag = inbound.tag.as_deref()?;
+                let users = inbound
+                    .settings
+                    .users
+                    .iter()
+                    .map(|user| user.name.clone())
+                    .collect();
+                Some((tag, users))
+            })
+            .collect();
         validate_routing_rules(
             routing,
             config
@@ -40,6 +57,7 @@ pub fn validate_server_config(config: &ServerConfig, config_path: &str) -> Resul
                 .outbounds
                 .iter()
                 .filter_map(|outbound| outbound.tag.as_deref()),
+            |tag| inbound_user_map.get(tag),
         )?;
     }
 
@@ -49,9 +67,9 @@ pub fn validate_server_config(config: &ServerConfig, config_path: &str) -> Resul
 fn validate_server_inbound(inbound: &ServerInbound, idx: usize, config_path: &str) -> Result<()> {
     let prefix = format!("inbounds[{}]", idx);
 
-    if inbound.protocol != "tunnel" {
+    if inbound.protocol != "kanotls" {
         bail!(
-            "{}: only 'tunnel' protocol is supported for server inbounds",
+            "{}: only 'kanotls' protocol is supported for server inbounds",
             prefix
         );
     }
@@ -61,20 +79,41 @@ fn validate_server_inbound(inbound: &ServerInbound, idx: usize, config_path: &st
 
     let s = &inbound.settings;
 
-    if is_placeholder_password(&s.password) {
-        bail!(
-            "Detected unmodified default skeleton config.\n\
-             Please edit {} and replace the placeholder password.\n\
-             Generate a secure password: openssl rand -base64 48",
-            config_path
-        );
+    if s.users.is_empty() {
+        bail!("{}: settings.users must not be empty", prefix);
     }
-    if s.password.len() < 32 {
-        bail!(
-            "{}: password must be at least 32 bytes (got {})",
-            prefix,
-            s.password.len()
-        );
+    let mut seen_names = std::collections::HashSet::new();
+    let mut seen_passwords = std::collections::HashSet::new();
+    for (user_idx, user) in s.users.iter().enumerate() {
+        let user_prefix = format!("{}.settings.users[{}]", prefix, user_idx);
+        if user.name.trim().is_empty() {
+            bail!("{}: name must not be empty", user_prefix);
+        }
+        if !seen_names.insert(user.name.as_str()) {
+            bail!("{}: duplicate user name '{}'", user_prefix, user.name);
+        }
+        if is_placeholder_password(&user.password) {
+            bail!(
+                "Detected unmodified default skeleton config.\n\
+                 Please edit {} and replace the placeholder password.\n\
+                 Generate a secure password: openssl rand -base64 48",
+                config_path
+            );
+        }
+        if user.password.len() < 32 {
+            bail!(
+                "{}: password must be at least 32 bytes (got {})",
+                user_prefix,
+                user.password.len()
+            );
+        }
+        if !seen_passwords.insert(user.password.as_str()) {
+            bail!(
+                "{}: duplicate password (user '{}'); each user must have a distinct password",
+                user_prefix,
+                user.name
+            );
+        }
     }
 
     if s.camouflage.host.is_empty() {
@@ -147,4 +186,139 @@ fn validate_server_outbound(outbound: &Outbound, idx: usize) -> Result<()> {
         other => bail!("{}: unsupported protocol '{}'", prefix, other),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{
+        CamouflageConfig, KanotlsServerSettings, Routing, RoutingRule, ServerConfig, ServerInbound,
+        User,
+    };
+
+    fn user(name: &str, password: &str) -> User {
+        User {
+            name: name.to_string(),
+            password: password.to_string(),
+        }
+    }
+
+    const PW_A: &str = "password-a-0123456789-0123456789-abcdef";
+    const PW_B: &str = "password-b-0123456789-0123456789-abcdef";
+    const PW_C: &str = "password-c-0123456789-0123456789-abcdef";
+
+    fn server_config(users: Vec<User>, routing: Option<Routing>) -> ServerConfig {
+        ServerConfig {
+            log: None,
+            inbounds: vec![ServerInbound {
+                tag: Some("tls-in".to_string()),
+                listen: "0.0.0.0".to_string(),
+                port: 443,
+                protocol: "kanotls".to_string(),
+                settings: KanotlsServerSettings {
+                    users,
+                    camouflage: CamouflageConfig {
+                        host: "example.com".to_string(),
+                        port: 443,
+                    },
+                    session: None,
+                },
+            }],
+            outbounds: vec![
+                Outbound {
+                    tag: Some("direct".to_string()),
+                    protocol: "direct".to_string(),
+                    settings: None,
+                },
+                Outbound {
+                    tag: Some("socks-out".to_string()),
+                    protocol: "socks5".to_string(),
+                    settings: Some(serde_json::json!({
+                        "address": "127.0.0.1",
+                        "port": 1080
+                    })),
+                },
+            ],
+            routing,
+        }
+    }
+
+    #[test]
+    fn valid_multi_user_config_is_accepted() {
+        let config = server_config(
+            vec![user("1", PW_A), user("2", PW_B), user("3", PW_C)],
+            None,
+        );
+        assert!(validate_server_config(&config, "test.json").is_ok());
+    }
+
+    #[test]
+    fn empty_users_is_rejected() {
+        let config = server_config(vec![], None);
+        let err = validate_server_config(&config, "test.json").unwrap_err();
+        assert!(err.to_string().contains("users must not be empty"));
+    }
+
+    #[test]
+    fn duplicate_user_name_is_rejected() {
+        let config = server_config(vec![user("1", PW_A), user("1", PW_B)], None);
+        let err = validate_server_config(&config, "test.json").unwrap_err();
+        assert!(err.to_string().contains("duplicate user name '1'"));
+    }
+
+    #[test]
+    fn duplicate_password_is_rejected() {
+        let config = server_config(vec![user("1", PW_A), user("2", PW_A)], None);
+        let err = validate_server_config(&config, "test.json").unwrap_err();
+        assert!(err.to_string().contains("duplicate password"));
+    }
+
+    #[test]
+    fn short_password_is_rejected() {
+        let config = server_config(vec![user("1", "too-short")], None);
+        let err = validate_server_config(&config, "test.json").unwrap_err();
+        assert!(err.to_string().contains("at least 32 bytes"));
+    }
+
+    #[test]
+    fn legacy_tunnel_protocol_is_rejected() {
+        let mut config = server_config(vec![user("1", PW_A)], None);
+        config.inbounds[0].protocol = "tunnel".to_string();
+        let err = validate_server_config(&config, "test.json").unwrap_err();
+        assert!(err.to_string().contains("only 'kanotls' protocol"));
+    }
+
+    #[test]
+    fn routing_rule_with_unknown_auth_user_is_rejected() {
+        let routing = Routing {
+            rules: vec![RoutingRule {
+                inbound: vec!["tls-in".to_string()],
+                auth_user: Some(vec!["ghost".to_string()]),
+                outbound: "socks-out".to_string(),
+            }],
+        };
+        let config = server_config(vec![user("1", PW_A), user("2", PW_B)], Some(routing));
+        let err = validate_server_config(&config, "test.json").unwrap_err();
+        assert!(err.to_string().contains("auth_user 'ghost'"));
+    }
+
+    #[test]
+    fn routing_rule_with_known_auth_users_is_accepted() {
+        let routing = Routing {
+            rules: vec![
+                RoutingRule {
+                    inbound: vec!["tls-in".to_string()],
+                    auth_user: Some(vec!["1".to_string(), "2".to_string()]),
+                    outbound: "socks-out".to_string(),
+                },
+                RoutingRule {
+                    inbound: vec!["tls-in".to_string()],
+                    auth_user: None,
+                    outbound: "direct".to_string(),
+                },
+            ],
+        };
+        let config = server_config(vec![user("1", PW_A), user("2", PW_B)], Some(routing));
+        assert!(validate_server_config(&config, "test.json").is_ok());
+    }
 }

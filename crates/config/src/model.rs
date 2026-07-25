@@ -28,10 +28,10 @@ pub struct Routing {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingRule {
-    #[serde(rename = "type")]
-    pub rule_type: String,
-    pub inbound_tag: Vec<String>,
-    pub outbound_tag: String,
+    pub inbound: Vec<String>,
+    #[serde(default)]
+    pub auth_user: Option<Vec<String>>,
+    pub outbound: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,12 +40,18 @@ pub struct ServerInbound {
     pub listen: String,
     pub port: u16,
     pub protocol: String,
-    pub settings: TunnelServerSettings,
+    pub settings: KanotlsServerSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TunnelServerSettings {
+pub struct User {
+    pub name: String,
     pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KanotlsServerSettings {
+    pub users: Vec<User>,
     #[serde(alias = "reference")]
     pub camouflage: CamouflageConfig,
     pub session: Option<SessionConfig>,
@@ -69,11 +75,11 @@ pub struct ClientInbound {
 pub struct ClientOutbound {
     pub tag: Option<String>,
     pub protocol: String,
-    pub settings: TunnelClientSettings,
+    pub settings: KanotlsClientSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TunnelClientSettings {
+pub struct KanotlsClientSettings {
     pub server: String,
     pub port: u16,
     pub password: String,

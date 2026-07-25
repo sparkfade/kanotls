@@ -17,7 +17,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
 use crate::common::{
-    self, apply_tcp_keepalive, derive_psk, max_flight3_total_wire_len, SnowyStream, AEAD_TAG_LEN,
+    self, apply_tcp_keepalive, max_flight3_total_wire_len, SnowyStream, AEAD_TAG_LEN,
     FLIGHT3_CCS_RECORD, FLIGHT3_FINISHED_PLAINTEXT_LEN, FLIGHT3_FINISHED_RECORD_LEN,
     TLS_RECORD_HEADER_LEN,
 };
@@ -41,12 +41,112 @@ pub(super) enum FailureClass {
     CapacityLimited,
 }
 
+/// Outcome of a successful multi-user ClientHello authentication: the matched
+/// user index (into the PSK slice passed to [`server_accept`]), the Noise
+/// responder state built with that user's PSK, and the anti-replay ticket to
+/// commit once the handshake is fully accepted.
+struct AuthSuccess {
+    user_index: usize,
+    derived_psk: [u8; common::PSK_LEN],
+    noise: snow::HandshakeState,
+    replay_check: Option<ReplayCheck>,
+}
+
+/// Probes every candidate derived PSK against the ClientHello in `pld` and
+/// returns the first one that passes ephemeral-key unmasking, the Noise
+/// handshake message, the counter MAC and the replay-window checks. Each probe
+/// is a few hashes plus one AEAD decryption, so the cost stays linear in the
+/// number of configured users.
+fn authenticate_client_hello(
+    pld: &[u8],
+    derived_psks: &[[u8; common::PSK_LEN]],
+    client_noise_tag: &mut [u8; 16],
+    peer_addr: SocketAddr,
+) -> Option<AuthSuccess> {
+    let (random_range, session_id_range) = client_hello_random_and_session_id_ranges(pld)?;
+    let random = &pld[random_range];
+    let session_id = &pld[session_id_range];
+    if session_id.len() < 32 {
+        debug!(
+            "session_id too short for Noise auth: {} bytes (need >= 32)",
+            session_id.len()
+        );
+        return None;
+    }
+
+    let mut random_copy = [0u8; 32];
+    random_copy.copy_from_slice(random);
+    client_noise_tag.copy_from_slice(&session_id[..16]);
+
+    let mut masked_counter = [0u8; 8];
+    masked_counter.copy_from_slice(&session_id[16..24]);
+    let mut got_mac = [0u8; 8];
+    got_mac.copy_from_slice(&session_id[24..32]);
+    mask_mac_flags(&mut got_mac);
+
+    for (user_index, derived_psk) in derived_psks.iter().enumerate() {
+        let recovered_e = unmask_noise_ephemeral_key(&random_copy, derived_psk, client_noise_tag);
+        if recovered_e == [0u8; 32] {
+            continue;
+        }
+
+        let mut noise_init = [0u8; 48];
+        noise_init[..32].copy_from_slice(&recovered_e);
+        noise_init[32..48].copy_from_slice(&session_id[..16]);
+
+        let Ok(builder) = snow::Builder::new(common::NOISE_PARAMS.clone()).psk(0, derived_psk)
+        else {
+            continue;
+        };
+        let Ok(mut noise) = builder.build_responder() else {
+            continue;
+        };
+        match noise.read_message(&noise_init, &mut []) {
+            Ok(0) => {}
+            Ok(len) => {
+                debug!("unexpected Noise init plaintext length: {}", len);
+                continue;
+            }
+            Err(_) => continue,
+        }
+
+        let random_prefix: &[u8] = &random_copy[..16];
+        let want_mac = derive_counter_mac(derived_psk, &random_copy, &masked_counter, random_prefix);
+        let mut want_mac_masked = want_mac;
+        mask_mac_flags(&mut want_mac_masked);
+        if !constant_time_eq(&got_mac, &want_mac_masked) {
+            continue;
+        }
+
+        let check = check_counter_replay(derived_psk, &random_copy, masked_counter);
+        if check.is_none() {
+            continue;
+        }
+        if is_replay(&random_copy) {
+            warn!(
+                "replayed Noise client ephemeral rejected from {}",
+                peer_addr
+            );
+            continue;
+        }
+
+        return Some(AuthSuccess {
+            user_index,
+            derived_psk: *derived_psk,
+            noise,
+            replay_check: check,
+        });
+    }
+
+    None
+}
+
 pub async fn server_accept(
     mut tcp: TcpStream,
-    psk: &[u8],
+    derived_psks: &[[u8; common::PSK_LEN]],
     camouflage_host: &str,
     camouflage_port: u16,
-) -> Result<SnowyStream, anyhow::Error> {
+) -> Result<(SnowyStream, usize), anyhow::Error> {
     tcp.set_nodelay(true)?;
     let _ = apply_tcp_keepalive(&tcp);
     let handshake_permit = match HANDSHAKE_LIMITER.clone().try_acquire_owned() {
@@ -59,9 +159,9 @@ pub async fn server_accept(
     let peer_addr = tcp.peer_addr()?;
     debug!("new connection from {}", peer_addr);
 
-    let derived_psk = derive_psk(psk);
-    let builder = snow::Builder::new(common::NOISE_PARAMS.clone()).psk(0, &derived_psk)?;
-    let mut noise = builder.build_responder()?;
+    if derived_psks.is_empty() {
+        anyhow::bail!("server requires at least one user PSK");
+    }
     let mut client_noise_tag = [0u8; 16];
 
     let mut rx_buf = Vec::new();
@@ -101,84 +201,16 @@ pub async fn server_accept(
 
     let client_hello_server_name = extract_client_hello_server_name(&rx_buf).map(str::to_owned);
     let pld = &mut rx_buf[..];
-    let mut replay_check: Option<ReplayCheck> = None;
 
-    let is_auth_valid = if let Some((random_range, session_id_range)) =
-        client_hello_random_and_session_id_ranges(pld)
-    {
-        let random = &pld[random_range];
-        let session_id = &pld[session_id_range];
-        if session_id.len() >= 32 {
-            let mut random_copy = [0u8; 32];
-            random_copy.copy_from_slice(random);
-            client_noise_tag.copy_from_slice(&session_id[..16]);
+    let auth = authenticate_client_hello(pld, derived_psks, &mut client_noise_tag, peer_addr);
 
-            let recovered_e =
-                unmask_noise_ephemeral_key(&random_copy, &derived_psk, &client_noise_tag);
-
-            if recovered_e == [0u8; 32] {
-                false
-            } else {
-                let mut noise_init = [0u8; 48];
-                noise_init[..32].copy_from_slice(&recovered_e);
-                noise_init[32..48].copy_from_slice(&session_id[..16]);
-
-                match noise.read_message(&noise_init, &mut []) {
-                    Ok(0) => {
-                        let mut masked_counter = [0u8; 8];
-                        masked_counter.copy_from_slice(&session_id[16..24]);
-                        let mut got_mac = [0u8; 8];
-                        got_mac.copy_from_slice(&session_id[24..32]);
-                        mask_mac_flags(&mut got_mac);
-                        let random_prefix: &[u8] = &random_copy[..16];
-                        let want_mac = derive_counter_mac(
-                            &derived_psk,
-                            &random_copy,
-                            &masked_counter,
-                            random_prefix,
-                        );
-                        let mut want_mac_masked = want_mac;
-                        mask_mac_flags(&mut want_mac_masked);
-                        if !constant_time_eq(&got_mac, &want_mac_masked) {
-                            debug!("counter MAC verification failed");
-                            false
-                        } else {
-                            let check =
-                                check_counter_replay(&derived_psk, &random_copy, masked_counter);
-                            if check.is_none() {
-                                false
-                            } else if is_replay(&random_copy) {
-                                warn!(
-                                    "replayed Noise client ephemeral rejected from {}",
-                                    peer_addr
-                                );
-                                false
-                            } else {
-                                replay_check = check;
-                                true
-                            }
-                        }
-                    }
-                    Ok(len) => {
-                        debug!("unexpected Noise init plaintext length: {}", len);
-                        false
-                    }
-                    Err(_) => false,
-                }
-            }
-        } else {
-            debug!(
-                "session_id too short for Noise auth: {} bytes (need >= 32)",
-                session_id.len()
-            );
-            false
-        }
-    } else {
-        debug!("failed to extract random/session_id from ClientHello");
-        false
-    };
-
-    if !is_auth_valid {
+    let Some(AuthSuccess {
+        user_index,
+        derived_psk,
+        noise,
+        replay_check,
+    }) = auth
+    else {
         debug!("Noise authentication failed or missing, rejecting handshake");
         drop(handshake_permit);
         emit_pre_auth_failure(
@@ -190,7 +222,7 @@ pub async fn server_accept(
         )
         .await;
         anyhow::bail!("Noise authentication failed");
-    }
+    };
 
     let client_hello_server_name = match client_hello_server_name {
         Some(server_name) => server_name,
@@ -275,7 +307,10 @@ pub async fn server_accept(
 
     consume_client_flight3_ghost(&mut tcp, &mut noise).await?;
 
-    Ok(SnowyStream::new_with_permit(tcp, noise, Some(_session_permit)))
+    Ok((
+        SnowyStream::new_with_permit(tcp, noise, Some(_session_permit)),
+        user_index,
+    ))
 }
 
 pub(super) async fn consume_client_flight3_ghost(
@@ -428,10 +463,15 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    use crate::common::derive_psk;
     use crate::utils::{
         client_hello_key_share_range, derive_counter_cache_key, derive_counter_mask,
         stable_client_hello_fingerprint, xor_u64_bytes,
     };
+
+    fn test_psks(psk: &[u8]) -> Vec<[u8; common::PSK_LEN]> {
+        vec![derive_psk(psk)]
+    }
 
     lazy_static! {
         static ref PRE_AUTH_FALLBACK_TEST_LOCK: tokio::sync::Mutex<()> =
@@ -1193,8 +1233,9 @@ mod tests {
 
         let (release_tx, lock_thread) = hold_pre_auth_fallback_peer_counts_lock();
         let (mut client, server) = connected_tcp_pair().await;
+        let psks = test_psks(b"test-psk");
         let server_task =
-            tokio::spawn(async move { server_accept(server, b"test-psk", "localhost", 443).await });
+            tokio::spawn(async move { server_accept(server, &psks, "localhost", 443).await });
 
         client
             .write_all(&[0x16, 0x03, 0x03, 0x41, 0x01])
@@ -1230,9 +1271,10 @@ mod tests {
         ] {
             let (release_tx, lock_thread) = hold_pre_auth_fallback_peer_counts_lock();
             let (mut client, server) = connected_tcp_pair().await;
+            let psks = test_psks(b"test-psk");
             let server_task =
                 tokio::spawn(
-                    async move { server_accept(server, b"test-psk", "localhost", 443).await },
+                    async move { server_accept(server, &psks, "localhost", 443).await },
                 );
 
             client.write_all(&initial_record).await.unwrap();
@@ -1516,5 +1558,65 @@ mod tests {
         let mut want_mac_masked = want_mac;
         crate::utils::mask_mac_flags(&mut want_mac_masked);
         assert_eq!(got_mac, want_mac_masked);
+    }
+
+    fn build_auth_client_hello(psk: &[u8; 32]) -> Vec<u8> {
+        use crate::template::{get_or_build_client_hello_template, ConnectionCounter};
+
+        let cache_key = derive_counter_cache_key(psk);
+        {
+            let mut cache = COUNTER_CACHE.lock().unwrap();
+            let _ = cache.pop(&cache_key);
+        }
+
+        let mut initiator = snow::Builder::new(common::NOISE_PARAMS.clone())
+            .psk(0, psk)
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut noise_init = [0u8; 48];
+        initiator.write_message(&[], &mut noise_init).unwrap();
+
+        let counter = ConnectionCounter::new();
+        let template =
+            get_or_build_client_hello_template("example.com", Some("firefox"), None, true).unwrap();
+        template.instantiate(psk, &noise_init, counter.next()).unwrap()
+    }
+
+    #[test]
+    fn authenticate_client_hello_identifies_matching_user() {
+        let psk_a = derive_psk(b"multi-user-alice-password");
+        let psk_b = derive_psk(b"multi-user-bob-password");
+        let psks = vec![psk_a, psk_b];
+
+        let ch = build_auth_client_hello(&psk_b);
+        let mut tag = [0u8; 16];
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let auth = authenticate_client_hello(&ch, &psks, &mut tag, peer)
+            .expect("client hello should authenticate against the user list");
+
+        assert_eq!(auth.user_index, 1);
+        assert_eq!(auth.derived_psk, psk_b);
+    }
+
+    #[test]
+    fn authenticate_client_hello_rejects_when_no_user_matches() {
+        let psk_a = derive_psk(b"multi-user-carol-password");
+        let psk_b = derive_psk(b"multi-user-dave-password");
+        let wrong = vec![
+            derive_psk(b"multi-user-wrong-1-password"),
+            derive_psk(b"multi-user-wrong-2-password"),
+        ];
+
+        let ch = build_auth_client_hello(&psk_a);
+        let mut tag = [0u8; 16];
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        assert!(authenticate_client_hello(&ch, &wrong, &mut tag, peer).is_none());
+
+        let ch = build_auth_client_hello(&psk_b);
+        let single = vec![psk_b];
+        let auth = authenticate_client_hello(&ch, &single, &mut tag, peer)
+            .expect("single-user list should still authenticate");
+        assert_eq!(auth.user_index, 0);
     }
 }

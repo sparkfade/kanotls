@@ -7,9 +7,14 @@
       "tag": "tls-in",
       "listen": "0.0.0.0",
       "port": 443,
-      "protocol": "tunnel",
+      "protocol": "kanotls",
       "settings": {
-        "password": "CHANGE_ME_min_32_bytes_use_openssl_rand_-base64_48",
+        "users": [
+          {
+            "name": "1",
+            "password": "CHANGE_ME_min_32_bytes_use_openssl_rand_-base64_48"
+          }
+        ],
         "camouflage": {
           "host": "example.com",
           "port": 443
@@ -41,9 +46,8 @@
   "routing": {
     "rules": [
       {
-        "type": "field",
-        "inbound_tag": ["tls-in"],
-        "outbound_tag": "direct"
+        "inbound": ["tls-in"],
+        "outbound": "direct"
       }
     ]
   }

@@ -18,13 +18,23 @@ use tracing::{debug, error, info, warn};
 
 const MAX_CONCURRENT_SERVER_CONNECTIONS: usize = 4096;
 
+#[derive(Clone)]
+struct ServerConnContext {
+    user_names: Arc<Vec<String>>,
+    user_psks: Arc<Vec<[u8; kanotls_tunnel::PSK_LEN]>>,
+    camouflage_host: Arc<str>,
+    camouflage_port: u16,
+    session_config: SessionConfig,
+    config: Arc<ServerConfig>,
+    inbound_tag: Option<String>,
+}
+
 pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
-    let config = load_server_config(config_path)?;
+    let config = Arc::new(load_server_config(config_path)?);
     info!("loaded server config, {} inbounds", config.inbounds.len());
 
     let inbound = &config.inbounds[0];
-    let selected_outbound = resolve_server_outbound(&config, inbound.tag.as_deref())?;
-    info!("server outbound: {}", selected_outbound);
+    let inbound_tag = inbound.tag.clone();
     let camouflage_host = &inbound.settings.camouflage.host;
     let camouflage_port = inbound.settings.camouflage.port;
 
@@ -40,8 +50,20 @@ pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&listen_addr).await?;
     info!("server listening on {}", listen_addr);
 
-    let password = inbound.settings.password.clone();
-    let camouflage_host = camouflage_host.to_string();
+    let user_names: Vec<String> = inbound
+        .settings
+        .users
+        .iter()
+        .map(|user| user.name.clone())
+        .collect();
+    let user_psks: Vec<[u8; kanotls_tunnel::PSK_LEN]> = inbound
+        .settings
+        .users
+        .iter()
+        .map(|user| kanotls_tunnel::derive_psk(user.password.as_bytes()))
+        .collect();
+    info!("server inbound has {} users", user_names.len());
+    let camouflage_host: Arc<str> = Arc::from(camouflage_host.as_str());
     let max_streams_per_session = inbound
         .settings
         .session
@@ -72,6 +94,16 @@ pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
         post_script_off,
     );
 
+    let conn_ctx = ServerConnContext {
+        user_names: Arc::new(user_names),
+        user_psks: Arc::new(user_psks),
+        camouflage_host,
+        camouflage_port,
+        session_config,
+        config,
+        inbound_tag,
+    };
+
     let shutdown = tokio::sync::watch::channel(false);
     let mut shutdown_rx = shutdown.1.clone();
     let shutdown_tx = shutdown.0;
@@ -99,23 +131,11 @@ pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
                                 continue;
                             }
                         };
-                        let psk = password.clone();
-                        let host = camouflage_host.clone();
-                        let port = camouflage_port;
-                        let sess_cfg = session_config.clone();
-                        let outbound = selected_outbound.clone();
+                        let ctx = conn_ctx.clone();
 
                         tokio::spawn(async move {
                             let _permit = permit;
-                            if let Err(e) = handle_server_conn(
-                                tcp,
-                                addr,
-                                &psk,
-                                &host,
-                                port,
-                                sess_cfg,
-                                outbound,
-                            ).await {
+                            if let Err(e) = handle_server_conn(tcp, addr, &ctx).await {
                                 let msg = e.to_string();
                                 if msg.contains("session shutting down")
                                     || msg.contains("session closed")
@@ -148,15 +168,20 @@ pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
 async fn handle_server_conn(
     tcp: tokio::net::TcpStream,
     addr: SocketAddr,
-    psk: &str,
-    camouflage_host: &str,
-    camouflage_port: u16,
-    session_config: SessionConfig,
-    outbound: Outbound,
+    ctx: &ServerConnContext,
 ) -> anyhow::Result<()> {
-    let tunnel = server_accept(tcp, psk.as_bytes(), camouflage_host, camouflage_port).await?;
-    info!("client {} connected", addr);
+    let (tunnel, user_index) = server_accept(
+        tcp,
+        &ctx.user_psks,
+        &ctx.camouflage_host,
+        ctx.camouflage_port,
+    )
+    .await?;
+    let user_name = ctx.user_names[user_index].as_str();
+    let outbound = resolve_server_outbound(&ctx.config, ctx.inbound_tag.as_deref(), Some(user_name))?;
+    info!("client {} connected as user '{}'", addr, user_name);
 
+    let session_config = ctx.session_config.clone();
     let first_data_timeout = session_config.idle_timeout_secs.clamp(1, 30);
     let handler = ServerSessionHandler::new(tunnel, session_config);
 
@@ -181,10 +206,11 @@ async fn handle_server_conn(
 fn resolve_server_outbound(
     config: &ServerConfig,
     inbound_tag: Option<&str>,
+    auth_user: Option<&str>,
 ) -> anyhow::Result<Outbound> {
-    let outbound = match find_routing_rule(config.routing.as_ref(), inbound_tag) {
+    let outbound = match find_routing_rule(config.routing.as_ref(), inbound_tag, auth_user) {
         Some(rule) => {
-            let tag = rule.outbound_tag.as_str();
+            let tag = rule.outbound.as_str();
             config
                 .outbounds
                 .iter()
@@ -198,8 +224,9 @@ fn resolve_server_outbound(
         }
         None => {
             debug!(
-                "no routing rule matched inbound {:?}, falling back to outbound '{}'",
+                "no routing rule matched inbound {:?} user {:?}, falling back to outbound '{}'",
                 inbound_tag,
+                auth_user,
                 config.outbounds[0].tag.as_deref().unwrap_or("<unnamed>")
             );
             &config.outbounds[0]
