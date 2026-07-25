@@ -1279,7 +1279,12 @@ mod tests {
 
             client.write_all(&initial_record).await.unwrap();
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // While the peer-counts mutex is held, the server task blocks a
+            // runtime worker on that std mutex; awaiting a tokio timer here
+            // could starve the runtime's timer driver and deadlock the test.
+            // Sleep on the block_on thread instead — no runtime progress is
+            // needed until the mutex is released below.
+            std::thread::sleep(Duration::from_millis(100));
             assert!(!server_task.is_finished());
             assert_eq!(
                 PRE_AUTH_FALLBACK_LIMITER.available_permits(),
