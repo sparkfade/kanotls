@@ -95,15 +95,39 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
         Arc::new(KanotlsConnector::new(
             session_config,
             TunnelConnectOptions {
-                server_addr,
-                sni,
+                server_addr: server_addr.clone(),
+                sni: sni.clone(),
                 psk: password.as_bytes().to_vec(),
                 insecure,
-                fingerprint,
-                custom_template_bytes,
+                fingerprint: fingerprint.clone(),
+                custom_template_bytes: custom_template_bytes.clone(),
             },
         )),
     ));
+
+    // 启动预检：后台建立一次性隧道，尽早发现 PSK 不匹配或 tls.sni 与
+    // 服务端 camouflage.host 不一致——此类误配下服务端一律走 fallback
+    // 透明中继，客户端永远等不到 Noise 响应，此前只能在代理使用时才
+    // 暴露为晦涩错误。仅告警不中断：池会自行重试，瞬时网络故障不应
+    // 阻断客户端启动。
+    {
+        let preflight_server_addr = server_addr.clone();
+        let preflight_sni = sni.clone();
+        let preflight_psk = password.as_bytes().to_vec();
+        let preflight_fingerprint = fingerprint.clone();
+        let preflight_template_bytes = custom_template_bytes.clone();
+        tokio::spawn(async move {
+            preflight_tunnel_check(
+                &preflight_server_addr,
+                &preflight_sni,
+                &preflight_psk,
+                insecure,
+                preflight_fingerprint.as_deref(),
+                &preflight_template_bytes,
+            )
+            .await;
+        });
+    }
 
     let mut handles = vec![];
     let connection_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENT_CONNECTIONS));
@@ -187,8 +211,65 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_client_routing_runtime(config: &ClientConfig) -> anyhow::Result<()> {
-    // 配置校验已保证 outbounds 非空。
+/// 启动预检：建立一次性隧道并按失败形态分类诊断。
+/// 收到完整真实 flight 却找不到 Noise 响应，说明服务端拒绝认证后走了
+/// fallback 透明中继——只会是 PSK 不匹配或 tls.sni 与服务端
+/// camouflage.host 不一致（两者在客户端不可区分，一并提示）。
+async fn preflight_tunnel_check(
+    server_addr: &str,
+    sni: &str,
+    psk: &[u8],
+    insecure: bool,
+    fingerprint: Option<&str>,
+    custom_template_bytes: &RwLock<Option<Vec<u8>>>,
+) {
+    let template_bytes = custom_template_bytes.read().await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        kanotls_tunnel::client_tunnel(
+            server_addr,
+            sni,
+            psk,
+            insecure,
+            fingerprint,
+            template_bytes.as_deref(),
+        ),
+    )
+    .await;
+    drop(template_bytes);
+
+    match result {
+        Ok(Ok(mut tunnel)) => {
+            let _ = tokio::io::AsyncWriteExt::shutdown(&mut tunnel).await;
+            info!(
+                "preflight tunnel check ok: {} reachable, sni '{}' accepted",
+                server_addr, sni
+            );
+        }
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            if msg.contains("failed to locate Noise response") {
+                error!(
+                    "preflight tunnel check failed: server rejected authentication and fell back to the camouflage relay — verify the client password matches the server PSK, and that tls.sni ('{}') exactly matches the server camouflage.host",
+                    sni
+                );
+            } else {
+                error!(
+                    "preflight tunnel check failed: {} (check server address/port and network reachability)",
+                    msg
+                );
+            }
+        }
+        Err(_) => {
+            error!(
+                "preflight tunnel check timed out: {} unreachable or handshake stalled",
+                server_addr
+            );
+        }
+    }
+}
+
+fn validate_client_routing_runtime(config: &ClientConfig) -> anyhow::Result<()> {    // 配置校验已保证 outbounds 非空。
     let first_tag = config.outbounds[0].tag.as_deref();
 
     for rule in config
