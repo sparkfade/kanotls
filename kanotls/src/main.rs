@@ -49,13 +49,14 @@ fn detect_mode(config_content: &str) -> anyhow::Result<Mode> {
     let v: serde_json::Value = serde_json::from_str(config_content)?;
     let mut saw_server = false;
     let mut saw_client = false;
+    let mut saw_legacy_tunnel = false;
 
     if let Some(inbounds) = v.get("inbounds") {
         if let Some(inbounds) = inbounds.as_array() {
             for inbound in inbounds {
                 if let Some(protocol) = inbound.get("protocol") {
                     let p = protocol.as_str().unwrap_or("");
-                    if p == "tunnel" {
+                    if p == "kanotls" {
                         if let Some(settings) = inbound.get("settings") {
                             if settings.get("camouflage").is_some()
                                 || settings.get("reference").is_some()
@@ -63,6 +64,9 @@ fn detect_mode(config_content: &str) -> anyhow::Result<Mode> {
                                 saw_server = true;
                             }
                         }
+                    }
+                    if p == "tunnel" {
+                        saw_legacy_tunnel = true;
                     }
                     if p == "socks5" || p == "socks" || p == "http" {
                         saw_client = true;
@@ -72,14 +76,20 @@ fn detect_mode(config_content: &str) -> anyhow::Result<Mode> {
         }
     }
 
+    if saw_legacy_tunnel && !saw_server {
+        anyhow::bail!(
+            "protocol \"tunnel\" was renamed to \"kanotls\", and settings.password was replaced by settings.users ([{{\"name\", \"password\"}}]); please update the config"
+        );
+    }
+
     match (saw_server, saw_client) {
         (true, false) => Ok(Mode::Server),
         (false, true) => Ok(Mode::Client),
         (true, true) => anyhow::bail!(
-            "config matches both server and client layouts; keep tunnel camouflage in server configs and socks5/http in client configs"
+            "config matches both server and client layouts; keep kanotls camouflage in server configs and socks5/http in client configs"
         ),
         (false, false) => anyhow::bail!(
-            "config must contain either a tunnel inbound with camouflage/reference or a socks5/http inbound"
+            "config must contain either a kanotls inbound with camouflage/reference or a socks5/http inbound"
         ),
     }
 }

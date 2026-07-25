@@ -20,6 +20,8 @@ The outer TLS ClientHello carries a full `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`
 
 The mapping is deterministic: given the same PSK and Noise initiator state, the same ClientHello fields are produced. The server recovers the Noise ephemeral key by applying the same XOR mask, reconstructs the 48-byte Noise init message (32B `e` + 16B tag), and completes `NoiseState::read_message()`.
 
+**Multi-user authentication.** The server inbound is configured with a `users` list (`{name, password}`), and each password is expanded at startup into an independent `derived_psk` via `derive_psk()`. During the handshake the server probes every candidate PSK against the ClientHello — ephemeral-key unmasking, `read_message()`, counter-MAC verification — and the first PSK that passes all checks identifies the authenticated user (`authenticate_client_hello()` in `crates/tunnel/src/server/mod.rs`). Each probe costs only a few hashes plus one AEAD decryption, so the per-handshake cost grows linearly with the user count. The identified user name is attached to the connection and is available to the routing engine via the `auth_user` rule field.
+
 ### 1.2 Why Dual Key Shares?
 
 The `key_share` extension contains a fresh random X25519 public key per connection. This key completes the visible TLS handshake with the reference (camouflage) endpoint. It is **cryptographically independent** of the Noise key in `random`. This prevents a passive observer from correlating the two 32-byte fields via statistical tests — they are generated from separate entropy sources (`rand::thread_rng` vs `snow::Builder::build_initiator()`).

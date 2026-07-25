@@ -278,10 +278,10 @@ fn validate_client_routing_runtime(config: &ClientConfig) -> anyhow::Result<()> 
         .into_iter()
         .flat_map(|routing| routing.rules.iter())
     {
-        if Some(rule.outbound_tag.as_str()) != first_tag {
+        if Some(rule.outbound.as_str()) != first_tag {
             anyhow::bail!(
-                "routing rule outbound_tag '{}' is configured, but the current client runtime only supports the first outbound{}",
-                rule.outbound_tag,
+                "routing rule outbound '{}' is configured, but the current client runtime only supports the first outbound{}",
+                rule.outbound,
                 first_tag
                     .map(|tag| format!(" ('{}')", tag))
                     .unwrap_or_default()
@@ -296,8 +296,8 @@ fn select_client_outbound_tag(
     config: &ClientConfig,
     inbound_tag: Option<&str>,
 ) -> anyhow::Result<String> {
-    if let Some(rule) = find_routing_rule(config.routing.as_ref(), inbound_tag) {
-        return Ok(rule.outbound_tag.clone());
+    if let Some(rule) = find_routing_rule(config.routing.as_ref(), inbound_tag, None) {
+        return Ok(rule.outbound.clone());
     }
 
     Ok(first_outbound_tag(&config.outbounds))

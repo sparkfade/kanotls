@@ -9,7 +9,7 @@ pub mod templates;
 pub mod utils;
 
 pub use client::client_tunnel;
-pub use common::{SnowyStream, AEAD_TAG_LEN};
+pub use common::{derive_psk, SnowyStream, AEAD_TAG_LEN, PSK_LEN};
 pub use control_size::{ConnectionState, FlowDirection};
 pub use entropy::{fill_from_pool, init_entropy_pool};
 pub use server::server_accept;

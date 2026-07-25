@@ -78,6 +78,7 @@ pub fn validate_routing_rules<'a>(
     routing: &crate::model::Routing,
     inbound_tags: impl Iterator<Item = &'a str>,
     outbound_tags: impl Iterator<Item = &'a str>,
+    inbound_users: impl Fn(&str) -> Option<&'a std::collections::HashSet<String>>,
 ) -> Result<()> {
     let inbound_tags: std::collections::HashSet<_> = inbound_tags.collect();
     let outbound_tags: std::collections::HashSet<_> = outbound_tags.collect();
@@ -85,32 +86,54 @@ pub fn validate_routing_rules<'a>(
     for (idx, rule) in routing.rules.iter().enumerate() {
         let prefix = format!("routing.rules[{}]", idx);
 
-        if rule.rule_type.trim().is_empty() {
-            bail!("{}: type is required", prefix);
+        if rule.inbound.is_empty() {
+            bail!("{}: inbound must not be empty", prefix);
         }
-        if rule.inbound_tag.is_empty() {
-            bail!("{}: inbound_tag must not be empty", prefix);
-        }
-        if rule.outbound_tag.trim().is_empty() {
-            bail!("{}: outbound_tag is required", prefix);
+        if rule.outbound.trim().is_empty() {
+            bail!("{}: outbound is required", prefix);
         }
 
-        for inbound_tag in &rule.inbound_tag {
+        for inbound_tag in &rule.inbound {
             if !inbound_tags.contains(inbound_tag.as_str()) {
                 bail!(
-                    "{}: inbound_tag '{}' does not match any configured inbound tag",
+                    "{}: inbound '{}' does not match any configured inbound tag",
                     prefix,
                     inbound_tag
                 );
             }
         }
 
-        if !outbound_tags.contains(rule.outbound_tag.as_str()) {
+        if !outbound_tags.contains(rule.outbound.as_str()) {
             bail!(
-                "{}: outbound_tag '{}' does not match any configured outbound tag",
+                "{}: outbound '{}' does not match any configured outbound tag",
                 prefix,
-                rule.outbound_tag
+                rule.outbound
             );
+        }
+
+        if let Some(auth_user) = rule.auth_user.as_ref() {
+            if auth_user.is_empty() {
+                bail!(
+                    "{}: auth_user must not be empty (omit it to match all users)",
+                    prefix
+                );
+            }
+            let known_users: std::collections::HashSet<&str> = rule
+                .inbound
+                .iter()
+                .filter_map(|tag| inbound_users(tag.as_str()))
+                .flatten()
+                .map(|name| name.as_str())
+                .collect();
+            for user in auth_user {
+                if !known_users.contains(user.as_str()) {
+                    bail!(
+                        "{}: auth_user '{}' does not match any user of the referenced inbounds",
+                        prefix,
+                        user
+                    );
+                }
+            }
         }
     }
 
@@ -120,12 +143,17 @@ pub fn validate_routing_rules<'a>(
 pub fn find_routing_rule<'a>(
     routing: Option<&'a crate::model::Routing>,
     inbound_tag: Option<&str>,
+    auth_user: Option<&str>,
 ) -> Option<&'a crate::model::RoutingRule> {
     let inbound_tag = inbound_tag?;
     routing?.rules.iter().find(|rule| {
-        rule.inbound_tag
-            .iter()
-            .any(|tag| tag.as_str() == inbound_tag)
+        rule.inbound.iter().any(|tag| tag.as_str() == inbound_tag)
+            && match (rule.auth_user.as_ref(), auth_user) {
+                (None, _) => true,
+                (Some(users), _) if users.is_empty() => true,
+                (Some(users), Some(user)) => users.iter().any(|u| u == user),
+                (Some(_), None) => false,
+            }
     })
 }
 
@@ -182,5 +210,124 @@ mod tests {
         // (the default "markov" behavior); validation must not fail.
         let session = session_with_post_script_shaping(Some("bogus"));
         assert!(validate_session_config("test", &session).is_ok());
+    }
+
+    fn rule(inbound: &[&str], auth_user: Option<&[&str]>, outbound: &str) -> crate::model::RoutingRule {
+        crate::model::RoutingRule {
+            inbound: inbound.iter().map(|s| s.to_string()).collect(),
+            auth_user: auth_user
+                .map(|users| users.iter().map(|s| s.to_string()).collect()),
+            outbound: outbound.to_string(),
+        }
+    }
+
+    fn routing(rules: Vec<crate::model::RoutingRule>) -> crate::model::Routing {
+        crate::model::Routing { rules }
+    }
+
+    fn user_map<'a>(users: &'a std::collections::HashSet<String>) -> impl Fn(&str) -> Option<&'a std::collections::HashSet<String>> {
+        move |tag| (tag == "tls-in").then_some(users)
+    }
+
+    #[test]
+    fn find_routing_rule_prefers_auth_user_rule_over_catch_all() {
+        let rules = routing(vec![
+            rule(&["tls-in"], Some(&["1", "2"]), "socks-out"),
+            rule(&["tls-in"], None, "direct"),
+        ]);
+
+        let matched = find_routing_rule(Some(&rules), Some("tls-in"), Some("1")).unwrap();
+        assert_eq!(matched.outbound, "socks-out");
+        let matched = find_routing_rule(Some(&rules), Some("tls-in"), Some("2")).unwrap();
+        assert_eq!(matched.outbound, "socks-out");
+
+        let matched = find_routing_rule(Some(&rules), Some("tls-in"), Some("3")).unwrap();
+        assert_eq!(matched.outbound, "direct");
+    }
+
+    #[test]
+    fn find_routing_rule_catch_all_matches_any_user() {
+        let rules = routing(vec![rule(&["tls-in"], None, "direct")]);
+        for user in [Some("1"), Some("whoever"), None] {
+            let matched = find_routing_rule(Some(&rules), Some("tls-in"), user).unwrap();
+            assert_eq!(matched.outbound, "direct");
+        }
+    }
+
+    #[test]
+    fn find_routing_rule_user_scoped_rule_does_not_match_without_user() {
+        let rules = routing(vec![rule(&["tls-in"], Some(&["1"]), "socks-out")]);
+        assert!(find_routing_rule(Some(&rules), Some("tls-in"), None).is_none());
+        assert!(find_routing_rule(Some(&rules), Some("tls-in"), Some("2")).is_none());
+        assert!(find_routing_rule(Some(&rules), Some("other-in"), Some("1")).is_none());
+    }
+
+    #[test]
+    fn validate_routing_rules_accepts_known_auth_users() {
+        let users: std::collections::HashSet<String> = ["1", "2"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rules = routing(vec![
+            rule(&["tls-in"], Some(&["1", "2"]), "direct"),
+            rule(&["tls-in"], None, "direct"),
+        ]);
+        assert!(validate_routing_rules(
+            &rules,
+            ["tls-in"].into_iter(),
+            ["direct"].into_iter(),
+            user_map(&users),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_routing_rules_rejects_unknown_auth_user() {
+        let users: std::collections::HashSet<String> = ["1"].iter().map(|s| s.to_string()).collect();
+        let rules = routing(vec![rule(&["tls-in"], Some(&["ghost"]), "direct")]);
+        let err = validate_routing_rules(
+            &rules,
+            ["tls-in"].into_iter(),
+            ["direct"].into_iter(),
+            user_map(&users),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("auth_user 'ghost'"));
+    }
+
+    #[test]
+    fn validate_routing_rules_rejects_empty_auth_user_list() {
+        let users: std::collections::HashSet<String> = ["1"].iter().map(|s| s.to_string()).collect();
+        let rules = routing(vec![rule(&["tls-in"], Some(&[]), "direct")]);
+        let err = validate_routing_rules(
+            &rules,
+            ["tls-in"].into_iter(),
+            ["direct"].into_iter(),
+            user_map(&users),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("auth_user must not be empty"));
+    }
+
+    #[test]
+    fn validate_routing_rules_rejects_unknown_inbound_and_outbound() {
+        let users: std::collections::HashSet<String> = ["1"].iter().map(|s| s.to_string()).collect();
+        let rules = routing(vec![rule(&["nope-in"], None, "direct")]);
+        assert!(validate_routing_rules(
+            &rules,
+            ["tls-in"].into_iter(),
+            ["direct"].into_iter(),
+            user_map(&users),
+        )
+        .is_err());
+
+        let rules = routing(vec![rule(&["tls-in"], None, "nope-out")]);
+        assert!(validate_routing_rules(
+            &rules,
+            ["tls-in"].into_iter(),
+            ["direct"].into_iter(),
+            user_map(&users),
+        )
+        .is_err());
     }
 }

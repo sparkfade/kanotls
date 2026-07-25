@@ -45,7 +45,7 @@ kanotls 使用独立 Noise 通道完成端点认证和载荷加密。Noise 临�
 cargo build --release
 ```
 
-使用 `kanotls --config config.json` 启动。角色自动判断：`"protocol": "tunnel"` 入站 → 服务端模式；`socks5` / `socks` / `http` 入站 → 客户端模式。
+使用 `kanotls --config config.json` 启动。角色自动判断：`"protocol": "kanotls"` 入站 → 服务端模式；`socks5` / `socks` / `http` 入站 → 客户端模式。
 
 ### 服务端
 
@@ -59,9 +59,12 @@ cargo build --release
       "tag": "tls-in",
       "listen": "0.0.0.0",
       "port": 443,
-      "protocol": "tunnel",
+      "protocol": "kanotls",
       "settings": {
-        "password": "8P5KbMuExWh6yNJI2xHLiWWfACIS5wYDHo7PVdTbOgj93mVrYKj7Q89VjJwfW8Oj",
+        "users": [
+          { "name": "1", "password": "8P5KbMuExWh6yNJI2xHLiWWfACIS5wYDHo7PVdTbOgj93mVrYKj7Q89VjJwfW8Oj" },
+          { "name": "2", "password": "mVf9k2Qz8wYxN3pL7rT5vB1nM4cX6sD0gH8jK2lP9qR4tU7wE3yI6oA5zS1dF8g" }
+        ],
         "camouflage": {
           "host": "example.com",
           "port": 443
@@ -95,9 +98,13 @@ cargo build --release
   "routing": {
     "rules": [
       {
-        "type": "field",
-        "inbound_tag": ["tls-in"],
-        "outbound_tag": "direct"
+        "inbound": ["tls-in"],
+        "auth_user": ["1"],
+        "outbound": "socks5-out"
+      },
+      {
+        "inbound": ["tls-in"],
+        "outbound": "direct"
       }
     ]
   }
@@ -122,7 +129,7 @@ cargo build --release
   "outbounds": [
     {
       "tag": "proxy",
-      "protocol": "tunnel",
+      "protocol": "kanotls",
       "settings": {
         "server": "1.2.2.4",
         "port": 443,
@@ -145,9 +152,8 @@ cargo build --release
   "routing": {
     "rules": [
       {
-        "type": "field",
-        "inbound_tag": ["socks-in"],
-        "outbound_tag": "proxy"
+        "inbound": ["socks-in"],
+        "outbound": "proxy"
       }
     ]
   }
@@ -165,7 +171,7 @@ curl -fsSL https://raw.githubusercontent.com/sparkfade/kanotls/main/install.sh |
 脚本为交互式——首先选择语言（中文/English），然后进入菜单（安装 / 更新 / 卸载）。安装和更新可选稳定版或预发布版。
 
 安装完成后，编辑 `/etc/kanotls/config.json`：
-- 替换占位密码
+- 替换 `settings.users` 中的占位密码
 - 设置 `camouflage.host` 和 `camouflage.port` 为参考端点地址
 
 启动服务：
@@ -179,13 +185,15 @@ sudo journalctl -u kanotls -f
 
 ## 配置说明
 
-### 密码
+### 用户
 
-预共享密钥，客户端和服务端必须完全一致。最少 32 字节。配置验证会拒绝包含占位子串的密码（`change_me`、`placeholder`、`replace_me`、`your_password_here`、`fill_me`）。生成：
+服务端入站通过 `settings.users` 列表（`{name, password}` 条目）对客户端进行认证。每个密码都是独立的预共享密钥（最少 32 字节）；同一入站内用户名与密码均必须唯一。配置验证会拒绝包含占位子串的密码（`change_me`、`placeholder`、`replace_me`、`your_password_here`、`fill_me`）。生成：
 
 ```bash
 openssl rand -base64 48
 ```
+
+客户端出站携带单个 `settings.password`，对应服务端某个用户的密码。认证通过后，用户名会附加到连接上，可通过路由规则的 `auth_user` 字段按用户分流。
 
 ### 日志级别
 
@@ -193,7 +201,9 @@ openssl rand -base64 48
 
 ### 路由
 
-按 `inbounds[].tag` 匹配。客户端运行时目前仅支持单一出站——所有路由规则的 `outbound_tag` 必须指向 `outbounds[0].tag`。服务端支持多出站，规则可引用任意已配置的出站 tag。
+sing-box 风格规则，按顺序评估，首个匹配生效。规则的 `inbound` 列表包含入站 `tag`，且 `auth_user` 列表（存在时）包含已认证用户名时匹配。不写 `auth_user` 的规则是该入站下所有未匹配用户的兜底规则。无规则匹配时，使用第一个出站（`outbounds[0]`）作为确定性回退。
+
+客户端运行时目前仅支持单一出站——所有路由规则的 `outbound` 必须指向 `outbounds[0].tag`。服务端支持多出站，规则可引用任意已配置的出站 tag。`auth_user` 仅在服务端有意义（客户端入站没有认证用户）。
 
 ### 协议别名
 
@@ -338,7 +348,7 @@ Fail-closed 失败（读取阶段错误、超大 record）永不回落。
 | `direct` | 直接 TCP/UDP 中继到目标 | _(无)_ |
 | `socks5` | 通过上游 SOCKS5 代理中继 | `address`（主机）、`port`（1–65535）、可选 `username`/`password`（RFC 1929 认证） |
 
-两种协议均支持 TCP CONNECT 和 UDP ASSOCIATE。路由引擎通过 `routing.rules` 中的 `inbound_tag` → `outbound_tag` 匹选出站。当无规则匹配时，使用第一个出站（`outbounds[0]`）作为确定性回退。
+两种协议均支持 TCP CONNECT 和 UDP ASSOCIATE。路由引擎通过 `routing.rules` 中的 `inbound`（可选叠加认证用户）→ `outbound` 匹选出站。当无规则匹配时，使用第一个出站（`outbounds[0]`）作为确定性回退。
 
 SOCKS5 出站示例：
 
@@ -355,15 +365,19 @@ SOCKS5 出站示例：
 }
 ```
 
-路由规则选择出站：
+路由规则选择出站，可按认证用户分流：
 
 ```jsonc
 "routing": {
   "rules": [
     {
-      "type": "field",
-      "inbound_tag": ["tls-in"],
-      "outbound_tag": "socks5-out"
+      "inbound": ["tls-in"],
+      "auth_user": ["1", "2"],
+      "outbound": "socks5-out"
+    },
+    {
+      "inbound": ["tls-in"],
+      "outbound": "direct"
     }
   ]
 }
@@ -388,7 +402,15 @@ SOCKS5 出站示例：
 | 字段 | 角色 | 说明 |
 |------|------|------|
 | `log.level` | 双方 | `trace` / `debug` / `info` / `warn` / `error`（默认 `info`） |
-| `routing.rules` | 双方 | sing-box 风格入站 tag 路由规则 |
+| `routing.rules` | 双方 | sing-box 风格路由规则 |
+
+每条路由规则：
+
+| 字段 | 说明 |
+|------|------|
+| `inbound` | 该规则适用的入站 tag 列表（必填） |
+| `auth_user` | 可选。已认证用户名列表；省略时匹配该入站所有未命中其他规则的用户 |
+| `outbound` | 规则命中时选择的出站 tag（必填） |
 
 ### 入站字段
 
@@ -397,9 +419,9 @@ SOCKS5 出站示例：
 | `tag` | 双方 | 路由标签 |
 | `listen` | 双方 | 监听地址（客户端：必须为 loopback IP 字面量） |
 | `port` | 双方 | 监听端口 |
-| `protocol` | 服务端 | `"tunnel"` |
+| `protocol` | 服务端 | `"kanotls"` |
 | `protocol` | 客户端 | `"socks5"` / `"socks"` / `"http"` |
-| `settings.password` | 服务端 | 预共享密钥，最少 32 字节 |
+| `settings.users` | 服务端 | 用户列表 `[{name, password}]`；用户名与密码均须唯一，密码最少 32 字节 |
 | `settings.camouflage.host` | 服务端 | 参考 TLS 1.3 端点主机名（DNS 名称；不接受 IP 字面量） |
 | `settings.camouflage.port` | 服务端 | 参考端点端口 |
 | `settings.session.max_streams_per_session` | 双方 | 可选。单 session 最大并发 stream 数（默认 256） |
@@ -423,10 +445,10 @@ SOCKS5 出站示例：
 | 字段 | 说明 |
 |------|------|
 | `tag` | 路由标签 |
-| `protocol` | 必须为 `"tunnel"` |
+| `protocol` | 必须为 `"kanotls"` |
 | `settings.server` | 服务端地址 |
 | `settings.port` | 服务端端口 |
-| `settings.password` | 预共享密钥（最少 32 字节） |
+| `settings.password` | 服务端某个用户的预共享密钥（最少 32 字节） |
 | `settings.tls.sni` | 外层 ClientHello SNI（DNS 名称；不接受 IP 字面量） |
 | `settings.tls.insecure` | 可选。跳过 rustls 路径 TLS 证书验证（默认 `false`）。仅影响原生 rustls ClientHello 生成；Noise 提供端点认证。 |
 | `settings.tls.fingerprint` | 可选。预设：`firefox`（默认）、`rustls`、`python-openssl`、`baseline` |

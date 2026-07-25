@@ -45,7 +45,7 @@ Detailed mechanism reference: [docs/MECHANISM.md](docs/MECHANISM.md)
 cargo build --release
 ```
 
-Start with `kanotls --config config.json`. Role auto-detection: `"protocol": "tunnel"` inbound → server mode; `socks5` / `socks` / `http` inbound → client mode.
+Start with `kanotls --config config.json`. Role auto-detection: `"protocol": "kanotls"` inbound → server mode; `socks5` / `socks` / `http` inbound → client mode.
 
 ### Server
 
@@ -59,9 +59,12 @@ Start with `kanotls --config config.json`. Role auto-detection: `"protocol": "tu
       "tag": "tls-in",
       "listen": "0.0.0.0",
       "port": 443,
-      "protocol": "tunnel",
+      "protocol": "kanotls",
       "settings": {
-        "password": "8P5KbMuExWh6yNJI2xHLiWWfACIS5wYDHo7PVdTbOgj93mVrYKj7Q89VjJwfW8Oj",
+        "users": [
+          { "name": "1", "password": "8P5KbMuExWh6yNJI2xHLiWWfACIS5wYDHo7PVdTbOgj93mVrYKj7Q89VjJwfW8Oj" },
+          { "name": "2", "password": "mVf9k2Qz8wYxN3pL7rT5vB1nM4cX6sD0gH8jK2lP9qR4tU7wE3yI6oA5zS1dF8g" }
+        ],
         "camouflage": {
           "host": "example.com",
           "port": 443
@@ -95,9 +98,13 @@ Start with `kanotls --config config.json`. Role auto-detection: `"protocol": "tu
   "routing": {
     "rules": [
       {
-        "type": "field",
-        "inbound_tag": ["tls-in"],
-        "outbound_tag": "direct"
+        "inbound": ["tls-in"],
+        "auth_user": ["1"],
+        "outbound": "socks5-out"
+      },
+      {
+        "inbound": ["tls-in"],
+        "outbound": "direct"
       }
     ]
   }
@@ -122,7 +129,7 @@ Start with `kanotls --config config.json`. Role auto-detection: `"protocol": "tu
   "outbounds": [
     {
       "tag": "proxy",
-      "protocol": "tunnel",
+      "protocol": "kanotls",
       "settings": {
         "server": "1.2.2.4",
         "port": 443,
@@ -145,9 +152,8 @@ Start with `kanotls --config config.json`. Role auto-detection: `"protocol": "tu
   "routing": {
     "rules": [
       {
-        "type": "field",
-        "inbound_tag": ["socks-in"],
-        "outbound_tag": "proxy"
+        "inbound": ["socks-in"],
+        "outbound": "proxy"
       }
     ]
   }
@@ -165,7 +171,7 @@ The script downloads the latest pre-built binary from GitHub Releases, installs 
 The script is interactive — it presents a language selection (中文/English) and a menu (Install / Update / Uninstall). Install and Update offer a choice between stable and pre-release versions.
 
 After installation, edit `/etc/kanotls/config.json`:
-- Replace the placeholder password
+- Replace the placeholder password in `settings.users`
 - Set `camouflage.host` and `camouflage.port` to your reference endpoint
 
 Then start the service:
@@ -179,13 +185,15 @@ The binary searches for its config at `/etc/kanotls/config.json` on Linux (or `/
 
 ## Configuration
 
-### Password
+### Users
 
-Pre-shared key, identical on both sides. Minimum 32 bytes. Config validation rejects passwords containing placeholder substrings (`change_me`, `placeholder`, `replace_me`, `your_password_here`, `fill_me`). Generate:
+The server inbound authenticates clients against `settings.users`, a list of `{name, password}` entries. Each password is an independent pre-shared key (minimum 32 bytes); names and passwords must both be unique within an inbound. Config validation rejects passwords containing placeholder substrings (`change_me`, `placeholder`, `replace_me`, `your_password_here`, `fill_me`). Generate:
 
 ```bash
 openssl rand -base64 48
 ```
+
+The client outbound carries a single `settings.password` matching one of the server's user entries. The authenticated user name is attached to the connection and can be used for per-user routing via `auth_user`.
 
 ### Log Level
 
@@ -193,7 +201,9 @@ openssl rand -base64 48
 
 ### Routing
 
-Rules match by `inbounds[].tag`. The client runtime currently supports only a single outbound — all routing rules must resolve to `outbounds[0].tag`. The server supports multiple outbounds; rules may reference any configured outbound tag.
+sing-box-style rules, evaluated in order; the first match wins. A rule matches when its `inbound` list contains the inbound's `tag` and its `auth_user` list (when present) contains the authenticated user name. A rule without `auth_user` is a catch-all for every remaining user of that inbound. When no rule matches, the first outbound (`outbounds[0]`) is used as the deterministic fallback.
+
+The client runtime currently supports only a single outbound — all routing rules must resolve to `outbounds[0].tag`. The server supports multiple outbounds; rules may reference any configured outbound tag. `auth_user` is only meaningful on the server (client inbounds have no authenticated users).
 
 ### Protocol Aliases
 
@@ -338,7 +348,7 @@ Server outbounds define the exit path for relayed traffic. Two protocols are sup
 | `direct` | Direct TCP/UDP relay to the target | _(none)_ |
 | `socks5` | Relay through an upstream SOCKS5 proxy | `address` (host), `port` (1–65535), optional `username`/`password` (RFC 1929 auth) |
 
-Both protocols support TCP CONNECT and UDP ASSOCIATE. The routing engine selects an outbound by matching `inbounds[].tag` → `outbound_tag` in `routing.rules`. When no rule matches, the first outbound (`outbounds[0]`) is used as the deterministic fallback.
+Both protocols support TCP CONNECT and UDP ASSOCIATE. The routing engine selects an outbound by matching `inbounds[].tag` (and optionally the authenticated user) → `outbound` in `routing.rules`. When no rule matches, the first outbound (`outbounds[0]`) is used as the deterministic fallback.
 
 Example SOCKS5 outbound:
 
@@ -355,15 +365,19 @@ Example SOCKS5 outbound:
 }
 ```
 
-Routing rules select the outbound:
+Routing rules select the outbound, optionally per authenticated user:
 
 ```jsonc
 "routing": {
   "rules": [
     {
-      "type": "field",
-      "inbound_tag": ["tls-in"],
-      "outbound_tag": "socks5-out"
+      "inbound": ["tls-in"],
+      "auth_user": ["1", "2"],
+      "outbound": "socks5-out"
+    },
+    {
+      "inbound": ["tls-in"],
+      "outbound": "direct"
     }
   ]
 }
@@ -388,7 +402,15 @@ Routing rules select the outbound:
 | Field | Role | Description |
 |-------|------|-------------|
 | `log.level` | both | `trace` / `debug` / `info` / `warn` / `error` (default `info`) |
-| `routing.rules` | both | sing-box-style inbound-tag routing |
+| `routing.rules` | both | sing-box-style routing rules |
+
+Each routing rule:
+
+| Field | Description |
+|-------|-------------|
+| `inbound` | List of inbound tags this rule applies to (required) |
+| `auth_user` | Optional list of authenticated user names; omit to match all remaining users of the inbound |
+| `outbound` | Tag of the outbound selected when the rule matches (required) |
 
 ### Inbound fields (server)
 
@@ -397,9 +419,9 @@ Routing rules select the outbound:
 | `tag`                                      | both   | Routing label                        |
 | `listen`                                   | both   | Bind address (client: must be loopback IP literal) |
 | `port`                                     | both   | Bind port                            |
-| `protocol`                                 | server | `"tunnel"`                           |
+| `protocol`                                 | server | `"kanotls"`                          |
 | `protocol`                                 | client | `"socks5"` / `"socks"` / `"http"`    |
-| `settings.password`                        | server | Pre-shared key, min 32 bytes         |
+| `settings.users`                           | server | User list: `[{name, password}]`; names and passwords unique, password min 32 bytes |
 | `settings.camouflage.host`                 | server | Reference TLS 1.3 endpoint hostname (DNS name; IP literals rejected) |
 | `settings.camouflage.port`                 | server | Reference endpoint port              |
 | `settings.session.max_streams_per_session` | both   | Optional. Max streams per tunnel (default 256) |
@@ -423,10 +445,10 @@ Routing rules select the outbound:
 | Field | Description |
 |--------|----------------|
 | `tag` | Routing tag |
-| `protocol` | Must be `"tunnel"` |
+| `protocol` | Must be `"kanotls"` |
 | `settings.server` | Server address |
 | `settings.port` | Server port |
-| `settings.password` | Pre-shared key (min 32 bytes) |
+| `settings.password` | Pre-shared key of one server user (min 32 bytes) |
 | `settings.tls.sni` | ClientHello SNI (DNS name; IP literals rejected) |
 | `settings.tls.insecure` | Optional. Skip TLS cert verification in rustls path (default `false`). Only affects the native-rustls ClientHello generation; Noise provides endpoint auth. |
 | `settings.tls.fingerprint` | Optional. Preset: `firefox` (default), `rustls`, `python-openssl`, `baseline` |
