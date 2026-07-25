@@ -420,21 +420,22 @@ pub(super) async fn validate_camouflage_tls13_flight(host: &str, port: u16) -> a
 }
 
 pub(super) fn build_probe_client_hello(host: &str) -> anyhow::Result<Vec<u8>> {
-    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|e| anyhow::anyhow!("failed to build camouflage probe config: {}", e))?
-    .with_root_certificates(rustls::RootCertStore::empty())
-    .with_no_client_auth();
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-        .map_err(|e| anyhow::anyhow!("invalid camouflage host {}: {:?}", host, e))?;
-    let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name)?;
-    let mut bytes = Vec::new();
-    let mut writer = std::io::Cursor::new(&mut bytes);
-    conn.write_tls(&mut writer)?;
-    Ok(bytes)
+    // 探针与客户端复用同一 Firefox 模板：真实站点会按 ClientHello 特征
+    // 选择 key_share / 证书链（如 ECDSA vs RSA），探针指纹若与客户端
+    // 不一致，录制的 flight 便不是真实客户端应得的那份。归一化指纹
+    // 一致还使启动采样直接落入客户端连接查询的 profile key。项目指纹
+    // 即将收敛至 firefox 单一预设，探针不再硬编码 rustls 指纹。
+    let template =
+        crate::template::get_or_build_client_hello_template(host, Some("firefox"), None, true)?;
+    // 注入材料仅充当随机字段填充：对真实伪装站点而言 random/session_id
+    // 本就是不透明随机字节，探针无需携带有效 Noise 语义。
+    let mut derived_psk = [0u8; 32];
+    let mut psk_e = [0u8; 48];
+    let mut rng = rand::thread_rng();
+    use rand::RngCore;
+    rng.fill_bytes(&mut derived_psk);
+    rng.fill_bytes(&mut psk_e);
+    template.instantiate(&derived_psk, &psk_e, rng.gen())
 }
 
 pub(super) async fn fetch_camouflage_flight(
@@ -1104,9 +1105,16 @@ pub(super) async fn read_camouflage_server_records(
                 if c_typ == 0x16 && is_server_hello(record) {
                     // HRR flight 不可缓存回放：缺第二个 ClientHello，回放会产生
                     // 异常流。中止本次采样，由上层走失败/冷却路径。
+                    //
+                    // 注（未实现 HRR 重试的原因）：HRR 意味着站点要求模板未
+                    // 提供的 key_share 组（如 P-384 / ML-KEM）。即使采样端换组
+                    // 重试拿到无 HRR 的 flight，该 flight 也与真实站点对客户端
+                    // 原始 CH 的应答（HRR）不一致，回放反而引入 CH↔flight 不
+                    // 自洽；且 ML-KEM 在当前依赖下无法生成。正确处置是更新
+                    // 模板或更换伪装站点。
                     if is_hello_retry_request(record) {
                         anyhow::bail!(
-                            "camouflage server returned HelloRetryRequest; HRR flights cannot be cached for replay"
+                            "camouflage server returned HelloRetryRequest (endpoint requires a key_share group the ClientHello template does not offer); HRR flights cannot be cached for replay — refresh the template with update_firefox_template.py or choose a different camouflage endpoint"
                         );
                     }
                     found_server_hello = true;
@@ -1256,5 +1264,31 @@ mod tests {
         let mut normal = server_hello_record_with_random(&[7u8; 32]);
         patch_server_hello_random(&mut normal);
         assert_ne!(&normal[11..43], &[7u8; 32], "普通 SH random 必须被重写");
+    }
+
+    #[test]
+    fn probe_client_hello_shares_firefox_template_fingerprint() {
+        // 探针 CH 与客户端 Firefox 模板 CH 的稳定指纹必须一致：启动验证
+        // 采样因此直接存入客户端连接查询的 profile key，而非仅 probe 兜底。
+        let probe = build_probe_client_hello("example.com").expect("probe ClientHello");
+        let template = crate::template::get_or_build_client_hello_template(
+            "example.com",
+            Some("firefox"),
+            None,
+            true,
+        )
+        .expect("firefox template");
+        let client_ch = template
+            .instantiate(&[9u8; 32], &[7u8; 48], 42)
+            .expect("client ClientHello");
+
+        let probe_fp = crate::utils::stable_client_hello_fingerprint(&probe)
+            .expect("probe fingerprint");
+        let client_fp = crate::utils::stable_client_hello_fingerprint(&client_ch)
+            .expect("client fingerprint");
+        assert_eq!(
+            probe_fp, client_fp,
+            "探针 CH 与客户端 Firefox CH 的稳定指纹必须一致"
+        );
     }
 }
