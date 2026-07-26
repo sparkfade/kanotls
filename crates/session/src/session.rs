@@ -128,8 +128,22 @@ impl Drop for BufferedPayload {
 }
 
 #[derive(Default)]
+struct StreamQueue {
+    items: VecDeque<BufferedPayload>,
+    bytes: usize,
+}
+
+/// 每流的待投递积压。
+///
+/// 总字节与每流字节都以运行计数维护，入队/出队时同增同减。此前
+/// `total_bytes()` 是对所有队列所有载荷的全量求和，而它在
+/// `store_pending_data` 中每存一帧就要调一次——限额是 1024 流 × 1024 帧，
+/// 于是最坏情况下每帧扫描百万级条目。触发条件恰是它要防的那一个：消费者
+/// 卡住、channel 满、帧开始落到 pending。O(1) 记账消除这条放大路径。
+#[derive(Default)]
 pub(crate) struct PendingData {
-    queues: HashMap<u32, VecDeque<BufferedPayload>>,
+    queues: HashMap<u32, StreamQueue>,
+    total_bytes: usize,
 }
 
 impl PendingData {
@@ -138,31 +152,52 @@ impl PendingData {
     }
 
     pub fn remove(&mut self, sid: u32) -> Option<VecDeque<BufferedPayload>> {
-        self.queues.remove(&sid)
+        let queue = self.queues.remove(&sid)?;
+        self.total_bytes -= queue.bytes;
+        Some(queue.items)
     }
 
     pub fn clear(&mut self) {
         self.queues.clear();
+        self.total_bytes = 0;
     }
 
+    /// 有积压的流数量（空队列不会残留：拒绝入队时不创建条目，排空时移除）。
     pub fn len(&self) -> usize {
         self.queues.len()
     }
 
-    pub fn entry(&mut self, sid: u32) -> &mut VecDeque<BufferedPayload> {
-        self.queues.entry(sid).or_default()
-    }
-
-    pub fn get_mut(&mut self, sid: u32) -> Option<&mut VecDeque<BufferedPayload>> {
-        self.queues.get_mut(&sid)
-    }
-
     pub fn total_bytes(&self) -> usize {
-        self.queues
-            .values()
-            .flat_map(|q| q.iter())
-            .map(BufferedPayload::len)
-            .sum()
+        self.total_bytes
+    }
+
+    pub fn stream_bytes(&self, sid: u32) -> usize {
+        self.queues.get(&sid).map(|q| q.bytes).unwrap_or(0)
+    }
+
+    pub fn stream_frames(&self, sid: u32) -> usize {
+        self.queues.get(&sid).map(|q| q.items.len()).unwrap_or(0)
+    }
+
+    pub fn push_back(&mut self, sid: u32, payload: BufferedPayload) {
+        let len = payload.len();
+        let queue = self.queues.entry(sid).or_default();
+        queue.items.push_back(payload);
+        queue.bytes += len;
+        self.total_bytes += len;
+    }
+
+    /// 取走队首载荷；队列排空时一并移除条目，使 `contains`/`len` 的口径
+    /// 始终等于「有积压的流」。
+    pub fn pop_front(&mut self, sid: u32) -> Option<BufferedPayload> {
+        let queue = self.queues.get_mut(&sid)?;
+        let payload = queue.items.pop_front()?;
+        queue.bytes -= payload.len();
+        self.total_bytes -= payload.len();
+        if queue.items.is_empty() {
+            self.queues.remove(&sid);
+        }
+        Some(payload)
     }
 }
 
@@ -1184,8 +1219,13 @@ impl Session {
     /// 拒绝时 payload 随作用域丢弃自动回账。
     async fn store_pending_data(&self, sid: u32, payload: BufferedPayload) -> bool {
         let mut pending = self.pending_data.lock().await;
-        let total_bytes: usize = pending.total_bytes();
-        if total_bytes.saturating_add(payload.len()) > MAX_PENDING_STREAM_BYTES {
+        // 四个限额检查全部 O(1)（PendingData 维护运行计数）。此前前两个
+        // 分别是全量求和与单队列求和，恰好在背压发生时被逐帧调用。
+        if pending
+            .total_bytes()
+            .saturating_add(payload.len())
+            > MAX_PENDING_STREAM_BYTES
+        {
             warn!("dropping pending stream data: pending byte limit exceeded");
             return false;
         }
@@ -1198,23 +1238,27 @@ impl Session {
             return false;
         }
 
-        let queue = pending.entry(sid);
-        let stream_bytes: usize = queue.iter().map(BufferedPayload::len).sum();
-        if stream_bytes.saturating_add(payload.len()) > MAX_STREAM_OVERFLOW_BYTES {
+        if pending
+            .stream_bytes(sid)
+            .saturating_add(payload.len())
+            > MAX_STREAM_OVERFLOW_BYTES
+        {
             warn!(
                 stream_id = sid,
                 "dropping pending stream data: per-stream overflow byte limit exceeded"
             );
             return false;
         }
-        if queue.len() >= MAX_PENDING_STREAM_FRAMES {
+        if pending.stream_frames(sid) >= MAX_PENDING_STREAM_FRAMES {
             warn!(
                 stream_id = sid,
                 "dropping pending stream data: per-stream frame limit exceeded"
             );
             return false;
         }
-        queue.push_back(payload);
+        // 入队放在全部检查之后：此前 `entry(sid)` 在检查前就创建了条目，
+        // 被拒绝的载荷会留下一个空队列，虚增 contains()/len() 的口径。
+        pending.push_back(sid, payload);
         true
     }
 
@@ -1449,9 +1493,8 @@ impl Session {
 
         if !remaining.is_empty() {
             let mut pending = self.pending_data.lock().await;
-            let queue = pending.entry(sid);
             for item in remaining {
-                queue.push_back(item);
+                pending.push_back(sid, item);
             }
             drop(pending);
             notify.notify_one();
@@ -1822,10 +1865,17 @@ impl SessionWriter {
     fn queue_bulk_request(
         pending: &mut Vec<u8>,
         responders: &mut Vec<oneshot::Sender<Result<(), String>>>,
-        request: WriteRequest,
+        mut request: WriteRequest,
     ) {
-        for packet in &request.packets {
-            pending.extend_from_slice(packet);
+        // 积压为空且请求只有一个包时直接接管其缓冲，省掉一次整包拷贝。
+        // 这是稳态大流量的常见形态：drive_shaper 每轮结束都会清空 pending，
+        // 于是每批的首个请求都命中此路径。
+        if pending.is_empty() && request.packets.len() == 1 {
+            *pending = request.packets.pop().expect("length checked above");
+        } else {
+            for packet in &request.packets {
+                pending.extend_from_slice(packet);
+            }
         }
         if request.flush == FlushBehavior::Auto {
             let _ = request.response_tx.send(Ok(()));

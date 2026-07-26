@@ -7,3 +7,4 @@ edition.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+lru.workspace = true

@@ -147,11 +147,8 @@ impl ServerStream {
 
     fn try_drain_pending_data(&self) -> Option<Vec<u8>> {
         let mut pending = self.pending_data.try_lock().ok()?;
-        let queue = pending.get_mut(self.sid)?;
-        let payload = queue.pop_front()?;
-        if queue.is_empty() {
-            pending.remove(self.sid);
-        }
+        // pop_front 在队列排空时自动移除条目。
+        let payload = pending.pop_front(self.sid)?;
         Some(payload.into_vec())
     }
 

@@ -424,8 +424,12 @@ pub(super) async fn resolve_allowed_camouflage(
         anyhow::bail!("invalid camouflage port 0");
     }
 
+    // 走带 TTL 的共享解析缓存：本函数在每次 pre-auth 回落时都会调用，
+    // 未缓存时一次端口扫描就会变成对本机解析器的等量放大。过滤留在此处，
+    // 因为伪装端点的私网判定与代理出站的目的地判定是两套策略。
+    let resolved = kanotls_proto::dns::resolve(host, port).await?;
     let mut first_allowed = None;
-    for addr in tokio::net::lookup_host((host, port)).await? {
+    for addr in resolved.iter().copied() {
         if is_blocked_camouflage_ip(addr.ip()) {
             debug!("skipping blocked camouflage address: {}", addr);
             continue;
