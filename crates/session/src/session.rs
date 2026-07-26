@@ -1,100 +1,49 @@
 use crate::frame::{
-    coalesce_encoded_frames, encode_padding_reply_into, encode_padding_request_into,
-    encode_psh_frames, Frame, CMD_FIN, CMD_PADDING, CMD_PSH, CMD_SETTINGS, CMD_SYN, CMD_SYNACK,
-    FRAME_HEADER_SIZE, MAX_PAYLOAD_LEN,
+    coalesce_encoded_frames, decode_padding_goaway, encode_padding_goaway_sized,
+    encode_padding_reply_sized, encode_padding_request_sized, encode_psh_frames,
+    self_sized_padding_wire_len, Frame, CMD_FIN, CMD_PADDING, CMD_PSH, CMD_SETTINGS, CMD_SYN,
+    CMD_SYNACK, CONTROL_RECORD_MIN_OVERHEAD, FRAME_HEADER_SIZE, MAX_PAYLOAD_LEN,
+    MIN_GOAWAY_RECORD_WIRE_LEN, PADDING_FLAG_GOAWAY, PADDING_FLAG_REQUEST,
 };
 use crate::shaper::{ShapePolicy, TrafficShaper};
 use crate::stream::{Stream, StreamInit, StreamOpenState, StreamParts};
-use bytes::BytesMut;
-use kanotls_tunnel::{FlowDirection, SnowyStream};
+use bytes::{Bytes, BytesMut};
+use kanotls_tunnel::{ConnectionState, FlowDirection, SnowyStream};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
-use std::task::{Context, Poll};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify, RwLock};
 use tracing::{debug, error, trace, warn};
 
-struct SplitInner {
-    stream: StdMutex<SnowyStream>,
-}
-
-struct SplitReadHalf {
-    inner: Arc<SplitInner>,
-}
-
-struct SplitWriteHalf {
-    inner: Arc<SplitInner>,
-}
-
-fn split_snowy(stream: SnowyStream) -> (SplitReadHalf, SplitWriteHalf) {
-    let inner = Arc::new(SplitInner {
-        stream: StdMutex::new(stream),
-    });
-    (
-        SplitReadHalf {
-            inner: inner.clone(),
-        },
-        SplitWriteHalf { inner },
-    )
-}
-
-impl AsyncRead for SplitReadHalf {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let mut guard = self.inner.stream.lock().unwrap();
-        let stream = unsafe { Pin::new_unchecked(&mut *guard) };
-        stream.poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for SplitWriteHalf {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let mut guard = self.inner.stream.lock().unwrap();
-        let stream = unsafe { Pin::new_unchecked(&mut *guard) };
-        stream.poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let mut guard = self.inner.stream.lock().unwrap();
-        let stream = unsafe { Pin::new_unchecked(&mut *guard) };
-        stream.poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let mut guard = self.inner.stream.lock().unwrap();
-        let stream = unsafe { Pin::new_unchecked(&mut *guard) };
-        stream.poll_shutdown(cx)
-    }
-}
-
-impl SplitWriteHalf {
-    fn with_stream<R>(&self, f: impl FnOnce(&mut SnowyStream) -> R) -> R {
-        let mut guard = self.inner.stream.lock().unwrap();
-        f(&mut guard)
-    }
-}
+/// 隧道的读半与写半。
+///
+/// 此前这两个类型是同一个 `Arc<StdMutex<SnowyStream>>` 的两个句柄：读半的
+/// `poll_read` 持锁跨越最多 16 KB 的解密，写半的 `prepare_*` / `poll_flush`
+/// 要同一把锁做加密与 `write()` 系统调用，于是**同一条连接的加密与解密完全
+/// 串行**，双向大流量时两个 task 在这把锁上乒乓。实测（双向各 400 MiB、
+/// 4 个 worker 线程）12.2 万次加锁中 5.0% 争用、累计阻塞 0.39 s。
+///
+/// 现在两半由 `SnowyStream::into_split` 直接给出：TCP socket 由
+/// `into_split` 分开，Noise 传输态改用 `StatelessTransportState` +
+/// 每半自己的 nonce 计数器（论证与线上字节等价性见
+/// `kanotls_tunnel::common::NoiseTransport`），那把锁整个消失。
+type SplitReadHalf = kanotls_tunnel::SnowyReadHalf;
+type SplitWriteHalf = kanotls_tunnel::SnowyWriteHalf;
 
 /// 入账缓冲载荷：创建即计入 buffered_stream_bytes，被消费者取走
 /// （into_vec）或被丢弃（Drop）时恰好扣减一次，杜绝手工记账漏减。
 #[derive(Debug)]
 pub(crate) struct BufferedPayload {
-    data: Vec<u8>,
+    data: Bytes,
     counter: Arc<AtomicUsize>,
     accounted: bool,
 }
 
 impl BufferedPayload {
-    pub(crate) fn new(data: Vec<u8>, counter: &Arc<AtomicUsize>) -> Self {
+    pub(crate) fn new(data: impl Into<Bytes>, counter: &Arc<AtomicUsize>) -> Self {
+        let data = data.into();
         counter.fetch_add(data.len(), Ordering::Relaxed);
         Self {
             data,
@@ -108,7 +57,12 @@ impl BufferedPayload {
     }
 
     /// 数据离开缓冲交付应用层：按口径扣减后返回原始字节。
-    pub(crate) fn into_vec(mut self) -> Vec<u8> {
+    ///
+    /// 返回 `Bytes` 而不是 `Vec<u8>`：载荷自 `Frame::decode` 起就是重组缓冲
+    /// 的一段引用计数切片，一路移交到这里都没有发生过拷贝，交付时再 `to_vec`
+    /// 等于把省下的拷贝重新付掉。中继侧只需要 `&[u8]`（`write_all(&d)`），
+    /// `Bytes` 直接 deref 即可。
+    pub(crate) fn into_bytes(mut self) -> Bytes {
         self.release();
         std::mem::take(&mut self.data)
     }
@@ -203,6 +157,52 @@ impl PendingData {
 
 pub(crate) type SharedTunnelWriter = Arc<SessionWriter>;
 
+/// 对端到达信号：读循环每收到一批字节就递增计数并唤醒等待者。
+///
+/// 写循环用它实现「让出方向」——第一个上行 burst 必须在第一条整形数据记录
+/// 之后就结束，而 burst 只能被**方向改变**打断（同方向连续包的尺寸累加，时间
+/// 间隔不算）。因此写端必须真的挂起到对端有记录抵达，光把 fake 请求排进队列
+/// 是不够的：对端的应答要一个 RTT 才回来，那期间若继续发数据，burst 就把后续
+/// 记录全部累加进去了。这正是 USENIX Sec'24 那篇论文给出的对抗建议
+/// （"buffer application data when the scheduler demands quiet time"）。
+#[derive(Default)]
+pub(crate) struct InboundSignal {
+    arrivals: AtomicU64,
+    notify: Notify,
+}
+
+impl InboundSignal {
+    fn arrivals(&self) -> u64 {
+        self.arrivals.load(Ordering::Relaxed)
+    }
+
+    fn note_arrival(&self) {
+        self.arrivals.fetch_add(1, Ordering::Relaxed);
+        // notify_one 在无等待者时留存一个 permit，故等待者不会丢唤醒。
+        self.notify.notify_one();
+    }
+}
+
+/// 「让出方向」的等待上限。路径 RTT 未知，只能给一个有界上限：对端的
+/// CMD_PADDING 应答由读循环在帧处理层立即回吐（不经应用层），因此正常路径上
+/// 一个 RTT 内必到；上限只在丢包或异常慢路径上兜底，避免首条记录之后卡死。
+const PEER_TURN_MAX_WAIT: Duration = Duration::from_millis(300);
+
+/// 挂起到对端有新记录抵达（方向改变发生）或上限到期。
+async fn wait_for_peer_turn(inbound: &InboundSignal, since: u64) {
+    let deadline = tokio::time::sleep(PEER_TURN_MAX_WAIT);
+    tokio::pin!(deadline);
+    loop {
+        if inbound.arrivals() != since {
+            return;
+        }
+        tokio::select! {
+            _ = &mut deadline => return,
+            _ = inbound.notify.notified() => {}
+        }
+    }
+}
+
 /// 顺序扫描编码缓冲中的帧头，逐帧回调 (cmd, stream_id, frame_len)；缓冲
 /// 可能是多帧合并（control 写）或任意帧拼接（bulk 积压），尾部不足一帧
 /// 时停止。
@@ -242,6 +242,74 @@ fn control_write_can_pass_through(request: &WriteRequest, pinned_sids: &HashSet<
     saw_frame && pass
 }
 
+/// 本 packet 是否承载「流生命周期」控制帧（SYN / FIN）。
+///
+/// 这两种帧在真实 H2 里**没有对应的独立小帧**：新流由 `HEADERS` 开启、
+/// 半关闭由挂在 `DATA`/`HEADERS` 上的 `END_STREAM` 标志表达，两者都是
+/// `L2` 量级的记录；一个 33–54 字节的独立记录只对应 `SETTINGS-ACK` /
+/// `WINDOW_UPDATE` / `PING`，而那三种在真实 H2 里出现的**位置**完全不同
+/// （开场、每 6 MiB、58 秒空闲）。
+///
+/// 实测（本仓测试台，一条连接跑 24 次「开流 → GET → 收响应 → 关流」）：
+/// 客户端的 FIN 与服务端的 FIN 各自独占一个 TCP 分段、且紧跟在响应体的
+/// 末段之后，于是 `(−L4, L1, −L1)`（论文 Table 2 判别力第 3，Distinc
+/// 2.879，本项目零容忍的两个 3-gram 之一）在 24 次流生命周期里出现 5–6 次
+/// ——大约每 4~5 次关流命中一次。命中与否只取决于响应末段是否 ≥1211 字节，
+/// 是一枚硬币，不是可依赖的保护。
+///
+/// 既有的回归台看不到它：`capture_scenario` 在关流之前总会再写一个 80 字节
+/// 的上行 flight，那条 `L2` 数据记录恰好把 `−L4` 与 `L1` 隔开；而最常见的
+/// HTTP GET 形态（请求发完就等响应、收完即关）没有这个 flight。
+///
+/// **`CMD_SYNACK` 刻意不在此列**，尽管它同样逐流重复。它是三者中唯一一条
+/// 记录**必然落在连接出生窗口内**的：服务端的 H2 开场 flight
+/// （`SETTINGS` + `WINDOW_UPDATE` + `SETTINGS-ACK` ≈ 119 字节）与首条 SYNACK
+/// 由同一次 `write()` 送出，把 SYNACK 从 ~40 字节抬到数据记录量级会让这个
+/// 下行分段跨过 1211 ⇒ 变成 `−L4`，而客户端此刻恰好要回一条 33 字节的
+/// `SETTINGS-ACK`（真实 H2 客户端也必须回，尺寸是定死的 9 字节帧）——于是
+/// 「客户端首个 flight（`L2`）→ 合并后的开场分段（`−L4`）→ SETTINGS-ACK
+/// （`L1`）」精确凑成 `(L2, −L4, L1)`（Distinc 7.226）。实测：把 SYNACK 纳入
+/// 本规则后 `paper_features_stay_clear_of_nested_handshake_grams` 立即命中。
+///
+/// 换句话说，SYNACK 的**小**在出生窗口里是保护而不是破绽；而 SYN / FIN 的
+/// 危害恰恰在出生窗口**之外**——它们在连接一生中重复至多 256 次，
+/// 每次都在下行 burst 之后放出一对「本端 L1 → 对端 L1」。
+fn packet_carries_stream_lifecycle_frame(packet: &[u8]) -> bool {
+    let mut lifecycle = false;
+    walk_frame_headers(packet, |cmd, _sid, _len| {
+        if matches!(cmd, CMD_SYN | CMD_FIN) {
+            lifecycle = true;
+        }
+    });
+    lifecycle
+}
+
+/// 请求内是否承载 PSH（应用数据）帧。
+///
+/// `Stream::write_gather_open` / `write_pending_open_with_data` 把
+/// `[SETTINGS][SYN][PSH(target)][PSH(首个数据块)]` 合并成一个 packet 走
+/// **Control** 类——必须同一通道才能保住「SETTINGS 先于 SYN、SYN 先于数据」
+/// 的到达顺序（若把 PSH 改走 Bulk，写循环的 biased select 会先把 bulk 积压
+/// 排空，数据反而越过 SYN 先到）。但 Control 路径不经 TrafficShaper，于是
+/// `prepare_control_record` 的 `max(采样值, payload 下限)` 生效，首记录的线速
+/// 尺寸退化为「内层首包 + 24」（Chrome 517⇒541，带 ML-KEM 的 Firefox
+/// ~1884⇒~1908），把内层 ClientHello 的尺寸 1:1 送上线，同时让第一个上行
+/// burst 远超 300 字节门限。
+///
+/// 判定为承载数据后，请求整体并入 pending 走 shaper 排空：通道不变、字节序
+/// 不变，尺寸决策回到 §3.3 声称的那一条路径上。
+fn request_carries_stream_data(request: &WriteRequest) -> bool {
+    let mut carries = false;
+    for packet in &request.packets {
+        walk_frame_headers(packet, |cmd, _sid, _len| {
+            if cmd == CMD_PSH {
+                carries = true;
+            }
+        });
+    }
+    carries
+}
+
 const MAX_PENDING_STREAM_FRAMES: usize = 1024;
 const MAX_PENDING_STREAM_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PENDING_STREAMS: usize = 1024;
@@ -257,64 +325,378 @@ const STICKY_BULK_FLUSH_MAX_RECORDS: usize = 8;
 const STICKY_BULK_FLUSH_MAX_BYTES: usize = 128 * 1024;
 
 /// 稳态 H2 行为骨架（post-script steady state）：真实 HTTP/2 接收端按消费
-/// 字节数回发 WINDOW_UPDATE，并偶发 PING/PING-ACK 对。内容加密不可见，
-/// 只需复刻尺寸/时序语义。两者都以 CMD_PADDING 帧实现：flag=1 被对端
-/// 静默吸收（等价 WINDOW_UPDATE 的“无回复”语义），flag=0 m=1 会换来
+/// 字节数回发 WINDOW_UPDATE，并在**空闲**时发 PING/PING-ACK 对。内容加密
+/// 不可见，只需复刻尺寸/时序语义。两者都以 CMD_PADDING 帧实现：flag=1 被
+/// 对端静默吸收（等价 WINDOW_UPDATE 的“无回复”语义），flag=0 m=1 会换来
 /// 一条 reply（等价 PING/PING-ACK 对）。
-const H2_WINDOW_UPDATE_MIN_BYTES: usize = 1024 * 1024;
-const H2_WINDOW_UPDATE_MAX_BYTES: usize = 4 * 1024 * 1024;
-const H2_PING_MIN_INTERVAL_SECS: u64 = 60;
-const H2_PING_MAX_INTERVAL_SECS: u64 = 150;
+///
+/// WINDOW_UPDATE 的触发阈值是**逐进程常量**，不逐次重采样。此前是
+/// `gen_range(1MB..=4MB)` 且每越过一次就重新采样一个新阈值 ⇒ 全随机，而
+/// 真实 H2 接收端的规则是确定的：窗口是实现里的编译期常量，消费字节越过
+/// 窗口的某个固定比例就回补一条 WINDOW_UPDATE。取值依据（Firefox，与本
+/// 项目的 TLS 指纹同源）：
+/// * `ASpdySession::kInitialRwin = 12 * 1024 * 1024`（12MB）——Firefox 在
+///   `SendHello` 里把连接级接收窗口从 65535 抬到这个值，源码注释原文
+///   *"This is roughly the amount of data a suspended channel will have to
+///   buffer before h2 flow control kicks in."*；
+/// * 「已消费量达到本地窗口的一半即回补」是 H2 接收端的通行规则（nghttp2 的
+///   `session_update_recv_connection_window_size`：`local_window_size / 2 <
+///   consumed_size` 时提交 WINDOW_UPDATE）。
+///
+/// 两者相乘 = 6 MiB。用 `OnceLock` 而不是 `const`：语义是「进程内解析一次、
+/// 此后恒定」，与真实实现的编译期常量同一口径，同时保留测试覆写点。
+const H2_FIREFOX_SESSION_WINDOW_BYTES: usize = 12 * 1024 * 1024;
+static H2_WINDOW_UPDATE_THRESHOLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// PING 的**空闲**阈值：Firefox 的 `network.http.spdy.ping-threshold`，
+/// 默认 58 秒。
+///
+/// 此前是「固定周期定时器 + 随机 60–150s 周期 + 两端都发」，三处都不对：
+/// * 真实 H2 按**无活动**触发——`Http2Session::ReadTimeoutTick` 的判据是
+///   `(now - mLastReadEpoch) < mPingThreshold` 就直接返回，即以「距上次从
+///   socket 读到数据的时长」为准。固定周期会在**正在传输大流量**的连接上
+///   插 PING，而真实 H2 有活动就不需要探活。空闲判据取「对端到达」而不是
+///   「任意收发」，正是为了与 `mLastReadEpoch` 同口径。
+/// * **nginx 从不主动发 H2 PING**，只回 PING-ACK ⇒ 仅客户端方向发起。
+/// * 阈值是实现里的 pref 常量，不是随机周期：在真实实现恒定的维度上随机化
+///   本身就是判别特征。
+const H2_PING_IDLE_THRESHOLD_SECS: u64 = 58;
+
+/// 论文（USENIX Sec'24, Xue et al.）的观测窗口 `Wo`：25 个承载数据的 TCP 包。
+///
+/// 连接仍处在这个窗口之内时**抑制 PING**。空闲触发本身已经让 PING 前面隔着
+/// ≥58 秒的静默，但论文的 3-gram 取在**包序列**上、不看时间间隔：一个已预热
+/// 的池化连接长时间空闲后发出的 `(+41, −41)` 对，若前一个包恰是此前下行
+/// burst 的尾段，序列上就是 `(−L4, L1, −L1)`（Distinc 2.879）。
+///
+/// 包数用「读循环收到的对端到达次数」近似：一次 `read()` 至少对应一个 TCP
+/// 段，故 arrivals ≤ 实际包数——**低估**方向，只会让抑制期更长，是保守的。
+///
+/// `TrafficShaper` 的窗口外放松（见 `shaper::POST_WINDOW_RELAX_BAND`）复用
+/// 同一个常量，但用的是一个更严的下界：`flush 次数 + arrivals`。
+pub(crate) const PAPER_OBSERVATION_WINDOW_PACKETS: u64 = 25;
+
+/// 优雅拆除前那条 H2 GOAWAY 记录的线速尺寸。
+///
+/// 真实 H2 端点在关闭连接前先发 GOAWAY（帧类型 0x07），然后才是
+/// close_notify + FIN。GOAWAY 的最小帧 = 9 字节帧头 + 4 last_stream_id +
+/// 4 error_code = 17 字节载荷，与 PING 帧（9 + 8）完全相同，故线速尺寸就是
+/// `PING_WIRE`（41）。此前拆除时线上只有一条 24 字节的 close_notify，前面
+/// 没有任何控制尺寸的记录——nginx/Firefox 关闭 H2 连接必有 GOAWAY，缺了它
+/// 本身就是一条可观测特征。
+///
+/// 用 `PADDING_FLAG_GOAWAY`（flag=2）的「不换应答」形式：GOAWAY 不换 ACK，
+/// 且旧对端的 `handle_frame` 只对 flag=0 作答、其余 flag 静默丢弃，因此这个
+/// 新 flag 值对未升级的对端**完全无害**（论证见 `PADDING_FLAG_REQUEST`）。
+const H2_GOAWAY_WIRE: usize = kanotls_tunnel::control_size::PING_WIRE;
+
+/// 41 字节的 GOAWAY 记录必须装得下 4 字节 last_stream_id，且**不改变线速
+/// 尺寸**（junk 从 8 字节变成「4 字节 id + 4 字节零」）。这条编译期断言把它
+/// 钉死：任何把 `H2_GOAWAY_WIRE` 调到 37 以下的改动直接编译失败，而不是在
+/// 运行期悄悄退化成一条不带 id 的 GOAWAY。
+const _: () = assert!(H2_GOAWAY_WIRE >= MIN_GOAWAY_RECORD_WIRE_LEN);
+
+/// 「未收到对端 GOAWAY」的哨兵值。
+///
+/// 用 `AtomicU64` 承载一个 `Option<u32>`：`u32` 的全值域都是合法的
+/// last_stream_id（含 0——真实 H2 里「一条都没处理」就写 0），没有可借用的
+/// 带内哨兵，而 `u64::MAX` 落在 u32 值域之外，单次原子读即可无撕裂地区分
+/// 「没收到」与「收到且值为 0」。
+const GOAWAY_NOT_RECEIVED: u64 = u64::MAX;
+
+/// 「对端 GOAWAY 宣告这条流从未被处理」的判据，`Session` 与 `Stream` 共用。
+///
+/// 没收到 GOAWAY ⇒ 恒为 false：本端主动 `force_close`、TCP 直接被打断、旧版本
+/// 对端等所有情形都落在这里，行为与引入 GOAWAY 语义之前逐字节一致。
+pub(crate) fn peer_never_processed(state: &AtomicU64, stream_id: u32) -> bool {
+    match state.load(Ordering::Relaxed) {
+        GOAWAY_NOT_RECEIVED => false,
+        last => u64::from(stream_id) > last,
+    }
+}
+
+/// 合成 H2 请求/响应交换（论文所称的 "synthetic co-existing flows"）。
+///
+/// 论文把 mux 的致命前提写得很直白：*"the effectiveness of multiplexing depends
+/// on the presence of co-existing flows. In situations where there is only a
+/// single flow, or where the co-existing flows are inactive, patterns will
+/// remain as exposed as non-multiplexed proxies."*，并把 "generating synthetic
+/// co-existing flows when they are not naturally present" 列为未来工作。
+///
+/// 这里的合成流量必须以**真实 H2 成因**表达，否则只是用一个新特征换旧特征。
+/// 采用的成因是「浏览器在同一条 H2 连接上继续发请求」：一条 HEADERS 尺寸的
+/// 上行记录换来一条响应尺寸的下行记录。因此
+/// * 请求侧尺寸取 C2S HEADERS 分布（`next_control_size` 的截断正态档，
+///   250–800 载荷 ⇒ 274–824 线速）——不是 PING 尺寸，避免在下行 burst 之后
+///   造出 `(−L4, L1, −L1)`；
+/// * 应答侧尺寸取响应方向的数据记录分布（见 `padding_reply_wire_len`）。
+///
+/// **开场窗口**：真实页面加载会在连接建立后的头 100ms 内连发若干请求，所以
+/// 前 `H2_EXCHANGE_OPENING_*` 次交换按数十毫秒的间隔发出——这恰好落在论文的
+/// `Wo = 25` 包观测窗口内，是「窗口内真的存在共存流」的唯一办法。
+/// **稳态**：此后回落到浏览量级的重尾间隔（中位数 ~20s）。
+///
+/// 触发条件（见读循环）：仅客户端方向、`post_script_off` 关闭时不生效、且必须
+/// 已经收到过对端记录（保证连接的第一个上行 burst 已经出网，合成请求不会挤进
+/// 那个 burst 把它顶过 300 字节）。稳态交换额外要求至少有一条流开着——一条
+/// 完全空闲的 H2 连接本来就该被 idle timeout 拆掉，硬撑着发帧反而是伪装破绽。
+const H2_EXCHANGE_OPENING_MIN_COUNT: u32 = 1;
+const H2_EXCHANGE_OPENING_MAX_COUNT: u32 = 3;
+const H2_EXCHANGE_OPENING_MU_MS: f64 = 3.4; // 中位数 ≈ 30ms
+const H2_EXCHANGE_OPENING_SIGMA: f64 = 0.7;
+const H2_EXCHANGE_STEADY_MU_MS: f64 = 9.9; // 中位数 ≈ 20s
+const H2_EXCHANGE_STEADY_SIGMA: f64 = 1.2;
+/// 稳态交换的间隔上限：超过它就没有观测意义，而且会把 sleep 的 deadline
+/// 推到不现实的远处。
+const H2_EXCHANGE_MAX_INTERVAL_SECS: u64 = 300;
 
 /// 测试覆写点：0 表示使用上面的生产常量。
 pub(crate) static H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES: AtomicUsize =
     AtomicUsize::new(0);
-pub(crate) static H2_PING_INTERVAL_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static H2_PING_IDLE_THRESHOLD_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static H2_EXCHANGE_INTERVAL_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
 
 /// H2 骨架关闭时的定时器“禁用”姿态：分支被 select guard 屏蔽，deadline
 /// 只需足够遥远。
 const H2_TIMER_DISABLED: Duration = Duration::from_secs(3600);
 
-/// `prepare_control_record` 的最小 wire 开销：block 长度前缀 + TLS record
-/// 头 + AEAD tag + inner content type。junk_len 按此反解，使整条控制记录
-/// 的 wire 尺寸命中目标 H2 帧尺寸（采样尺寸更大时由 shaper 采样兜底）。
-const CONTROL_RECORD_MIN_OVERHEAD: usize = kanotls_tunnel::common::BLOCK_LEN_PREFIX_SIZE
-    + kanotls_tunnel::common::TLS_RECORD_HEADER_LEN
-    + kanotls_tunnel::common::AEAD_TAG_LEN
-    + kanotls_tunnel::common::INNER_CONTENT_TYPE_LEN;
+/// 单条 CMD_PADDING 请求可换取的应答记录上限。
+///
+/// 真实 H2 没有「一问 m 答」这种语义：PING 换恰好一个 PING-ACK，
+/// WINDOW_UPDATE 不换任何应答，SETTINGS 换恰好一个 SETTINGS-ACK。一次交互
+/// 里能站得住脚的第二条应答记录只有一种角色——「接收方本来就要发的窗口
+/// 更新」，故上限压到 2。此前是 16：m=4 在线上就是「一条请求 → 一簇记录」，
+/// 而且（见下方 handle_frame）这一簇还被合并成单条记录，两头都不像 H2。
+const MAX_PADDING_REPLIES: usize = 2;
 
-fn sample_h2_window_update_threshold() -> usize {
+/// CMD_PADDING 记录的角色尺寸。真实 H2 里这三种帧的尺寸都是确定值
+/// （PING/PING-ACK 恒 8 字节载荷 → 17 字节帧，WINDOW_UPDATE 恒 4 字节载荷
+/// → 13 字节帧，SETTINGS-ACK 恒 9 字节帧），因此这里也取确定值而不是再过一遍
+/// 混合分布采样器：在真实实现恒定的维度上随机化，本身就是一个判别特征。
+const PADDING_REQUEST_WIRE: usize = kanotls_tunnel::control_size::PING_WIRE;
+const PADDING_ACK_WIRE: usize = kanotls_tunnel::control_size::PING_WIRE;
+const PADDING_WINDOW_UPDATE_WIRE: usize = kanotls_tunnel::control_size::WINDOW_UPDATE_WIRE;
+const PADDING_SETTINGS_ACK_WIRE: usize = kanotls_tunnel::control_size::SETTINGS_ACK_WIRE;
+
+/// 一条应答记录的目标线速尺寸，按**请求记录的 H2 角色**决定。
+///
+/// 角色由请求自身的线速尺寸唯一确定（`CMD_PADDING` 的 junk 已按目标尺寸反解，
+/// 故接收端能从帧长复原它）：
+/// * SETTINGS 尺寸的请求 → 一条 `SETTINGS-ACK`（33）；
+/// * HEADERS 量级（越过 `L1` 上界）的请求 → 一条**响应尺寸**的记录，即合成的
+///   H2 请求/响应交换（见 `sample_h2_exchange_request_wire`）；
+/// * 其余（PING 尺寸）→ 一条 `PING-ACK`（41）；
+/// * 第二条应答一律是接收方本来就要发的 `WINDOW_UPDATE`（37）。
+///
+/// 「应答尺寸随请求尺寸变化」在这里是**保真**而不是相关性泄漏：真实 H2 的
+/// PING-ACK 必须回显 PING 的 8 字节载荷、SETTINGS-ACK 恒为 9 字节帧、HEADERS
+/// 请求换来的是响应体。此前被删掉的是另一种做法——`total_junk =
+/// frame.payload.len() - 2`，让应答尺寸成为请求尺寸的**连续**函数，那才是一条
+/// 可观测的相关性。这里是一张 3 项的离散角色表。
+fn padding_reply_wire_len(request_wire_len: usize, index: usize, direction: FlowDirection) -> usize {
+    if index > 0 {
+        return PADDING_WINDOW_UPDATE_WIRE;
+    }
+    if kanotls_tunnel::control_size::is_settings_bearing_wire_size(request_wire_len) {
+        return PADDING_SETTINGS_ACK_WIRE;
+    }
+    if request_wire_len > kanotls_tunnel::control_size::L1_MAX_WIRE_LEN {
+        // 合成交换的应答：按响应侧数据记录的尺寸分布取值。
+        let payload = kanotls_tunnel::control_size::next_data_record_payload(
+            direction,
+            &mut rand::thread_rng(),
+        );
+        return SnowyStream::data_record_wire_len(payload);
+    }
+    PADDING_ACK_WIRE
+}
+
+/// 把一个 control packet 编码成一条或多条 0x17 记录：每条的线速尺寸独立
+/// 决定，载荷不足则零填充，任何一条记录的尺寸都不是载荷长度的函数。
+///
+/// 此前是「一个 packet 恰好一条记录」+ `prepare_control_record(packet, 采样值)`，
+/// 而后者取 `max(采样值 - TLS头 - AEAD tag, payload + 长度前缀 + inner)`：载荷
+/// 一旦超出采样尺寸能承载的容量，`max` 就把采样值整个吃掉，线速尺寸退化为
+/// `payload.len() + CONTROL_RECORD_MIN_OVERHEAD`。后果分三档：
+///
+/// * `Frame::cmd_settings()` 恒为 23 字节 ⇒ 客户端首条控制记录在多数连接上恒
+///   为 47 字节，而 47 不在任何采样池里——一个跨连接稳定的常量。
+/// * `send_synack_rejection` 的 reason 串长度各异（17/19/21/28/31 字节）
+///   ⇒ **拒绝原因通过记录尺寸泄漏**，持有合法 PSK 的探测者可据此区分服务端
+///   内部状态。
+/// * 最严重的是 `Stream::write_gather_open`：它把 `[SETTINGS][SYN][PSH(target)]
+///   [PSH(首个数据块)]` 合并成一个 packet 走 Control 类，于是**每条流的第一条
+///   记录尺寸 = 内层首包尺寸 + 24**。对经 SOCKS5 走 HTTPS 的浏览器，那就是内层
+///   TLS ClientHello 的尺寸 1:1 上链（Chrome 517 ⇒ 541，带 ML-KEM 的 Firefox
+///   ~1884 ⇒ ~1908），直接违反 §3.1/§3.3 声称已在 v1.1 消除的「明文长度不再
+///   映射至线速长度」。
+///
+/// 在任意字节边界切分都是安全的：wire 协议不标记 record 边界，对端把各 record
+/// 的块载荷按序拼进同一个 `BytesMut` 再 `Frame::decode`，看到的是纯字节流。
+/// （这与 `drive_shaper` 里 `frame_boundaries` 的约束不同：那里限制的是**插队**
+/// 的 control 帧只能落在完整帧边界上，因为插队会切断另一个帧的载荷；此处是
+/// 同一个 packet 自己被切成多条记录，字节序完全不变。）
+///
+/// 返回本 packet 产生的记录条数：写循环用它维护合并 flush 的批量上限
+/// （见 `FlushBatch`）。
+fn prepare_control_packet_records(
+    stream: &mut SplitWriteHalf,
+    packet: &[u8],
+    state: ConnectionState,
+    direction: FlowDirection,
+) -> std::io::Result<usize> {
+    // CMD_PADDING 的 H2 角色已知（WINDOW_UPDATE / PING / PING-ACK），尺寸由
+    // 编码侧的 junk 反解定死，整包恰好一条记录、精确命中角色尺寸。
+    if let Some(target) = self_sized_padding_wire_len(packet) {
+        trace!("control write: padding record wire_size={}", target);
+        stream.prepare_control_record(packet, target)?;
+        return Ok(1);
+    }
+
+    // 流生命周期帧（SYN / FIN）按**数据记录**分布定尺寸，不再走
+    // 控制帧的离散池（`{33, 37, 41, 46, 54}`，全部落在论文的 `L1`）。
+    //
+    // 成因与判据（含 SYNACK 为何不在此列）见
+    // `packet_carries_stream_lifecycle_frame`：这两种帧在真实 H2 里分别对应
+    // `HEADERS` 与挂在 `DATA` 上的 `END_STREAM`，都是 `L2` 量级；
+    // 而按控制池取值时，每次关流都会在响应体末段之后放出一对
+    // 「本端 L1 → 对端 L1」，实测每 4~5 次关流就精确复现 `(−L4, L1, −L1)`。
+    //
+    // 取的是与 `TrafficShaper::markov_policy` **完全相同**的采样器
+    // （`next_data_record_payload`），不是另开一个窄区间：若给它们一个专属的
+    // 窄窗口，「每条流开/关各有一条 176–272 字节的记录」本身就是一条可跨流
+    // 聚合的新特征——在一条最多承载 256 条流的连接上，可聚合的弱特征等于强
+    // 特征。与常规数据记录同分布则无从分离。
+    //
+    // 不按 `ConnectionState` 设门：`from_control_count` 用的是方向无关的上界
+    // `H2_OPENING_MAX_LEN = 3`（S2C 序列长度），而 C2S 的开场序列只有 1 条，
+    // 于是客户端的第 1、2 条控制记录**报 Handshake 却已落到 Transport 池**。
+    // 在客户端上这两条恰好就是「首条流的 FIN」与「第二条流的 SYN」——正是本
+    // 规则要覆盖的对象。实测按 `state == Transport` 设门时，`(L2, −L4, L1)`
+    // （Distinc 7.226）仍会从这两条漏出来。
+    //
+    // 开场 flight 不受影响：它由 `emit_h2_server_opening` 以**自定尺寸的
+    // CMD_PADDING** 发出，在本函数开头就短路返回了，根本不经过这里；而服务端
+    // 的 SYNACK 必然排在那三条之后（flight 由收到客户端 SETTINGS 触发，
+    // SYNACK 要等应用层 accept + 连源站）。
+    let lifecycle_sized = packet_carries_stream_lifecycle_frame(packet);
+
+    let mut rng = rand::thread_rng();
+    let mut consumed = 0usize;
+    let mut records = 0usize;
+    loop {
+        let remaining = packet.len() - consumed;
+        let control_target = if lifecycle_sized {
+            SnowyStream::data_record_wire_len(
+                kanotls_tunnel::control_size::next_data_record_payload(direction, &mut rng),
+            )
+        } else {
+            stream.next_control_size(state, direction)
+        };
+        let control_cap = control_target.saturating_sub(CONTROL_RECORD_MIN_OVERHEAD);
+        let (target, take) = if remaining <= control_cap {
+            // 常态（SYN/FIN/小 SYNACK，以及采样到较大档的 SETTINGS）：整段装
+            // 进一条采样尺寸的控制记录，余量零填充。
+            (control_target, remaining)
+        } else if remaining >= SnowyStream::data_record_capacity() {
+            // 大段载荷按满载数据记录切走，与 bulk fast path 同一口径——否则
+            // 65535 字节的首块会被切成上千条 33–82 字节的小记录，那既不像真实
+            // H2，也把每条记录 24 字节的固定开销放大到四成。
+            (
+                SnowyStream::max_data_record_wire_len(),
+                SnowyStream::data_record_capacity(),
+            )
+        } else {
+            // 装不下 ⇒ 这一段是应用数据而不是空闲期控制帧
+            // （`Stream::write_gather_open` 把 `[SETTINGS][SYN][PSH(target)]
+            // [PSH(首块)]` 合并成一个 control packet），必须按**数据记录**口径
+            // 切分：按 H2 HEADERS/DATA 帧的尺寸分布采样一个 chunk，切走
+            // `min(remaining, chunk)` 并零填充至 chunk。记录尺寸只反映这次采样，
+            // 与载荷长度无关。分布与 `TrafficShaper` 的 `InteractiveControl` 共用
+            // 同一个定义（`control_size::next_data_record_payload`），此前是本文件
+            // 私有的 200–600 均匀区间——两处对「H2 数据记录量级」各存一份定义。
+            let chunk =
+                kanotls_tunnel::control_size::next_data_record_payload(direction, &mut rng);
+            (
+                SnowyStream::data_record_wire_len(chunk),
+                remaining.min(chunk),
+            )
+        };
+        debug_assert!(
+            take + CONTROL_RECORD_MIN_OVERHEAD <= target,
+            "control payload slice must fit its target, else prepare_control_record's floor bites"
+        );
+        trace!(
+            "control write: frame_cmd=0x{:02x} wire_size={} payload={}",
+            packet.first().unwrap_or(&0),
+            target,
+            take
+        );
+        stream.prepare_control_record(&packet[consumed..consumed + take], target)?;
+        consumed += take;
+        records += 1;
+        if consumed >= packet.len() {
+            return Ok(records);
+        }
+    }
+}
+
+/// WINDOW_UPDATE 阈值：逐进程解析一次，此后恒定（论证见常量定义处）。
+fn h2_window_update_threshold() -> usize {
     let override_bytes = H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES.load(Ordering::Relaxed);
     if override_bytes > 0 {
         return override_bytes;
     }
-    use rand::Rng;
-    rand::thread_rng().gen_range(H2_WINDOW_UPDATE_MIN_BYTES..=H2_WINDOW_UPDATE_MAX_BYTES)
+    *H2_WINDOW_UPDATE_THRESHOLD.get_or_init(|| H2_FIREFOX_SESSION_WINDOW_BYTES / 2)
 }
 
-fn sample_h2_ping_interval() -> Duration {
-    let override_ms = H2_PING_INTERVAL_OVERRIDE_MS.load(Ordering::Relaxed);
+/// PING 的空闲阈值：常量，不采样（论证见 `H2_PING_IDLE_THRESHOLD_SECS`）。
+fn h2_ping_idle_threshold() -> Duration {
+    let override_ms = H2_PING_IDLE_THRESHOLD_OVERRIDE_MS.load(Ordering::Relaxed);
     if override_ms > 0 {
         return Duration::from_millis(override_ms);
     }
-    use rand::Rng;
-    let secs = rand::thread_rng().gen_range(H2_PING_MIN_INTERVAL_SECS..=H2_PING_MAX_INTERVAL_SECS);
-    Duration::from_secs(secs)
+    Duration::from_secs(H2_PING_IDLE_THRESHOLD_SECS)
 }
 
-/// 构造一条 wire 尺寸 ≈ target_wire_len 的 CMD_PADDING 帧：junk_len 按
-/// CONTROL_RECORD_MIN_OVERHEAD 反解，packet 长度对齐目标 H2 帧总长。
-fn encode_h2_wire_sized_padding(flag: u8, m: u8, target_wire_len: usize) -> Vec<u8> {
-    let junk_len = target_wire_len
-        .saturating_sub(CONTROL_RECORD_MIN_OVERHEAD)
-        .saturating_sub(crate::frame::FRAME_HEADER_SIZE + 2);
-    // junk 保持零字节：整帧随后由 ChaChaPoly 加密，填充内容在线上不可见。
-    let mut payload = vec![0u8; 2 + junk_len];
-    payload[0] = flag;
-    payload[1] = m;
-    Frame::new(CMD_PADDING, 0, payload)
-        .encode()
-        .expect("h2 skeleton padding frame encodes")
+/// 对数正态采样（Box-Muller），与 `shaper::sample_log_normal` 同口径。
+fn sample_log_normal_ms(mu: f64, sigma: f64) -> f64 {
+    use rand::Rng;
+    use std::f64::consts::PI;
+    let mut rng = rand::thread_rng();
+    loop {
+        let u1: f64 = rng.gen_range(0.0..1.0);
+        let u2: f64 = rng.gen_range(0.0..1.0);
+        if u1 <= 0.0 {
+            continue;
+        }
+        let z = (-2.0_f64 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
+        return (mu + sigma * z).exp();
+    }
+}
+
+/// 下一次合成 H2 交换的间隔：开场窗口内是数十毫秒量级，之后是浏览量级。
+fn sample_h2_exchange_interval(opening_left: u32) -> Duration {
+    let override_ms = H2_EXCHANGE_INTERVAL_OVERRIDE_MS.load(Ordering::Relaxed);
+    if override_ms > 0 {
+        return Duration::from_millis(override_ms);
+    }
+    let (mu, sigma) = if opening_left > 0 {
+        (H2_EXCHANGE_OPENING_MU_MS, H2_EXCHANGE_OPENING_SIGMA)
+    } else {
+        (H2_EXCHANGE_STEADY_MU_MS, H2_EXCHANGE_STEADY_SIGMA)
+    };
+    let ms = sample_log_normal_ms(mu, sigma).max(1.0);
+    Duration::from_micros((ms * 1000.0).round() as u64)
+        .min(Duration::from_secs(H2_EXCHANGE_MAX_INTERVAL_SECS))
+}
+
+/// 合成 H2 交换的请求记录尺寸：C2S HEADERS 帧量级（不是 PING 量级）。
+fn sample_h2_exchange_request_wire() -> usize {
+    kanotls_tunnel::control_size::next_headers_frame_wire_len(
+        FlowDirection::C2S,
+        &mut rand::thread_rng(),
+    )
 }
 
 pub struct Session {
@@ -326,26 +708,152 @@ pub struct Session {
     pub(crate) is_client: bool,
     pub(crate) max_streams_per_session: usize,
     pub(crate) post_script_off: bool,
-    idle_timeout_with_jitter_secs: u64,
+    idle_timeout_secs: u64,
     pub(crate) shutdown: Arc<Notify>,
     alive: AtomicBool,
     close_requested: Arc<AtomicBool>,
     close_notify: Arc<Notify>,
     pending_inbound_streams: AtomicUsize,
-    pending_open_streams: Arc<Mutex<HashMap<u32, PendingOpenStream>>>,
+    pending_open_streams: Arc<Mutex<PendingOpenStreams>>,
     pub(crate) pending_data: Arc<Mutex<PendingData>>,
     pending_fin: Arc<Mutex<HashSet<u32>>>,
     closing_streams: Arc<Mutex<HashSet<u32>>>,
     on_new_stream: Option<Arc<dyn Fn(u32) -> bool + Send + Sync>>,
     pending_client_settings: Arc<Mutex<Option<Vec<u8>>>>,
     pub(crate) buffered_stream_bytes: Arc<AtomicUsize>,
+    inbound: Arc<InboundSignal>,
+    /// 本端已**处理**过的最大对端流 id —— 拆除时写进 GOAWAY 的
+    /// `last_stream_id`。
+    ///
+    /// 口径刻意保守：CMD_SYN 一进 `handle_frame` 就抬水位，无论后续是接受还是
+    /// 拒绝。语义是 H2 的「**可能**已被处理」，因此**高于**水位的流才是「对端
+    /// 确定没碰过、可安全重试」的那批；把一条其实已经转发给源站的流误算进可
+    /// 重试集合，会造成非幂等请求的重复执行，方向上比漏算严重得多。
+    ///
+    /// KanoTLS 中流只由客户端发起（服务端 `next_stream_id` 起始为 0，
+    /// `next_stream_id()` 见 0 即 bail），所以这本账在客户端侧恒为 0——正如
+    /// 真实 H2 客户端在没有服务端推送时发出的 GOAWAY 也写 0。
+    peer_stream_high_water: Arc<AtomicU32>,
+    /// 对端 GOAWAY 里的 last_stream_id（`GOAWAY_NOT_RECEIVED` 表示还没收到）。
+    peer_goaway_last_stream_id: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Default)]
 struct PendingOpenStream {
     buffered_data: Vec<BufferedPayload>,
+    /// buffered_data 的运行字节数，与 `PendingOpenStreams::total_bytes` 同增
+    /// 同减，使整条流的丢弃/取走都是 O(1) 扣减。
+    bytes: usize,
     buffered_fin: bool,
     reservation_released: bool,
+}
+
+/// 服务端 pre-accept 缓冲：CMD_SYN 已到、应用层尚未 accept 期间落下的
+/// PSH/FIN。
+///
+/// 总字节以运行计数维护，入队 + / 取走・丢弃 −，四个限额检查全部 O(1)。
+/// 此前 `store_pending_open_data` 每存一帧都要
+/// `values().flat_map(buffered_data).map(len).sum()` 一遍：上限是
+/// max_streams_per_session（默认 256）× MAX_PENDING_STREAM_FRAMES（1024）
+/// = 26 万条目，而触发条件恰是它要防的那一个——消费者不 accept、帧开始落
+/// 到 pending，于是背压一发生就是 O(n²) 放大。这正是 `PendingData` 上方那段
+/// 注释已经修掉的反模式，服务端 pre-accept 这条路径漏了。
+///
+/// 载荷本身仍由 `BufferedPayload` 的 RAII 记账维护 buffered_stream_bytes 那
+/// 本账；这里维护的是 pending_open 自己的限额账，两本互不干扰。
+#[derive(Default)]
+pub(crate) struct PendingOpenStreams {
+    streams: HashMap<u32, PendingOpenStream>,
+    total_bytes: usize,
+}
+
+impl PendingOpenStreams {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
+
+    pub(crate) fn contains(&self, sid: u32) -> bool {
+        self.streams.contains_key(&sid)
+    }
+
+    pub(crate) fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    pub(crate) fn stream_frames(&self, sid: u32) -> usize {
+        self.streams
+            .get(&sid)
+            .map(|stream| stream.buffered_data.len())
+            .unwrap_or(0)
+    }
+
+    /// 登记一个新的 pre-accept 条目（重复 SYN 由调用方在此之前拒绝；万一
+    /// 覆盖，旧条目的字节先扣账，计数不会漂移）。
+    pub(crate) fn insert_new(&mut self, sid: u32) {
+        self.remove(sid);
+        self.streams.insert(sid, PendingOpenStream::default());
+    }
+
+    /// 丢弃条目：未投递载荷由 `BufferedPayload::drop` 回 buffered_stream_bytes
+    /// 的账，此处扣的是限额账。
+    pub(crate) fn remove(&mut self, sid: u32) {
+        if let Some(stream) = self.streams.remove(&sid) {
+            self.total_bytes -= stream.bytes;
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.streams.clear();
+        self.total_bytes = 0;
+    }
+
+    /// 入队一帧；条目不存在时返回 false（载荷随作用域丢弃自动回账）。
+    pub(crate) fn push_data(&mut self, sid: u32, payload: BufferedPayload) -> bool {
+        let len = payload.len();
+        match self.streams.get_mut(&sid) {
+            Some(stream) => {
+                stream.buffered_data.push(payload);
+                stream.bytes += len;
+                self.total_bytes += len;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 取走一批待投递内容（所有权转交调用方，限额账同步扣减）并清掉 FIN
+    /// 标记；None 表示条目不存在。
+    pub(crate) fn take_ready(&mut self, sid: u32) -> Option<(Vec<BufferedPayload>, bool)> {
+        let stream = self.streams.get_mut(&sid)?;
+        let data = std::mem::take(&mut stream.buffered_data);
+        let fin = stream.buffered_fin;
+        let bytes = std::mem::take(&mut stream.bytes);
+        stream.buffered_fin = false;
+        self.total_bytes -= bytes;
+        Some((data, fin))
+    }
+
+    /// 置位 buffered_fin；返回条目是否存在。
+    pub(crate) fn set_buffered_fin(&mut self, sid: u32) -> bool {
+        match self.streams.get_mut(&sid) {
+            Some(stream) => {
+                stream.buffered_fin = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 入站流预留的一次性释放：Some(true) 表示本次首次释放，None 表示条目
+    /// 不存在。
+    pub(crate) fn release_reservation(&mut self, sid: u32) -> Option<bool> {
+        let stream = self.streams.get_mut(&sid)?;
+        if stream.reservation_released {
+            return Some(false);
+        }
+        stream.reservation_released = true;
+        Some(true)
+    }
 }
 
 #[derive(Debug)]
@@ -456,6 +964,97 @@ pub(crate) struct PendingWrite {
     response_rx: Option<oneshot::Receiver<Result<(), String>>>,
 }
 
+/// 一次 flush 边界内已 prepare 进 `write_buffer`、尚未出网的内容。
+///
+/// 此前每条小控制记录各自 flush 一次：`write_control_request_now` 逐请求
+/// flush、`drive_shaper` 在排空末尾再 flush、`emit_fake_frames` 自己又 flush
+/// 一次。socket 开了 `TCP_NODELAY`，一次 `write()` 内的字节尽量落进同一个
+/// TCP 段 ⇒ **flush 边界就是分段边界，就是分类器观测的单位**。于是一条 33
+/// 字节的 SETTINGS-ACK 会独占一个 33 字节的段，哪怕同一时刻队列里还压着
+/// 后续内容；真实 NSS/BoringSSL 则把 nghttp2 已排队的全部内容一次
+/// `write()` 出去 ⇒ 一个段。这既是 KanoTLS 包数远高于 nginx 的根因，也是
+/// 零延迟源站下 `(L2, −L4, L1)` 残留的来源。而论文只在连接的前 `Wo = 25`
+/// 个承载数据的包上采样一次，包数正是那个窗口能覆盖多少内容的分母。
+///
+/// 现在改为：control/bulk 通道当前都没有立即可取的后续内容时才 flush，否则
+/// 把本批留在 `write_buffer` 里与后续内容并进同一次 `write()`。记录的尺寸、
+/// 条数、顺序完全不变——只改分段边界。
+///
+/// **responder 语义不变**：必须在字节真正 flush 之后才应答 `Ok`
+/// （`PendingWrite::wait` 的调用方依赖它），因此同一批 responder 在同一次
+/// flush 之后一起应答。responder 只能在其字节**已经 prepare 进
+/// write_buffer** 之后才入批——仍留在明文积压 `pending` 里的写请求，其
+/// responder 由 `drain_pending_and_respond` 在整段排空之后才移交本批。
+#[derive(Default)]
+struct FlushBatch {
+    /// 字节已进入 write_buffer、等「真正出网」才能应答的 responder。
+    responders: Vec<oneshot::Sender<Result<(), String>>>,
+    /// 自上次 flush 以来 prepare 的记录条数（合并上限之一）。
+    records: usize,
+    /// 本连接累计成功 flush 的次数。
+    ///
+    /// 用途：给 `TrafficShaper` 一个**可辩护的包数下界**。socket 开了
+    /// `TCP_NODELAY`，一次 `flush()` = 一次 `write()` ⇒ 至少一个 TCP 段，
+    /// 因此「flush 次数」恒 ≤ 本端已发出的承载数据的包数。加上
+    /// `InboundSignal::arrivals()`（一次 `read()` ≥ 一个对端段，同样是下界），
+    /// 两者之和是**双向总包数的下界**。
+    ///
+    /// 为什么不能用 shaper 自己的 `packet_seq`：它计的是**记录**条数，而合并
+    /// flush 会把最多 `STICKY_BULK_FLUSH_MAX_RECORDS` 条记录塞进同一个段
+    /// ⇒ `packet_seq` 会**高估**包数，据此判「窗口已过」会放松得太早。下界则
+    /// 只会判得太晚——方向保守，与 PING 抑制处的口径一致。
+    flushes: u64,
+}
+
+impl FlushBatch {
+    fn note_records(&mut self, count: usize) {
+        self.records += count;
+    }
+
+    fn push_responder(&mut self, responder: oneshot::Sender<Result<(), String>>) {
+        self.responders.push(responder);
+    }
+
+    fn is_idle(&self) -> bool {
+        self.records == 0 && self.responders.is_empty()
+    }
+
+    /// 合并上限（双上限，先到先 flush）：沿用 sticky bulk 的**确定性**阈值，
+    /// 不加抖动——真实实现在这里也不抖动。它保证合并不会引入无界延迟，也
+    /// 保证 write_buffer 不会无界增长。
+    fn is_full(&self, buffered: usize) -> bool {
+        self.records >= STICKY_BULK_FLUSH_MAX_RECORDS || buffered >= STICKY_BULK_FLUSH_MAX_BYTES
+    }
+
+    /// 冲刷并应答本批全部 responder。
+    async fn flush(&mut self, write_half: &mut SplitWriteHalf) -> std::io::Result<()> {
+        self.records = 0;
+        match write_half.flush().await {
+            Ok(()) => {
+                self.flushes = self.flushes.saturating_add(1);
+                for responder in self.responders.drain(..) {
+                    let _ = responder.send(Ok(()));
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                for responder in self.responders.drain(..) {
+                    let _ = responder.send(Err(msg.clone()));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn fail(&mut self, msg: &str) {
+        self.records = 0;
+        for responder in self.responders.drain(..) {
+            let _ = responder.send(Err(msg.to_string()));
+        }
+    }
+}
+
 impl Session {
     pub fn new(
         tunnel: SnowyStream,
@@ -473,7 +1072,11 @@ impl Session {
         }));
         let close_requested = Arc::new(AtomicBool::new(false));
         let close_notify = Arc::new(Notify::new());
-        let (read_half, write_half) = split_snowy(tunnel);
+        let inbound = Arc::new(InboundSignal::default());
+        // 写循环在 SessionWriter::new 里就被 spawn 出去，而 GOAWAY 由它在退出
+        // 路径上发出：水位账本必须先于写循环存在，两侧共享同一个 Arc。
+        let peer_stream_high_water = Arc::new(AtomicU32::new(0));
+        let (read_half, write_half) = tunnel.into_split();
         let writer = Arc::new(SessionWriter::new(
             write_half,
             close_requested.clone(),
@@ -482,19 +1085,11 @@ impl Session {
             config.traffic_script.as_deref(),
             config.post_script_off,
             pending_client_settings.clone(),
+            inbound.clone(),
+            peer_stream_high_water.clone(),
         ));
-        // 空闲拆除仅服务端生效（见 run_read_loop）：客户端无需抖动采样。
-        let idle_timeout_with_jitter_secs = {
-            let base = config.idle_timeout_secs.max(1);
-            if config.is_client {
-                base
-            } else {
-                let jitter_max = (base / 10).max(1);
-                use rand::Rng;
-                let mut rng = rand::thread_rng();
-                base + rng.gen_range(0..=jitter_max)
-            }
-        };
+        // 空闲拆除取配置值本身，**不加抖动**（论证见 `Session::idle_timeout_secs`）。
+        let idle_timeout_secs = config.idle_timeout_secs.max(1);
 
         Self {
             read_half: Mutex::new(Some(read_half)),
@@ -505,19 +1100,22 @@ impl Session {
             is_client: config.is_client,
             max_streams_per_session: config.max_streams_per_session,
             post_script_off: config.post_script_off,
-            idle_timeout_with_jitter_secs,
+            idle_timeout_secs,
             shutdown: Arc::new(Notify::new()),
             alive: AtomicBool::new(true),
             close_requested,
             close_notify,
             pending_inbound_streams: AtomicUsize::new(0),
-            pending_open_streams: Arc::new(Mutex::new(HashMap::new())),
+            pending_open_streams: Arc::new(Mutex::new(PendingOpenStreams::default())),
             pending_data: Arc::new(Mutex::new(PendingData::default())),
             pending_fin: Arc::new(Mutex::new(HashSet::new())),
             closing_streams: Arc::new(Mutex::new(HashSet::new())),
             on_new_stream,
             pending_client_settings,
             buffered_stream_bytes: Arc::new(AtomicUsize::new(0)),
+            inbound,
+            peer_stream_high_water,
+            peer_goaway_last_stream_id: Arc::new(AtomicU64::new(GOAWAY_NOT_RECEIVED)),
         }
     }
 
@@ -556,8 +1154,53 @@ impl Session {
         }
     }
 
-    pub fn idle_timeout_with_jitter_secs(&self) -> u64 {
-        self.idle_timeout_with_jitter_secs
+    /// 服务端 session 的空闲拆除时长，**精确常量、无抖动**。
+    ///
+    /// 此前取 `base + U[0, base/10]`（默认 45 秒 ±10%），于是每条服务端连接的
+    /// 空闲拆除时刻是一个逐连接采样的随机量。真实 nginx 的 `keepalive_timeout`
+    /// 是一个编译进配置的**精确常量**：同一台服务器上所有空闲连接都在同一秒
+    /// 被关掉。在一个真实实现恒定的维度上随机化，本身就是判别特征
+    /// （MECHANISM §9.0 原则 2）。
+    ///
+    /// 这条抖动此前只是次要观测量：客户端连接池 30 秒回收先于服务端 45 秒
+    /// 触发，服务端定时器多数情况下根本走不到期。上一轮把池的空闲回收提到
+    /// **115 秒**（Firefox `network.http.keep-alive.timeout`）之后，**先关闭的
+    /// 一方变成了服务端**，这个抖动随之升级为线上**主要的可观测拆除时序**——
+    /// 一个观测者只要对同一服务端保持若干条空闲连接，就能测出「关闭时刻服从
+    /// 一个宽度为 base/10 的均匀分布」，而任何真实服务器给出的都是一条直线。
+    pub fn idle_timeout_secs(&self) -> u64 {
+        self.idle_timeout_secs
+    }
+
+    /// 记录对端 GOAWAY 的 `last_stream_id`。
+    ///
+    /// **只在客户端侧记账**。H2 里 GOAWAY 的 last_stream_id 指的是「**接收方
+    /// 发起的**流」——客户端发的 GOAWAY 说的是服务端推送流，与服务端 accept
+    /// 来的那些客户端发起的流毫无关系。KanoTLS 里流只由客户端发起，所以客户端
+    /// 发出的 GOAWAY 恒带 0；若服务端也照单全收，它会把自己手上**每一条**流
+    /// （id ≥ 1）都判成「对端没处理过」，正好是最危险的误判方向。
+    ///
+    /// 载荷长度不足以携带 id 时（`decode_padding_goaway` 返回 `None`）保持
+    /// 「未收到」状态：宁可退化成与今天完全一致的普通断开，也不能把缺省值 0
+    /// 当成真值。
+    fn note_peer_goaway(&self, payload: &[u8]) {
+        if !self.is_client {
+            return;
+        }
+        let Some(last_stream_id) = decode_padding_goaway(payload) else {
+            return;
+        };
+        debug!(last_stream_id, "peer sent GOAWAY");
+        // fetch_min 而不是 store：GOAWAY 在 H2 中可以发第二条以收窄范围，
+        // 但绝不允许放宽（那会把已经判定为「未处理」的流又算回去）。
+        // 哨兵是 u64::MAX，所以首条 GOAWAY 天然取胜。
+        self.peer_goaway_last_stream_id
+            .fetch_min(u64::from(last_stream_id), Ordering::Relaxed);
+    }
+
+    /// 对端 GOAWAY 是否宣告 `stream_id` 从未被处理 ⇒ 该流可安全重试。
+    pub fn peer_never_processed(&self, stream_id: u32) -> bool {
+        peer_never_processed(&self.peer_goaway_last_stream_id, stream_id)
     }
 
     pub fn buffered_stream_bytes(&self) -> usize {        self.buffered_stream_bytes.load(Ordering::Relaxed)
@@ -711,6 +1354,7 @@ impl Session {
             pending_fin: self.pending_fin.clone(),
             closing_streams: self.closing_streams.clone(),
             pending_notify,
+            peer_goaway_last_stream_id: self.peer_goaway_last_stream_id.clone(),
             open_state: if has_deferred_open {
                 StreamOpenState::DeferredUnsent(vec![syn])
             } else {
@@ -784,8 +1428,7 @@ impl Session {
             .await
             .take()
             .ok_or_else(|| anyhow::anyhow!("session read loop already running"))?;
-        let mut buf = BytesMut::with_capacity(65536);
-        let mut read_buf = vec![0u8; 16384];
+        let mut buf = BytesMut::with_capacity(TUNNEL_REASSEMBLY_CAPACITY);
 
         let mut settings_received = self.is_client;
 
@@ -793,7 +1436,7 @@ impl Session {
         // 统一管理（drain 后 force_close 本 session），session 层不再重复
         // 维护一套永远更晚触发的空闲定时器。
         let idle_teardown_enabled = !self.is_client;
-        let idle_duration = Duration::from_secs(self.idle_timeout_with_jitter_secs);
+        let idle_duration = Duration::from_secs(self.idle_timeout_secs);
         let idle_timeout = tokio::time::sleep(idle_duration);
         tokio::pin!(idle_timeout);
 
@@ -801,13 +1444,34 @@ impl Session {
         // 分支被 guard 屏蔽）。
         let h2_skeleton_enabled = !self.post_script_off;
         let mut bytes_since_window_update = 0usize;
-        let mut window_update_threshold = sample_h2_window_update_threshold();
-        let h2_ping_timer = tokio::time::sleep(if h2_skeleton_enabled {
-            sample_h2_ping_interval()
+        // PING 仅客户端方向发起：nginx 从不主动发 H2 PING，只回 PING-ACK。
+        // 触发条件是**空闲**而不是固定周期，故这里的定时器只是一个自校正的
+        // tick：到期后先看「距上次对端到达」够不够阈值，不够就按剩余时间重新
+        // 武装。论证见 H2_PING_IDLE_THRESHOLD_SECS。
+        let h2_ping_enabled = h2_skeleton_enabled && self.is_client;
+        let mut last_inbound_at = tokio::time::Instant::now();
+        let h2_ping_timer = tokio::time::sleep(if h2_ping_enabled {
+            h2_ping_idle_threshold()
         } else {
             H2_TIMER_DISABLED
         });
         tokio::pin!(h2_ping_timer);
+
+        // 合成共存流：仅客户端方向（真实 H2 的请求由客户端发起）。
+        let h2_exchange_enabled = h2_skeleton_enabled && self.is_client;
+        let mut h2_exchange_opening_left = if h2_exchange_enabled {
+            use rand::Rng;
+            rand::thread_rng()
+                .gen_range(H2_EXCHANGE_OPENING_MIN_COUNT..=H2_EXCHANGE_OPENING_MAX_COUNT)
+        } else {
+            0
+        };
+        let h2_exchange_timer = tokio::time::sleep(if h2_exchange_enabled {
+            sample_h2_exchange_interval(h2_exchange_opening_left)
+        } else {
+            H2_TIMER_DISABLED
+        });
+        tokio::pin!(h2_exchange_timer);
 
         loop {
             if self.close_requested.load(Ordering::Relaxed) {
@@ -822,56 +1486,98 @@ impl Session {
                 }
                 _ = &mut idle_timeout, if idle_teardown_enabled => {
                     if self.is_idle_timeout_eligible().await {
-                        debug!("session idle for {}s, tearing down", self.idle_timeout_with_jitter_secs);
+                        debug!("session idle for {}s, tearing down", self.idle_timeout_secs);
                         break;
                     }
                     idle_timeout.as_mut().reset(tokio::time::Instant::now() + idle_duration);
                     continue;
                 }
-                _ = &mut h2_ping_timer, if h2_skeleton_enabled => {
-                    // 偶发 PING 对：flag=0 m=1 请求（wire ≈ H2 PING），对端
-                    // 回一条 padding reply，构成 PING/PING-ACK 时序。
-                    let packet = encode_h2_wire_sized_padding(
-                        0,
-                        1,
-                        kanotls_tunnel::control_size::PING_WIRE,
-                    );
-                    if let Err(e) = self
-                        .writer
-                        .submit_write_packets(
-                            vec![packet],
-                            FlushBehavior::Auto,
-                            TrafficClass::Control,
-                        )
-                        .await
-                    {
-                        warn!("failed to queue h2 ping padding: {}", e);
+                _ = &mut h2_ping_timer, if h2_ping_enabled => {
+                    // 空闲探活：flag=0 m=1 请求（wire 恰为 H2 PING 尺寸），
+                    // 对端回一条 padding reply，构成 PING/PING-ACK 时序。
+                    let threshold = h2_ping_idle_threshold();
+                    if last_inbound_at.elapsed() < threshold {
+                        // 期间有对端数据到达 ⇒ 连接不空闲，真实 H2 不探活。
+                        h2_ping_timer.as_mut().reset(last_inbound_at + threshold);
+                        continue;
+                    }
+                    // 仍在论文的 Wo 观测窗口内时抑制，论证见
+                    // PAPER_OBSERVATION_WINDOW_PACKETS。
+                    if self.inbound.arrivals() >= PAPER_OBSERVATION_WINDOW_PACKETS {
+                        let packet = encode_padding_request_sized(1, PADDING_REQUEST_WIRE);
+                        if let Err(e) = self
+                            .writer
+                            .submit_write_packets(
+                                vec![packet],
+                                FlushBehavior::Auto,
+                                TrafficClass::Control,
+                            )
+                            .await
+                        {
+                            warn!("failed to queue h2 ping padding: {}", e);
+                        }
                     }
                     h2_ping_timer
                         .as_mut()
-                        .reset(tokio::time::Instant::now() + sample_h2_ping_interval());
+                        .reset(tokio::time::Instant::now() + threshold);
                     continue;
                 }
-                result = read_half.read(&mut read_buf) => result,
+                _ = &mut h2_exchange_timer, if h2_exchange_enabled => {
+                    // 合成 H2 请求/响应交换。发出条件（论证见
+                    // H2_EXCHANGE_OPENING_MIN_COUNT）：
+                    //  * 对端已经说过话——保证连接的第一个上行 burst 已出网，
+                    //    合成请求不会挤进那个 burst 把它顶过 300 字节门限；
+                    //  * 仍在开场窗口内，或至少有一条流开着。
+                    let peer_spoke = self.inbound.arrivals() > 0;
+                    let has_stream = self.capacity_stream_count.load(Ordering::Relaxed) > 0;
+                    if peer_spoke && (h2_exchange_opening_left > 0 || has_stream) {
+                        let wire = sample_h2_exchange_request_wire();
+                        let packet = encode_padding_request_sized(1, wire);
+                        if let Err(e) = self
+                            .writer
+                            .submit_write_packets(
+                                vec![packet],
+                                FlushBehavior::Auto,
+                                TrafficClass::Control,
+                            )
+                            .await
+                        {
+                            warn!("failed to queue h2 synthetic exchange: {}", e);
+                        }
+                        h2_exchange_opening_left = h2_exchange_opening_left.saturating_sub(1);
+                    }
+                    h2_exchange_timer.as_mut().reset(
+                        tokio::time::Instant::now()
+                            + sample_h2_exchange_interval(h2_exchange_opening_left),
+                    );
+                    continue;
+                }
+                result = read_tunnel_chunk(&mut read_half, &mut buf) => result,
             };
 
             idle_timeout
                 .as_mut()
                 .reset(tokio::time::Instant::now() + idle_duration);
 
-            let n = match read_result {
+            match read_result {
                 Ok(0) => {
                     debug!("tunnel eof, ending read loop");
                     break;
                 }
-                Ok(n) => n,
+                // 字节已由 `read_tunnel_chunk` 直接落进 `buf` 的尾部。
+                Ok(_) => {}
                 Err(e) => {
                     error!("tunnel read error: {}", e);
                     break;
                 }
-            };
+            }
 
-            buf.extend_from_slice(&read_buf[..n]);
+            // 方向改变信号：写循环据此结束第一个上行 burst（见 InboundSignal）。
+            self.inbound.note_arrival();
+            // PING 的空闲判据与 Firefox 的 `mLastReadEpoch` 同口径：只由
+            // 「从 socket 读到数据」刷新。
+            last_inbound_at = tokio::time::Instant::now();
+
             if buf.len() > MAX_SESSION_REASSEMBLY_BYTES {
                 warn!(
                     "closing session: frame reassembly buffer exceeded {} bytes",
@@ -882,19 +1588,16 @@ impl Session {
 
             let mut protocol_error = false;
             while let Some(frame) = Frame::decode(&mut buf) {
-                // WINDOW_UPDATE 节奏：每分发约 1–4MB 数据（阈值每连接随机、
-                // 越过后重采样）即向对端注入一条 flag=1 padding（wire ≈ H2
-                // WINDOW_UPDATE），方向天然是收 bulk 的一方发 WU。
+                // WINDOW_UPDATE 节奏：消费字节每越过一次**逐进程常量**阈值
+                // （= Firefox 连接窗口的一半，见 H2_WINDOW_UPDATE_THRESHOLD）
+                // 即向对端注入一条 flag=1 padding（wire ≈ H2 WINDOW_UPDATE），
+                // 方向天然是收 bulk 的一方发 WU。
                 if h2_skeleton_enabled && frame.cmd == CMD_PSH {
                     bytes_since_window_update += frame.payload.len();
+                    let window_update_threshold = h2_window_update_threshold();
                     while bytes_since_window_update >= window_update_threshold {
                         bytes_since_window_update -= window_update_threshold;
-                        window_update_threshold = sample_h2_window_update_threshold();
-                        let packet = encode_h2_wire_sized_padding(
-                            1,
-                            0,
-                            kanotls_tunnel::control_size::WINDOW_UPDATE_WIRE,
-                        );
+                        let packet = encode_padding_reply_sized(PADDING_WINDOW_UPDATE_WIRE);
                         if let Err(e) = self
                             .writer
                             .submit_write_packets(
@@ -931,13 +1634,87 @@ impl Session {
         Ok(())
     }
 
+    /// 拒绝原因帧的定长载荷：全部 reason 右侧补空格到同一长度。
+    ///
+    /// 此前 reason 原样上帧，五种原因的长度各不相同（17/19/21/28/31 字节）。
+    /// 控制记录切分后尺寸虽已落回采样池，但「载荷能否装进当前那条记录」仍取决
+    /// 于长度：短原因装得下 ⇒ 一条开场尺寸的记录，长原因装不下 ⇒ 退到数据量级
+    /// 的记录。于是**拒绝原因仍能通过记录尺寸/条数被区分**，持有合法 PSK 的
+    /// 探测者据此可以枚举服务端内部状态（settings 未到 / 流 id 重复 / 达到流上限
+    /// / 过载 / 不接受入站流）。定长后五种原因在线上完全同形。
+    /// 接收侧 `Stream::wait_synack_once` 会 trim 掉补白。
+    const SYNACK_REJECTION_PAYLOAD_LEN: usize = 32;
+
     async fn send_synack_rejection(
         &self,
         stream_id: u32,
         reason: &'static str,
     ) -> Result<(), anyhow::Error> {
-        let frame = Frame::new(CMD_SYNACK, stream_id, reason.as_bytes().to_vec());
+        debug_assert!(reason.len() <= Self::SYNACK_REJECTION_PAYLOAD_LEN);
+        let mut payload = vec![b' '; Self::SYNACK_REJECTION_PAYLOAD_LEN];
+        let take = reason.len().min(Self::SYNACK_REJECTION_PAYLOAD_LEN);
+        payload[..take].copy_from_slice(&reason.as_bytes()[..take]);
+        let frame = Frame::new(CMD_SYNACK, stream_id, payload);
         self.write_frame(&frame, TrafficClass::Control).await
+    }
+
+    /// 服务端在收到客户端 `CMD_SETTINGS` 后立即发出的 H2 开场 flight。
+    ///
+    /// 这把 `control_size::h2_opening_size` 从一张**尺寸表**变成了真正的
+    /// **发送时序**。此前那三条 S2C 开场尺寸只是「服务端接下来碰巧要发的前 3 条
+    /// 控制记录」被赋予的尺寸，而服务端在没有 SYNACK/padding 要发时根本不说话；
+    /// 于是线上既没有 nginx/h2o 那条
+    /// `SETTINGS → WINDOW_UPDATE → SETTINGS-ACK` 开场 flight，客户端一侧的
+    /// `h2_opening_size(C2S, 0) = SETTINGS-ACK` 也永远被跳过（客户端的第一条控制
+    /// 记录是自定尺寸的 CMD_PADDING，走 `self_sized_padding_wire_len` 短路，
+    /// 不消费开场序列的 index 0）。
+    ///
+    /// 现在两侧都对齐真实 H2：
+    /// * 服务端收到客户端 SETTINGS ⇒ 回 `SETTINGS`（换一条 ACK）+
+    ///   `WINDOW_UPDATE`（不换应答）+ `SETTINGS-ACK`（不换应答），三条记录一次
+    ///   flush，正是 nginx 的开场写；
+    /// * 客户端收到那条 SETTINGS ⇒ 由 `padding_reply_wire_len` 的角色表回一条
+    ///   33 字节 `SETTINGS-ACK`，即 `h2_opening_size(C2S, 0)`。
+    ///
+    /// 这同时取代了旧的「首条数据记录同批注入一条 41 字节 PING 请求」来让出
+    /// 方向：PING 是保活帧，把它放在最受关注的位置（论文 `Wo = 25` 窗口的第 0
+    /// 条记录）等于用一个新特征换掉旧特征。SETTINGS/SETTINGS-ACK 交换是这个
+    /// 位置上唯一站得住脚的 H2 语义，而且同样在一个 RTT 内完成——它由读循环在
+    /// 帧层直接回吐，不经 DNS / connect（SYNACK 要等那两步，10–100ms）。
+    ///
+    /// 尺寸取 `h2_opening_size` 的确定值而不是采样：真实端点的开场帧内容由代码
+    /// 决定，逐连接抖动本身就是判别特征（同 `H2_OPENING_MAX_LEN` 的论证）。
+    /// 三条记录共用一次 flush，因此线上是**一个** ~121/139 字节的下行分段，与
+    /// nginx 把开场帧一次写出的形态一致。
+    async fn emit_h2_server_opening(&self) {
+        if self.is_client || self.post_script_off {
+            return;
+        }
+        use kanotls_tunnel::control_size::h2_opening_size;
+        let mut packets = Vec::new();
+        let mut index = 0u64;
+        while let Some(size) = h2_opening_size(FlowDirection::S2C, index) {
+            // index 0 是服务端自己的 SETTINGS：按 H2 语义必须换来一条
+            // SETTINGS-ACK ⇒ flag=0, m=1。其余两条（WINDOW_UPDATE、
+            // 对客户端 SETTINGS 的 ACK）不换应答 ⇒ flag=1。
+            let packet = if index == 0 {
+                encode_padding_request_sized(1, size)
+            } else {
+                encode_padding_reply_sized(size)
+            };
+            packets.push(packet);
+            index += 1;
+        }
+        if packets.is_empty() {
+            return;
+        }
+        if let Err(e) = self
+            .writer
+            .submit_write_packets(packets, FlushBehavior::Auto, TrafficClass::Control)
+            .await
+        {
+            warn!("failed to queue h2 server opening flight: {}", e);
+        }
     }
 
     async fn handle_frame(
@@ -1050,6 +1827,11 @@ impl Session {
                 }
             }
             CMD_SYN => {
+                // 水位在**任何**分支判断之前抬起：GOAWAY 的 last_stream_id 语义
+                // 是「可能已被处理」，一条被拒绝的 SYN 同样已经换回了一条
+                // SYNACK 拒绝帧，绝不属于「对端没碰过、可安全重试」的那批。
+                self.peer_stream_high_water
+                    .fetch_max(frame.stream_id, Ordering::Relaxed);
                 if !*settings_received {
                     tracing::warn!("CMD_SYN received before CMD_SETTINGS, dropping");
                     self.send_synack_rejection(frame.stream_id, "settings not received")
@@ -1076,13 +1858,13 @@ impl Session {
                 self.pending_open_streams
                     .lock()
                     .await
-                    .insert(frame.stream_id, PendingOpenStream::default());
+                    .insert_new(frame.stream_id);
                 if let Some(ref cb) = self.on_new_stream {
                     if !cb(frame.stream_id) {
                         self.pending_open_streams
                             .lock()
                             .await
-                            .remove(&frame.stream_id);
+                            .remove(frame.stream_id);
                         self.release_inbound_stream_reservation();
                         self.send_synack_rejection(frame.stream_id, "server overloaded")
                             .await?;
@@ -1091,7 +1873,7 @@ impl Session {
                     self.pending_open_streams
                         .lock()
                         .await
-                        .remove(&frame.stream_id);
+                        .remove(frame.stream_id);
                     self.release_inbound_stream_reservation();
                     self.send_synack_rejection(frame.stream_id, "inbound streams not accepted")
                         .await?;
@@ -1162,7 +1944,9 @@ impl Session {
                         .and_then(|handle| handle.synack_tx.take())
                 };
                 if let Some(tx) = synack_tx {
-                    let payload = frame.payload;
+                    // SYNACK 载荷是定长 32 字节的拒绝原因串，走 oneshot
+                    // 通道（`Vec<u8>`）交付；这一次拷贝在量级上不可见。
+                    let payload = frame.payload.to_vec();
                     let has_pending = self.pending_data.lock().await.contains(frame.stream_id)
                         || self.pending_fin.lock().await.contains(&frame.stream_id);
                     if tx.send(payload).is_err() {
@@ -1175,33 +1959,65 @@ impl Session {
                 }
             }
             CMD_SETTINGS => {
+                let first = !*settings_received;
                 *settings_received = true;
                 trace!(
                     "client settings: {}",
                     String::from_utf8_lossy(&frame.payload)
                 );
+                if first {
+                    self.emit_h2_server_opening().await;
+                }
             }
             CMD_PADDING => {
-                let flag = frame.payload.first().copied().unwrap_or(0);
-                if flag == 0 {
-                    let m = frame.payload.get(1).copied().unwrap_or(1).clamp(1, 16);
-                    let total_junk = frame.payload.len().saturating_sub(2).max(32);
-                    // 全部 reply 连续写进一个 buffer，作为单个 control
-                    // WriteRequest fire-and-forget 提交：只等入队成功，
-                    // 不等 socket 冲刷，读循环不被 reply 拖住。
-                    let mut replies = Vec::new();
-                    for i in 0..m as usize {
-                        let step = i.saturating_mul(41) % 192;
-                        let junk_len = total_junk.min(48 + step);
-                        encode_padding_reply_into(&mut replies, junk_len);
-                    }
+                let flag = frame.payload.first().copied().unwrap_or(PADDING_FLAG_REQUEST);
+                if flag == PADDING_FLAG_GOAWAY {
+                    self.note_peer_goaway(&frame.payload);
+                } else if flag == PADDING_FLAG_REQUEST {
+                    // 请求记录的线速尺寸由帧长唯一复原（junk 已按目标反解），
+                    // 应答的 H2 角色据此决定——见 padding_reply_wire_len。
+                    let request_wire = FRAME_HEADER_SIZE
+                        + frame.payload.len()
+                        + CONTROL_RECORD_MIN_OVERHEAD;
+                    let m = frame
+                        .payload
+                        .get(1)
+                        .copied()
+                        .unwrap_or(1)
+                        .clamp(1, MAX_PADDING_REPLIES as u8) as usize;
+                    // 每条 reply 独立成 packet：write_control_request_now 逐
+                    // packet prepare 一条记录，于是 m 条应答就是 m 条独立记录。
+                    // 此前全部 reply 连续写进同一个 Vec 并以 `vec![replies]`
+                    // 提交，只 prepare 一次 ⇒ 线上只有 1 条记录（m=2 恒 138B、
+                    // m=4 恒 252B），设计文档 §3.8 要求的「M 个独立拆分应答」
+                    // 从未成立；又因请求侧尺寸同样由 payload 反向决定，m=1 时
+                    // 两端恒为 81B，构成成对签名。
+                    //
+                    // 尺寸取角色常量而非派生自请求载荷长度：旧实现
+                    // `total_junk = frame.payload.len() - 2` 让应答尺寸跟着
+                    // 请求尺寸联动，本身就是一条「请求尺寸 → 应答尺寸」的
+                    // 可观测相关性。
+                    let direction = if self.is_client {
+                        FlowDirection::C2S
+                    } else {
+                        FlowDirection::S2C
+                    };
+                    let replies: Vec<Vec<u8>> = (0..m)
+                        .map(|i| {
+                            encode_padding_reply_sized(padding_reply_wire_len(
+                                request_wire,
+                                i,
+                                direction,
+                            ))
+                        })
+                        .collect();
+                    // 单个 control WriteRequest fire-and-forget 提交：只等入队
+                    // 成功，不等 socket 冲刷，读循环不被 reply 拖住。m 条记录
+                    // 共用一次 flush——真实 H2 端点同样把同一 flight 的
+                    // PING-ACK 与 WINDOW_UPDATE 合并写出。
                     if let Err(e) = self
                         .writer
-                        .submit_write_packets(
-                            vec![replies],
-                            FlushBehavior::Auto,
-                            TrafficClass::Control,
-                        )
+                        .submit_write_packets(replies, FlushBehavior::Auto, TrafficClass::Control)
                         .await
                     {
                         warn!("failed to queue CMD_PADDING replies: {}", e);
@@ -1274,18 +2090,19 @@ impl Session {
         pending_fin.insert(sid);
     }
 
-    async fn store_pending_open_data(&self, sid: u32, payload: Vec<u8>) -> bool {
+    async fn store_pending_open_data(&self, sid: u32, payload: Bytes) -> bool {
         let mut pending = self.pending_open_streams.lock().await;
-        let total_bytes: usize = pending
-            .values()
-            .flat_map(|stream| stream.buffered_data.iter())
-            .map(BufferedPayload::len)
-            .sum();
-        let Some(stream) = pending.get_mut(&sid) else {
+        if !pending.contains(sid) {
             return false;
-        };
+        }
 
-        if total_bytes.saturating_add(payload.len()) > MAX_PENDING_STREAM_BYTES {
+        // 两个限额检查都是 O(1)（PendingOpenStreams 维护运行计数）。此前字节
+        // 上限是对全部条目的全量求和，而它恰好在每存一帧时被调一次。
+        if pending
+            .total_bytes()
+            .saturating_add(payload.len())
+            > MAX_PENDING_STREAM_BYTES
+        {
             warn!(
                 stream_id = sid,
                 "dropping pending stream data: pending byte limit exceeded"
@@ -1293,7 +2110,7 @@ impl Session {
             return true;
         }
 
-        if stream.buffered_data.len() >= MAX_PENDING_STREAM_FRAMES {
+        if pending.stream_frames(sid) >= MAX_PENDING_STREAM_FRAMES {
             warn!(
                 stream_id = sid,
                 "dropping pending stream data: per-stream frame limit exceeded"
@@ -1303,21 +2120,20 @@ impl Session {
 
         // pre-accept 缓冲同样由 BufferedPayload 入账；
         // flush_pending_accept_stream 投递时只是转移所有权。
-        stream.buffered_data.push(BufferedPayload::new(
-            payload,
-            &self.buffered_stream_bytes,
-        ));
+        let stored = pending.push_data(
+            sid,
+            BufferedPayload::new(payload, &self.buffered_stream_bytes),
+        );
+        debug_assert!(stored, "条目存在性已在同一把锁下检查过");
         true
     }
 
     async fn store_pending_open_fin(&self, sid: u32) -> bool {
         let mut pending = self.pending_open_streams.lock().await;
-        let Some(stream) = pending.get_mut(&sid) else {
+        if !pending.set_buffered_fin(sid) {
             return false;
-        };
-        stream.buffered_fin = true;
-        if !stream.reservation_released {
-            stream.reservation_released = true;
+        }
+        if pending.release_reservation(sid).unwrap_or(false) {
             drop(pending);
             self.release_inbound_stream_reservation();
         }
@@ -1325,15 +2141,11 @@ impl Session {
     }
 
     pub(crate) async fn release_pending_open_reservation(&self, sid: u32) -> bool {
-        let mut pending = self.pending_open_streams.lock().await;
-        let Some(stream) = pending.get_mut(&sid) else {
-            return false;
-        };
-        if stream.reservation_released {
-            return false;
-        }
-        stream.reservation_released = true;
-        true
+        self.pending_open_streams
+            .lock()
+            .await
+            .release_reservation(sid)
+            .unwrap_or(false)
     }
 
     async fn try_reserve_inbound_stream(&self) -> bool {
@@ -1363,7 +2175,7 @@ impl Session {
 
     pub(crate) async fn begin_accept_pending_stream(&self, sid: u32) -> Result<(), anyhow::Error> {
         let pending = self.pending_open_streams.lock().await;
-        if pending.contains_key(&sid) {
+        if pending.contains(sid) {
             Ok(())
         } else {
             anyhow::bail!("pending stream {} disappeared before accept", sid)
@@ -1371,7 +2183,7 @@ impl Session {
     }
 
     async fn is_pending_open_stream(&self, sid: u32) -> bool {
-        self.pending_open_streams.lock().await.contains_key(&sid)
+        self.pending_open_streams.lock().await.contains(sid)
     }
 
     fn is_closing_stream(&self, sid: u32) -> bool {
@@ -1391,16 +2203,13 @@ impl Session {
         loop {
             let (pending_data, pending_fin) = {
                 let mut pending = self.pending_open_streams.lock().await;
-                let Some(stream) = pending.get_mut(&sid) else {
+                let Some((pending_data, pending_fin)) = pending.take_ready(sid) else {
                     return PendingAcceptFlushResult::Open;
                 };
-                if stream.buffered_data.is_empty() && !stream.buffered_fin {
-                    pending.remove(&sid);
+                if pending_data.is_empty() && !pending_fin {
+                    pending.remove(sid);
                     return PendingAcceptFlushResult::Open;
                 }
-                let pending_data = std::mem::take(&mut stream.buffered_data);
-                let pending_fin = stream.buffered_fin;
-                stream.buffered_fin = false;
                 (pending_data, pending_fin)
             };
 
@@ -1415,7 +2224,7 @@ impl Session {
                     );
                     drop(payloads);
                     let _ = self.close_stream(sid).await;
-                    self.pending_open_streams.lock().await.remove(&sid);
+                    self.pending_open_streams.lock().await.remove(sid);
                     return PendingAcceptFlushResult::ClosedLocally;
                 }
                 delivered_data = true;
@@ -1427,7 +2236,7 @@ impl Session {
                     if let Some(handle) = self.streams.write().await.get_mut(&sid) {
                         mark_stream_read_closed_locked(handle, &self.capacity_stream_count);
                     }
-                    self.pending_open_streams.lock().await.remove(&sid);
+                    self.pending_open_streams.lock().await.remove(sid);
                     return PendingAcceptFlushResult::PeerHalfClosed;
                 }
                 unregister_stream_locked(
@@ -1435,7 +2244,7 @@ impl Session {
                     &self.capacity_stream_count,
                     sid,
                 );
-                self.pending_open_streams.lock().await.remove(&sid);
+                self.pending_open_streams.lock().await.remove(sid);
                 return PendingAcceptFlushResult::PeerClosed;
             }
         }
@@ -1520,6 +2329,7 @@ impl Session {
 }
 
 impl SessionWriter {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         write_half: SplitWriteHalf,
         close_requested: Arc<AtomicBool>,
@@ -1528,6 +2338,8 @@ impl SessionWriter {
         traffic_script: Option<&[String]>,
         post_script_off: bool,
         pending_client_settings: Arc<Mutex<Option<Vec<u8>>>>,
+        inbound: Arc<InboundSignal>,
+        peer_stream_high_water: Arc<AtomicU32>,
     ) -> Self {
         let direction = if is_client {
             FlowDirection::C2S
@@ -1551,6 +2363,8 @@ impl SessionWriter {
                 script_owned,
                 post_script_off,
                 pending_client_settings,
+                inbound,
+                peer_stream_high_water,
             )
             .await;
         });
@@ -1640,12 +2454,18 @@ impl SessionWriter {
         traffic_script: Option<Vec<String>>,
         post_script_off: bool,
         pending_client_settings: Arc<Mutex<Option<Vec<u8>>>>,
+        inbound: Arc<InboundSignal>,
+        peer_stream_high_water: Arc<AtomicU32>,
     ) {
         let mut pending: Vec<u8> = Vec::with_capacity(65536);
-        // 仅 Immediate 写请求进入此队列：其字节随下一次 drive_shaper 全部
-        // 排空后统一应答。Auto 写请求入队即应答（背压由有界 bulk channel
-        // 的 send().await 提供），不进此队列。
+        // 仅 Immediate 写请求进入此队列：其字节仍在明文积压 `pending` 里，
+        // 要等 drive_shaper 把它们全部 prepare 完才能移交 `batch`（见
+        // FlushBatch 的 responder 语义）。Auto 写请求入队即应答（背压由有界
+        // bulk channel 的 send().await 提供），不进此队列。
         let mut responders: Vec<oneshot::Sender<Result<(), String>>> = Vec::new();
+        // 合并 flush 的批：已 prepare 进 write_buffer、尚未出网的记录与
+        // responder。
+        let mut batch = FlushBatch::default();
         let mut shaper = TrafficShaper::new(direction, traffic_script.as_deref(), post_script_off);
 
         loop {
@@ -1664,6 +2484,7 @@ impl SessionWriter {
 
                     if close_requested.load(Ordering::Relaxed) {
                         let msg = "session writer closed".to_string();
+                        batch.fail(&msg);
                         for responder in responders.drain(..) {
                             let _ = responder.send(Err(msg.clone()));
                         }
@@ -1687,16 +2508,23 @@ impl SessionWriter {
                         Self::queue_bulk_request(&mut pending, &mut responders, bulk_request);
                     }
 
-                    let mut deferred_control = Vec::new();
-                    if !pending.is_empty() {
-                        // 钉住当前 control 请求触及的流：delay 窗口内同流
-                        // 控制帧不得越过本请求插队（保序论证见 drive_shaper）。
-                        let mut pinned_sids = HashSet::new();
-                        for packet in &request.packets {
-                            walk_frame_headers(packet, |_cmd, sid, _len| {
-                                pinned_sids.insert(sid);
-                            });
-                        }
+                    // 钉住当前 control 请求触及的流：delay 窗口内同流
+                    // 控制帧不得越过本请求插队（保序论证见 drive_shaper）。
+                    let mut pinned_sids = HashSet::new();
+                    for packet in &request.packets {
+                        walk_frame_headers(packet, |_cmd, sid, _len| {
+                            pinned_sids.insert(sid);
+                        });
+                    }
+                    // 承载 PSH 的 control 请求（gather-open：SETTINGS+SYN+
+                    // target+首个数据块）并入 pending，与 bulk 积压同一路径经
+                    // TrafficShaper 排空——它承载的是应用数据，尺寸必须由
+                    // shaper 决定。详见 request_carries_stream_data。
+                    // 字节序不变：先到的 bulk 字节在前，本请求的字节紧随其后，
+                    // 包内 SETTINGS→SYN→PSH 的相对序完全保持。
+                    let carries_stream_data = request_carries_stream_data(&request);
+                    if carries_stream_data {
+                        Self::queue_bulk_request(&mut pending, &mut responders, request);
                         match Self::drain_pending_and_respond(
                             &mut pending,
                             &mut shaper,
@@ -1705,31 +2533,81 @@ impl SessionWriter {
                             &mut control_rx,
                             &pending_client_settings,
                             direction,
+                            &inbound,
                             pinned_sids,
+                            &mut batch,
                         )
                         .await
                         {
-                            Ok(deferred) => deferred_control = deferred,
-                            Err(msg) => {
-                                let _ = request.response_tx.send(Err(msg));
-                                break;
+                            Ok(deferred) => {
+                                if Self::prepare_deferred_control_requests(
+                                    deferred,
+                                    &mut write_half,
+                                    direction,
+                                    &mut batch,
+                                )
+                                .is_err()
+                                {
+                                    break;
+                                }
                             }
+                            Err(_) => break,
+                        }
+                    } else {
+                        let mut deferred_control = Vec::new();
+                        if !pending.is_empty() {
+                            match Self::drain_pending_and_respond(
+                                &mut pending,
+                                &mut shaper,
+                                &mut write_half,
+                                &mut responders,
+                                &mut control_rx,
+                                &pending_client_settings,
+                                direction,
+                                &inbound,
+                                pinned_sids,
+                                &mut batch,
+                            )
+                            .await
+                            {
+                                Ok(deferred) => deferred_control = deferred,
+                                Err(msg) => {
+                                    let _ = request.response_tx.send(Err(msg));
+                                    break;
+                                }
+                            }
+                        }
+
+                        if Self::prepare_control_request(
+                            request,
+                            &mut write_half,
+                            direction,
+                            &mut batch,
+                        )
+                        .is_err()
+                        {
+                            break;
+                        }
+
+                        // 窗口内暂存的 control 写按到达顺序补发（排在本请求
+                        // 之后，与旧版“下一事件循环回合再处理”的相对顺序一致）。
+                        if Self::prepare_deferred_control_requests(
+                            deferred_control,
+                            &mut write_half,
+                            direction,
+                            &mut batch,
+                        )
+                        .is_err()
+                        {
+                            break;
                         }
                     }
 
-                    if Self::write_control_request_now(request, &mut write_half, direction)
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-
-                    // 窗口内暂存的 control 写按到达顺序补发（排在本请求
-                    // 之后，与旧版“下一事件循环回合再处理”的相对顺序一致）。
-                    if Self::write_deferred_control_requests(
-                        deferred_control,
+                    if Self::flush_or_merge(
                         &mut write_half,
-                        direction,
+                        &mut batch,
+                        &control_rx,
+                        &bulk_rx,
                     )
                     .await
                     .is_err()
@@ -1742,6 +2620,7 @@ impl SessionWriter {
 
                     if close_requested.load(Ordering::Relaxed) {
                         let msg = "session writer closed".to_string();
+                        batch.fail(&msg);
                         for responder in responders.drain(..) {
                             let _ = responder.send(Err(msg.clone()));
                         }
@@ -1767,18 +2646,20 @@ impl SessionWriter {
                             &mut control_rx,
                             &pending_client_settings,
                             direction,
+                            &inbound,
                             HashSet::new(),
+                            &mut batch,
                         )
                         .await
                         {
                             Ok(deferred) => {
                                 // 窗口内暂存的 control 写按到达顺序补发。
-                                if Self::write_deferred_control_requests(
+                                if Self::prepare_deferred_control_requests(
                                     deferred,
                                     &mut write_half,
                                     direction,
+                                    &mut batch,
                                 )
-                                .await
                                 .is_err()
                                 {
                                     break;
@@ -1786,6 +2667,18 @@ impl SessionWriter {
                             }
                             Err(_) => break,
                         }
+                    }
+
+                    if Self::flush_or_merge(
+                        &mut write_half,
+                        &mut batch,
+                        &control_rx,
+                        &bulk_rx,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
                     }
                 }
             }
@@ -1803,22 +2696,87 @@ impl SessionWriter {
                 &mut dead_rx,
                 &pending_client_settings,
                 direction,
+                &inbound,
                 HashSet::new(),
+                &mut batch,
             )
             .await;
-            for responder in responders.drain(..) {
-                let _ = responder.send(Ok(()));
-            }
+            // 明文积压已全部 prepare，等待者的字节这才进了 write_buffer。
+            batch.responders.append(&mut responders);
         }
+        // 主循环退出时批里可能还留着已 prepare 未 flush 的字节：先冲刷并
+        // 据实应答，再走 GOAWAY / close_notify。
+        let _ = batch.flush(&mut write_half).await;
+        Self::emit_h2_goaway(
+            &mut write_half,
+            post_script_off,
+            peer_stream_high_water.load(Ordering::Relaxed),
+        )
+        .await;
         let _ = write_half.shutdown().await;
     }
 
+    /// 优雅拆除前的 H2 GOAWAY（论证与尺寸依据见 `H2_GOAWAY_WIRE`）。
+    ///
+    /// 它单独 flush、再由 `shutdown()` 写 close_notify —— 真实端点也是两次
+    /// 独立的 `SSL_write`（GOAWAY 记录）+ `SSL_shutdown`（alert 记录），
+    /// 线上是 `[41][24]` 两个小分段。
+    ///
+    /// `last_stream_id` 取本端处理过的最大对端流 id（见
+    /// `Session::peer_stream_high_water`）。此前这条记录是 `flag=1` 的纯填充，
+    /// 尺寸对了但不带任何语义；载荷改为 `flag=2 + last_stream_id` 之后线速尺寸
+    /// 仍是 41（`MIN_GOAWAY_RECORD_WIRE_LEN` 的编译期断言保证），对端因此能
+    /// 判定「哪些流对端从未处理、可安全重试」。
+    async fn emit_h2_goaway(
+        write_half: &mut SplitWriteHalf,
+        post_script_off: bool,
+        last_stream_id: u32,
+    ) {
+        if post_script_off {
+            return;
+        }
+        let packet = encode_padding_goaway_sized(last_stream_id, H2_GOAWAY_WIRE);
+        let prepared = write_half
+            .prepare_control_record(&packet, H2_GOAWAY_WIRE)
+            .is_ok();
+        if prepared {
+            let _ = write_half.flush().await;
+        }
+    }
+
+    /// 合并 flush 的判定：control/bulk 通道当前都没有立即可取的后续内容时
+    /// 才冲刷；否则把本批留在 write_buffer 里，与紧随其后的内容并进同一次
+    /// `write()`（= 同一个 TCP 段，见 `FlushBatch`）。
+    ///
+    /// 不会造成无界延迟，也不会死锁：只有在某个通道**非空**时才延后，而
+    /// 非空意味着写循环的 select 下一轮立即就绪；双上限（记录条数 / 缓冲
+    /// 字节）另外给出一个确定性的硬上界。
+    async fn flush_or_merge(
+        write_half: &mut SplitWriteHalf,
+        batch: &mut FlushBatch,
+        control_rx: &mpsc::Receiver<WriteRequest>,
+        bulk_rx: &mpsc::Receiver<WriteRequest>,
+    ) -> std::io::Result<()> {
+        if batch.is_idle() {
+            return Ok(());
+        }
+        let more_queued = !control_rx.is_empty() || !bulk_rx.is_empty();
+        let buffered = write_half.buffered_write_len();
+        if more_queued && !batch.is_full(buffered) {
+            return Ok(());
+        }
+        batch.flush(write_half).await
+    }
+
     /// 两个写循环分支共用的“排空 + 收尾”序列：drive_shaper 排空 pending，
-    /// 发出 fake 帧，并应答全部 Immediate 等待者。delay 窗口内被暂存的
-    /// control 写随 Ok 一并返回，由调用方按分支语义补发（control 分支
-    /// 排在本请求之后，bulk 分支立即补发）；其 responder 在字节真正
-    /// flush 后才应答。失败时已入队的 responder 以同一错误应答，错误
-    /// 消息返回给调用方做分支专属处理。
+    /// prepare fake 帧，并把全部 Immediate 等待者移交合并批。delay 窗口内被
+    /// 暂存的 control 写随 Ok 一并返回，由调用方按分支语义补发（control 分支
+    /// 排在本请求之后，bulk 分支立即补发）。
+    ///
+    /// responder 仍严格在字节真正 flush 之后才应答 Ok：它们的字节此前还在
+    /// 明文积压 `pending` 里，drive_shaper 返回时才全部进入 write_buffer，
+    /// 于是这里移交给 `batch`，由下一次 flush 统一应答。失败时已入队的
+    /// responder 以同一错误应答，错误消息返回给调用方做分支专属处理。
     #[allow(clippy::too_many_arguments)]
     async fn drain_pending_and_respond(
         pending: &mut Vec<u8>,
@@ -1828,7 +2786,9 @@ impl SessionWriter {
         control_rx: &mut mpsc::Receiver<WriteRequest>,
         pending_client_settings: &Arc<Mutex<Option<Vec<u8>>>>,
         direction: FlowDirection,
+        inbound: &InboundSignal,
         pinned_sids: HashSet<u32>,
+        batch: &mut FlushBatch,
     ) -> Result<Vec<WriteRequest>, String> {
         match Self::drive_shaper(
             pending,
@@ -1837,15 +2797,15 @@ impl SessionWriter {
             control_rx,
             pending_client_settings,
             direction,
+            inbound,
             pinned_sids,
+            batch,
         )
         .await
         {
-            Ok((fake_frames, deferred)) => {
-                let _ = Self::emit_fake_frames(write_half, direction, &fake_frames).await;
-                for responder in responders.drain(..) {
-                    let _ = responder.send(Ok(()));
-                }
+            Ok((fake_responses, deferred)) => {
+                let _ = Self::prepare_fake_frames(write_half, &fake_responses, batch);
+                batch.responders.append(responders);
                 Ok(deferred)
             }
             Err(e) => {
@@ -1853,6 +2813,7 @@ impl SessionWriter {
                 for responder in responders.drain(..) {
                     let _ = responder.send(Err(msg.clone()));
                 }
+                batch.fail(&msg);
                 Err(msg)
             }
         }
@@ -1893,12 +2854,17 @@ impl SessionWriter {
     /// The first policy of a drain is sticky: when it allows a full block
     /// (bulk fast path), the entire backlog is carved into capacity-sized
     /// records — the tail at its exact wire length — with zero delay, no fake
-    /// frames, and no per-record policy consultation. sticky 路径按
-    /// STICKY_BULK_FLUSH_MAX_RECORDS / STICKY_BULK_FLUSH_MAX_BYTES 双上限
-    /// 批量 flush：多次 prepare 在 write_buffer 中自然累积后统一冲刷，
-    /// record 尺寸/顺序与逐条 flush 完全一致，仅减少 syscall 次数。非
-    /// sticky（脚本/Markov/逐条策略）路径保持逐条 flush 不变。批量有界，
-    /// write_buffer 不会无界增长。
+    /// frames, and no per-record policy consultation.
+    ///
+    /// 两条路径统一按 STICKY_BULK_FLUSH_MAX_RECORDS /
+    /// STICKY_BULK_FLUSH_MAX_BYTES 双上限批量 flush：多次 prepare 在
+    /// write_buffer 中自然累积后统一冲刷，record 尺寸/条数/顺序与逐条 flush
+    /// 完全一致，仅减少 syscall 与 TCP 分段边界。此前只有 sticky 路径批量，
+    /// 非 sticky 路径逐条 flush——而 InteractiveControl 施加延迟的概率只有
+    /// 15%，于是 85% 的小记录各自占一个 TCP 分段（socket 开了 TCP_NODELAY），
+    /// 真实端点则会把零间隔的连续记录一次写出、由内核按 MSS 分段。批量上限
+    /// 是确定值而非抖动值：真实实现在这里也不抖动。批量有界，write_buffer
+    /// 不会无界增长。
     ///
     /// 脚本/Markov 策略的 delay 窗口内监听 control 通道：真实协议控制帧
     /// （SYN/FIN/SETTINGS/SYNACK，且不触及 pinned_sids 与 pending 数据流）
@@ -1906,9 +2872,14 @@ impl SessionWriter {
     /// control 写（CMD_PADDING 骨架/假响应等）暂存返回，由主循环按到达
     /// 顺序补发。data record 的尺寸、数量、delay 时长分布严格不变。
     ///
-    /// Returns (fake_frames, deferred_control_writes)：fake 帧由调用方走
-    /// control 路径发出；暂存的 control 写按到达顺序补发，其 responder
-    /// 必须在字节真正 flush 后才应答 Ok。
+    /// 排空**末尾不再自己 flush**：末批交给调用方的 `flush_or_merge` 决定，
+    /// 于是「紧跟在数据记录之后的 control 写」（例如对端开场 flight 换来的
+    /// SETTINGS-ACK）能与这批数据记录并进同一次 `write()`。记录的尺寸/条数/
+    /// 顺序不受影响，只有分段边界变了（见 `FlushBatch`）。
+    ///
+    /// Returns (fake_responses, deferred_control_writes)：fake 请求的应答条数
+    /// 由调用方走 control 路径采样+编码+发出；暂存的 control 写按到达顺序
+    /// 补发，其 responder 必须在字节真正 flush 后才应答 Ok。
     #[allow(clippy::too_many_arguments)]
     async fn drive_shaper(
         pending: &mut Vec<u8>,
@@ -1917,27 +2888,22 @@ impl SessionWriter {
         control_rx: &mut mpsc::Receiver<WriteRequest>,
         pending_client_settings: &Arc<Mutex<Option<Vec<u8>>>>,
         direction: FlowDirection,
+        inbound: &InboundSignal,
         mut pinned_sids: HashSet<u32>,
-    ) -> std::io::Result<(Vec<Vec<u8>>, Vec<WriteRequest>)> {
-        let mut fake_frames = Vec::new();
+        batch: &mut FlushBatch,
+    ) -> std::io::Result<(Vec<u8>, Vec<WriteRequest>)> {
+        let mut fake_responses: Vec<u8> = Vec::new();
         let mut deferred_control = Vec::new();
         let mut consumed = 0usize;
 
-        // 钉住 pending 积压中的数据流：同流控制帧（如 FIN）不得越过仍在
-        // 积压中的数据插队，否则对端会因 FIN 先至而丢弃其后的数据。
-        // 同时记录全部帧边界偏移：wire 协议没有 record 边界标记，对端把
-        // 各 record 的块载荷拼接后重组帧，插队 control 帧只能落在完整帧
-        // 边界上（旧实现靠“先排空 pending 再写 control”隐式保证）。
-        let mut frame_boundaries = HashSet::new();
-        let mut frame_offset = 0usize;
-        walk_frame_headers(pending, |cmd, sid, frame_len| {
-            if cmd == CMD_PSH {
-                pinned_sids.insert(sid);
-            }
-            frame_offset += frame_len;
-            frame_boundaries.insert(frame_offset);
-        });
-
+        // next_data_policy 的首次调用提到帧头遍历之前：frame_boundaries 与
+        // pinned_sids 只在 policy.delay > 0 的窗口里被读（wait_shaping_delay），
+        // 而 sticky bulk 路径的 delay 恒为 Duration::ZERO，于是大流量稳态下
+        // 每轮 drain 都在白遍历全部帧头并建两个 HashSet。
+        // 窗口进度用**下界**喂给 shaper：flush 次数 + 对端到达次数（论证见
+        // `FlushBatch::flushes`）。逐轮 drain 更新一次即可——drain 内部的 flush
+        // 只会让真实进度更靠前，而少算只推迟放松，方向保守。
+        shaper.begin_drain(batch.flushes.saturating_add(inbound.arrivals()));
         let mut first_policy = if pending.is_empty() {
             None
         } else {
@@ -1947,9 +2913,27 @@ impl SessionWriter {
             .as_ref()
             .is_some_and(|policy| policy.allow_full_block);
 
-        // sticky 批量 flush 记账：自上次 flush 以来累积的 record 条数。
-        let mut batched_records = 0usize;
+        // 钉住 pending 积压中的数据流：同流控制帧（如 FIN）不得越过仍在
+        // 积压中的数据插队，否则对端会因 FIN 先至而丢弃其后的数据。
+        // 同时记录全部帧边界偏移：wire 协议没有 record 边界标记，对端把
+        // 各 record 的块载荷拼接后重组帧，插队 control 帧只能落在完整帧
+        // 边界上（旧实现靠“先排空 pending 再写 control”隐式保证）。
+        // 偏移天然单调递增，故用有序 Vec + 二分取代 HashSet<usize>，省掉
+        // 逐帧哈希与哈希表增长；调用方预填的 pinned_sids 原样保留。
+        let mut frame_boundaries: Vec<usize> = Vec::new();
+        if !sticky_full_block {
+            let mut frame_offset = 0usize;
+            walk_frame_headers(pending, |cmd, sid, frame_len| {
+                if cmd == CMD_PSH {
+                    pinned_sids.insert(sid);
+                }
+                frame_offset += frame_len;
+                frame_boundaries.push(frame_offset);
+            });
+        }
 
+        // 批量 flush 记账由调用方传入的 `batch` 统一维护：它同时覆盖排空前
+        // 已 prepare 的 control 记录，双上限于是作用在整个 write_buffer 上。
         loop {
             if consumed >= pending.len() {
                 break;
@@ -1969,6 +2953,7 @@ impl SessionWriter {
                         fake: None,
                         pre_fake: None,
                         allow_full_block: true,
+                        quiet_gap: false,
                     }
                 }
                 None => shaper.next_data_policy(remaining),
@@ -1980,68 +2965,108 @@ impl SessionWriter {
                 .min(SnowyStream::data_record_capacity());
             let take = payload_cap.min(remaining);
 
-            {
-                // 负抖动 fake（F:n?k 采样到负偏移）：CMD_PADDING 控制记录
-                // 在本条数据记录之前上链，随本次 flush 一同发出，线上序为
-                // control → data，归于前一条记录的槽位。
-                if let Some(pre) = &policy.pre_fake {
-                    let mut encoded = Vec::new();
-                    encode_padding_request_into(&mut encoded, pre.responses);
-                    write_half.with_stream(|stream| {
-                        let state = stream.control_state();
-                        let size = stream.next_control_size(state, direction);
-                        stream.prepare_control_record(&encoded, size)
-                    })?;
+            // 插在数据记录之前的 CMD_PADDING 记录只能落在**完整帧边界**上：
+            // wire 协议不标记 record 边界，对端把各 record 的块载荷按序拼进
+            // 一个 BytesMut 再解帧，若当前 drain 偏移正处在某个 PSH 帧的载荷
+            // 中间，插进去的 padding 帧字节会被并进那个帧的载荷，对端的帧重组
+            // 直接错乱（→ unknown cmd → 拆会话）。此前 pre_fake 无条件插入，
+            // 只因内嵌脚本 6 条规则的 fake_jitter 全为 0、`F:n?k` 负抖动没人用
+            // 才没暴露；`consumed == 0` 恒为边界（pending 由整帧拼成，上一轮
+            // drain 全部排空）。
+            let at_frame_boundary =
+                consumed == 0 || frame_boundaries.binary_search(&consumed).is_ok();
+            // 让出方向的那一条记录：fake 请求必须与数据记录**同批** prepare、
+            // 同批 flush，对端才会在一个 RTT 内回吐应答。此前 fake 请求一律
+            // 攒到整个 drain 结束后由 emit_fake_frames 发出，应答自然落在整个
+            // 上行 burst 之后，起不到打断 burst 的作用。
+            let quiet_gap = policy.quiet_gap;
+            let mut inline_fake = if quiet_gap {
+                policy.fake.as_ref().map(|spec| spec.responses)
+            } else {
+                None
+            };
+            let mut deferred_fake = None;
+            if let Some(pre) = policy.pre_fake.as_ref().map(|spec| spec.responses) {
+                if at_frame_boundary {
+                    inline_fake = Some(inline_fake.unwrap_or(0).saturating_add(pre));
+                } else {
+                    // 非边界：退化为「本记录之后」的 fake，由 emit_fake_frames
+                    // 在整段排空后（必然落在帧边界）发出。
+                    deferred_fake = Some(pre);
                 }
+            }
+
+            // 一次持锁完成「inline fake control 记录 + data 记录 + 读积压量」，
+            // 省掉两次额外的 std::Mutex 往返。
+            let buffered = {
                 let slice = &pending[consumed..consumed + take];
-                write_half.with_stream(|stream| {
-                    stream.prepare_data_record(slice, policy.target_wire_len)
-                })?;
+                // 线上序为 control → data：两条记录进的是同一个
+                // write_buffer，批量 flush 不改变它们的相对顺序。
+                if let Some(responses) = inline_fake {
+                    let packet = encode_padding_request_sized(responses, PADDING_REQUEST_WIRE);
+                    write_half.prepare_control_record(&packet, PADDING_REQUEST_WIRE)?;
+                }
+                write_half.prepare_data_record(slice, policy.target_wire_len)?;
+                write_half.buffered_write_len()
+            };
+            if let Some(responses) = deferred_fake {
+                fake_responses.push(responses);
             }
 
             consumed += take;
             shaper.advance();
+            batch.note_records(1 + usize::from(inline_fake.is_some()));
 
-            if sticky_full_block {
-                batched_records += 1;
-                let buffered = write_half.with_stream(|stream| stream.buffered_write_len());
-                if batched_records >= STICKY_BULK_FLUSH_MAX_RECORDS
-                    || buffered >= STICKY_BULK_FLUSH_MAX_BYTES
-                {
-                    write_half.flush().await?;
-                    batched_records = 0;
+            // delay 非零时必须先 flush 再 sleep：否则已 prepare 的字节会攒到
+            // sleep 之后一起出网，延迟根本作用不到线上，IAT 模型失效。这同时
+            // 保证进入 delay 窗口时 write_buffer 必为空——窗口内的 control
+            // 插队路径（wait_shaping_delay → prepare_control_request + flush）
+            // 自己 flush 整个 write_buffer，若还残留未 flush 的数据记录，
+            // 它们会被那次 flush 一并带出，线上序仍是「已 prepare 的数据 →
+            // 插队 control」（与逐条 flush 时一致），但记录归属的时间槽会错。
+            // 此处的先 flush 消除了这种情形。
+            if quiet_gap
+                || policy.delay > Duration::ZERO
+                || batch.is_full(buffered)
+            {
+                let arrivals_before = inbound.arrivals();
+                batch.flush(write_half).await?;
+                if quiet_gap {
+                    // 挂起到对端有记录抵达：burst 只能被方向改变打断，同方向
+                    // 连续包的尺寸会累加，时间间隔不算。不等这一下，后续记录
+                    // 就会把第一个上行 burst 累加到 300 字节门限以上。
+                    wait_for_peer_turn(inbound, arrivals_before).await;
                 }
-            } else {
-                write_half.flush().await?;
             }
 
             if let Some(fake) = &policy.fake {
-                let mut encoded = Vec::new();
-                encode_padding_request_into(&mut encoded, fake.responses);
-                fake_frames.push(encoded);
+                if !quiet_gap {
+                    // 只登记应答条数：尺寸与编码统一在 emit_fake_frames 内发生。
+                    // quiet_gap 的那一条已在上面同批发出，不能重复。
+                    fake_responses.push(fake.responses);
+                }
             }
 
             if policy.delay > Duration::ZERO {
                 Self::wait_shaping_delay(
                     policy.delay,
-                    frame_boundaries.contains(&consumed),
+                    frame_boundaries.binary_search(&consumed).is_ok(),
                     write_half,
                     control_rx,
                     pending_client_settings,
                     direction,
                     &mut pinned_sids,
                     &mut deferred_control,
+                    batch,
                 )
                 .await?;
             }
         }
 
-        if sticky_full_block && batched_records > 0 {
-            write_half.flush().await?;
-        }
-
+        // 末批不在此处 flush：交给调用方的 `flush_or_merge`，使紧随其后的
+        // control 写能与这批数据记录并进同一次 `write()`（论证见 FlushBatch）。
         pending.clear();
-        Ok((fake_frames, deferred_control))
+        Ok((fake_responses, deferred_control))
     }
 
     /// 整形 delay 窗口：挂起 data record 节奏期间同时监听 control 通道。
@@ -2060,6 +3085,7 @@ impl SessionWriter {
         direction: FlowDirection,
         pinned_sids: &mut HashSet<u32>,
         deferred: &mut Vec<WriteRequest>,
+        batch: &mut FlushBatch,
     ) -> std::io::Result<()> {
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
@@ -2085,9 +3111,12 @@ impl SessionWriter {
                         && at_frame_boundary
                         && control_write_can_pass_through(&request, pinned_sids)
                     {
-                        Self::write_control_request_now(request, write_half, direction)
-                            .await
+                        // 插队写立即冲刷，不参与合并：delay 窗口本就是在**刻意
+                        // 拉开**记录间隔，把插队的控制帧攒到下一条数据记录上
+                        // 反而抵消了「真实 H2 端点优先控制帧」这一语义。
+                        Self::prepare_control_request(request, write_half, direction, batch)
                             .map_err(std::io::Error::other)?;
+                        batch.flush(write_half).await?;
                     } else {
                         // 暂存请求触及的流一并钉住：后续窗口内同流控制帧
                         // 不得越过暂存写插队（保持到达顺序）。
@@ -2104,77 +3133,82 @@ impl SessionWriter {
         Ok(())
     }
 
-    /// 单条 control 写请求的 prepare + flush + 应答：主 control 分支、
-    /// delay 窗口插队、窗口暂存补发共用同一口径。responder 在字节真正
-    /// flush 完成后才收到 Ok；失败时先应答 Err 再把错误交调用方终止
-    /// 写循环。
-    async fn write_control_request_now(
+    /// 单条 control 写请求的 prepare + 入批：主 control 分支、delay 窗口
+    /// 插队、窗口暂存补发共用同一口径。
+    ///
+    /// 此前叫 `write_control_request_now`，prepare 完就无条件 flush 一次。
+    /// 现在只 prepare 并把 responder 挂进 `batch`，flush 时机由调用方决定
+    /// （论证见 `FlushBatch`）——**responder 的语义完全不变**：它仍然只在
+    /// 字节真正 flush 之后才收到 Ok，只是与同批的其他请求一起应答。失败时
+    /// 先应答 Err，再把错误交调用方终止写循环。
+    ///
+    /// 每个 packet 编码成一条或多条记录，尺寸决策统一交给
+    /// `prepare_control_packet_records`（口径与其文档注释一致）。packet 顺序
+    /// 与包内字节序都不变，故 SETTINGS 仍严格先于 SYN 到达对端，control 写
+    /// 之间的 FIFO 也不变。
+    fn prepare_control_request(
         request: WriteRequest,
         write_half: &mut SplitWriteHalf,
         direction: FlowDirection,
+        batch: &mut FlushBatch,
     ) -> Result<(), String> {
-        let state = write_half.with_stream(|stream| stream.control_state());
+        let state = write_half.control_state();
         for packet in &request.packets {
-            let result = write_half.with_stream(|stream| {
-                let size = stream.next_control_size(state, direction);
-                trace!(
-                    "control write: frame_cmd=0x{:02x} wire_size={}",
-                    packet.first().unwrap_or(&0),
-                    size
-                );
-                stream.prepare_control_record(packet, size)
-            });
-            if let Err(e) = result {
-                let msg = e.to_string();
-                let _ = request.response_tx.send(Err(msg.clone()));
-                return Err(msg);
+            let result = prepare_control_packet_records(write_half, packet, state, direction);
+            match result {
+                Ok(records) => batch.note_records(records),
+                Err(e) => {
+                    let msg = e.to_string();
+                    let _ = request.response_tx.send(Err(msg.clone()));
+                    return Err(msg);
+                }
             }
         }
-        match write_half.flush().await {
-            Ok(()) => {
-                let _ = request.response_tx.send(Ok(()));
-                Ok(())
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                let _ = request.response_tx.send(Err(msg.clone()));
-                Err(msg)
-            }
-        }
+        batch.push_responder(request.response_tx);
+        Ok(())
     }
 
-    /// 窗口暂存 control 写的补发：按到达顺序逐条 prepare+flush，任一
-    /// 失败即终止（失败请求的 responder 已在 write_control_request_now
-    /// 内应答 Err）。
-    async fn write_deferred_control_requests(
+    /// 窗口暂存 control 写的补发：按到达顺序逐条 prepare 进同一批，任一
+    /// 失败即终止（失败请求的 responder 已在 prepare_control_request 内
+    /// 应答 Err）。
+    fn prepare_deferred_control_requests(
         deferred: Vec<WriteRequest>,
         write_half: &mut SplitWriteHalf,
         direction: FlowDirection,
+        batch: &mut FlushBatch,
     ) -> Result<(), String> {
         for request in deferred {
-            Self::write_control_request_now(request, write_half, direction).await?;
+            Self::prepare_control_request(request, write_half, direction, batch)?;
         }
         Ok(())
     }
 
-    /// Emit fake-response control frames generated by the shaper.
-    async fn emit_fake_frames(
+    /// Prepare the fake-interaction requests the shaper asked for: one
+    /// CMD_PADDING request record per entry, `responses[i]` reply records
+    /// expected back.
+    ///
+    /// 尺寸采样/常量与编码必须在同一处发生：此前调用方先按 `m` 编码 junk、
+    /// 这里才去采样尺寸，于是 `prepare_control_record` 的 payload 下限把采样
+    /// 值吃掉，请求记录恒为 81 / 97 / 129 字节——不对应任何真实 H2 帧尺寸。
+    /// 现在按 PING 的确定尺寸编码并以同一目标 prepare，记录精确落在
+    /// PADDING_REQUEST_WIRE。
+    ///
+    /// 同样不再自带 flush：此前 drive_shaper 末尾 flush 一次、这里紧接着又
+    /// flush 一次，于是 fake 请求必定独占一个 TCP 分段。
+    fn prepare_fake_frames(
         write_half: &mut SplitWriteHalf,
-        direction: FlowDirection,
-        frames: &[Vec<u8>],
+        responses: &[u8],
+        batch: &mut FlushBatch,
     ) -> std::io::Result<()> {
-        if frames.is_empty() {
+        if responses.is_empty() {
             return Ok(());
         }
-        write_half.with_stream(|stream| {
-            let state = stream.control_state();
-            for packet in frames {
-                let size = stream.next_control_size(state, direction);
-                stream.prepare_control_record(packet, size)?;
-            }
-            std::io::Result::Ok(())
-        })?;
-        write_half.flush().await
+        for &m in responses {
+            let packet = encode_padding_request_sized(m, PADDING_REQUEST_WIRE);
+            write_half.prepare_control_record(&packet, PADDING_REQUEST_WIRE)?;
+        }
+        batch.note_records(responses.len());
+        Ok(())
     }
 }
 
@@ -2362,6 +3396,38 @@ pub(crate) fn subtract_buffered_stream_bytes(counter: &AtomicUsize, bytes: usize
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_sub(bytes))
     });
+}
+
+/// 隧道重组缓冲的初始容量。
+const TUNNEL_REASSEMBLY_CAPACITY: usize = 65536;
+
+/// 单次隧道读取的上限。
+///
+/// **这个数字是线上可观测的，不能顺手放大。** `InboundSignal::arrivals()`
+/// 计的就是「成功 read 的次数」，而它同时是：喂给 `TrafficShaper` 的窗口
+/// 进度下界（`begin_drain`）、PING 抑制的判据（`>= PAPER_OBSERVATION_WINDOW_PACKETS`）、
+/// 以及让出方向的等待条件（`wait_for_peer_turn`）。一次读得越多，arrivals
+/// 涨得越慢，整形窗口就退出得越晚——记录尺寸与延迟分布随之改变。
+const TUNNEL_READ_CHUNK: usize = 16384;
+
+/// 直接读进重组缓冲的未初始化尾部。
+///
+/// 此前是 `read(&mut read_buf)` + `buf.extend_from_slice(&read_buf[..n])`：
+/// 每个字节在解密之后还要再被 memcpy 一次才进入帧重组缓冲。`reserve` 先
+/// 保证尾部至少有 `TUNNEL_READ_CHUNK` 的空闲容量，`limit` 再把本次读取
+/// **精确**限制在 16 KiB —— 不加 `limit` 的话 `read_buf` 会按 `BytesMut`
+/// 的全部剩余容量一次读到 64 KiB，arrivals 掉到四分之一（见
+/// `TUNNEL_READ_CHUNK`）。
+///
+/// 取消安全：`AsyncReadExt::read_buf` 本身是取消安全的（未就绪时不消费
+/// 任何字节），因此可以直接放进读循环的 `select!`。
+async fn read_tunnel_chunk(
+    read_half: &mut SplitReadHalf,
+    buf: &mut BytesMut,
+) -> std::io::Result<usize> {
+    use bytes::BufMut;
+    buf.reserve(TUNNEL_READ_CHUNK);
+    read_half.read_buf(&mut (&mut *buf).limit(TUNNEL_READ_CHUNK)).await
 }
 
 #[cfg(test)]

@@ -40,7 +40,10 @@ pub(super) const MIN_CAMOUFLAGE_APP_DATA_RECORD_LEN: usize = 17;
 
 /// 回放时断开写批次的间隔阈值：低于此值的间隔并入同一次突发写
 /// （见 establish_synthetic_camouflage_tunnel 中的说明）。
-pub(super) const SIGNIFICANT_REPLAY_GAP_MS: u16 = 5;
+///
+/// 量纲随 profile 一并从毫秒改为微秒（见 `CamouflageProfile` 上的说明），
+/// 阈值本身仍是 5 ms。
+pub(super) const SIGNIFICANT_REPLAY_GAP_US: u32 = 5_000;
 pub(super) const MAX_CAMOUFLAGE_APP_DATA_RECORD_LEN: usize = 16401;
 
 pub(super) const CAMOUFLAGE_REFRESH_DAEMON_MIN_SECS: u64 = 300;
@@ -99,6 +102,15 @@ pub(super) struct CamouflageRefreshGateLease {
     pub(super) released: bool,
 }
 
+/// 参考端点可见 TLS 1.3 握手形态的采样结果。
+///
+/// **记录间隔以微秒存储。** 此前 `first_app_data_delay_ms: u16` /
+/// `early_app_data_gap_ms: Vec<u16>` 是整毫秒，采样端 `as_millis()` 又是向下
+/// 截断，于是：真实端点的帧内间隔多在 0–1 ms，全部被截断成 0；1.9 ms 记为
+/// 1 ms（系统性低估最多 1 ms）；而所有活下来的间隔都落在整毫秒格点上，
+/// `jitter_iat` 的 ±20% 只是围绕一个整毫秒中心散开——跨连接取均值，中心值
+/// 收敛到精确整毫秒，这本身就是「回放自量化模板」的信号。改为 u32 微秒后
+/// 存的是端点真实做过的事（u32 可覆盖 ~71 分钟，远超采样侧 10 s 的上限）。
 #[derive(Clone, Debug)]
 pub(super) struct CamouflageProfile {
     pub(super) server_records: Arc<[u8]>,
@@ -108,8 +120,10 @@ pub(super) struct CamouflageProfile {
     pub(super) early_app_data_count: u8,
     pub(super) has_ccs: bool,
     pub(super) visible_server_record_count: u16,
-    pub(super) first_app_data_delay_ms: u16,
-    pub(super) early_app_data_gap_ms: Vec<u16>,
+    /// ServerHello 到达 → 首条 0x17 记录的间隔（微秒）。
+    pub(super) first_app_data_delay_us: u32,
+    /// 连续 0x17 记录之间的间隔（微秒）：`[i]` 是第 i 条与第 i+1 条之间。
+    pub(super) early_app_data_gap_us: Vec<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -174,7 +188,7 @@ pub(super) fn sanitize_camouflage_profile(mut profile: CamouflageProfile) -> Cam
     profile.first_app_data_size = profile.app_data_sizes.first().copied();
     profile.early_app_data_count = profile.app_data_sizes.len().min(u8::MAX as usize) as u8;
     profile
-        .early_app_data_gap_ms
+        .early_app_data_gap_us
         .truncate(profile.app_data_sizes.len().saturating_sub(1));
 
     profile
@@ -202,9 +216,9 @@ pub(super) fn merge_camouflage_profile(
             }
         } else {
             cached_profile.app_data_sizes = sampled_profile.app_data_sizes;
-            cached_profile.early_app_data_gap_ms = sampled_profile.early_app_data_gap_ms;
+            cached_profile.early_app_data_gap_us = sampled_profile.early_app_data_gap_us;
         }
-        cached_profile.first_app_data_delay_ms = sampled_profile.first_app_data_delay_ms;
+        cached_profile.first_app_data_delay_us = sampled_profile.first_app_data_delay_us;
     }
     sanitize_camouflage_profile(cached_profile)
 }
@@ -253,24 +267,40 @@ pub(super) fn pick_refresh_base_profile(
     )
 }
 
+/// 从池中按 rank 优先、同 rank 均匀随机地取一个变体。
+///
+/// **选取语义与此前逐字等价**（同一次 RNG 抽样下返回同一个变体），只是不再
+/// 为了「排个序」而把整个池物化一遍：此前先 `sanitize + clone` **每一个**变体
+/// 得到 `Vec<CamouflageProfile>`，再按 rank 过滤、再 `swap_remove` 取一个——
+/// 最多 4 个变体，每个变体的 `prefix_app_data_sizes` / `early_app_data_gap_us`
+/// / `app_data_sizes` 都是真实分配，于是「有没有 rank-3 条目」这个纯读问题要
+/// 付十余次分配与数 KB memcpy，而其中至多 1 个结果会被用到。
+///
+/// 等价性依据：`camouflage_profile_rank` 只看 `server_records` 与
+/// `app_data_sizes` 是否为空；`sanitize_camouflage_profile` 从不改 `server_records`，
+/// 且**入池的每个变体都已经过 sanitize**（`push_profile_variant` 是唯一写入
+/// 路径，它在存入前 sanitize），而 sanitize 是幂等的 ⇒ 对池中变体
+/// `rank(sanitize(p)) == rank(p)`，在引用上算 rank 与在克隆上算 rank 结果相同。
+/// 这两条不变量由 `sanitize_camouflage_profile_is_idempotent` /
+/// `pooled_profiles_are_stored_pre_sanitized` 锁定。
+/// 迭代顺序、候选集合、`gen_range(0..len)` 的抽样域与 RNG 调用次数（恰好 1 次）
+/// 全部不变。
 pub(super) fn sample_camouflage_profile(pool: &CamouflageProfilePool) -> Option<CamouflageProfile> {
-    let mut usable: Vec<CamouflageProfile> = pool
+    let max_rank = pool
         .profiles
         .iter()
-        .map(|entry| sanitize_camouflage_profile(entry.profile.clone()))
-        .filter(|profile| camouflage_profile_rank(profile) > 0)
-        .collect();
-    if usable.is_empty() {
+        .map(|entry| camouflage_profile_rank(&entry.profile))
+        .max()?;
+    if max_rank == 0 {
         return None;
     }
-    let max_rank = usable
+    let usable: Vec<&PooledProfile> = pool
+        .profiles
         .iter()
-        .map(camouflage_profile_rank)
-        .max()
-        .unwrap_or(0);
-    usable.retain(|profile| camouflage_profile_rank(profile) == max_rank);
+        .filter(|entry| camouflage_profile_rank(&entry.profile) == max_rank)
+        .collect();
     let idx = rand::thread_rng().gen_range(0..usable.len());
-    Some(usable.swap_remove(idx))
+    Some(sanitize_camouflage_profile(usable[idx].profile.clone()))
 }
 
 pub(super) fn push_profile_variant(
@@ -284,8 +314,8 @@ pub(super) fn push_profile_variant(
         existing.profile.server_records == profile.server_records
             && existing.profile.prefix_app_data_sizes == profile.prefix_app_data_sizes
             && existing.profile.app_data_sizes == profile.app_data_sizes
-            && existing.profile.early_app_data_gap_ms == profile.early_app_data_gap_ms
-            && existing.profile.first_app_data_delay_ms == profile.first_app_data_delay_ms
+            && existing.profile.early_app_data_gap_us == profile.early_app_data_gap_us
+            && existing.profile.first_app_data_delay_us == profile.first_app_data_delay_us
             && existing.profile.has_ccs == profile.has_ccs
     }) {
         existing.profile = profile;
@@ -512,21 +542,22 @@ pub(super) async fn fetch_camouflage_flight(
     port: u16,
     client_hello: &[u8],
 ) -> anyhow::Result<(Arc<[u8]>, Arc<[usize]>, CamouflageProfile)> {
-    let fingerprint = stable_client_hello_fingerprint(client_hello)
+    // 指纹与全部 key 在这里算**一次**，随后所有查找都复用（见
+    // `lookup_cached_camouflage_profile` 上关于双重指纹计算的说明）。
+    let CamouflageCacheKeys {
+        profile: profile_key,
+        family_baseline: baseline_key,
+        probe_baseline: probe_baseline_key,
+        refresh_cooldown: refresh_cooldown_key,
+        refresh_gate: refresh_gate_key,
+    } = camouflage_cache_keys(host, port, client_hello)
         .ok_or_else(|| anyhow::anyhow!("failed to fingerprint ClientHello"))?;
-    let mut hex_buf = [0u8; 64];
-    let fingerprint_hex = hex_encode_fingerprint(&fingerprint, &mut hex_buf);
-    let profile_key = camouflage_profile_key(host, port, fingerprint_hex);
-    let family = if fingerprint_hex.len() >= 8 {
-        &fingerprint_hex[..8]
-    } else {
-        "probe"
-    };
-    let baseline_key = camouflage_baseline_key(host, port, family);
-    let probe_baseline_key = camouflage_baseline_key(host, port, "probe");
-    let refresh_cooldown_key = camouflage_refresh_cooldown_key(host, port, family);
-    let refresh_gate_key = camouflage_refresh_gate_key(host, port, family);
-    let cached_profile = lookup_cached_camouflage_profile(host, port, client_hello).await;
+    let cached_profile = lookup_cached_camouflage_profile(
+        Some(&profile_key),
+        Some(&baseline_key),
+        &probe_baseline_key,
+    )
+    .await;
     let cached_specific_profile = get_cached_camouflage_profile_entry(&profile_key).await;
     let cached_family_profile = get_cached_camouflage_profile_entry(&baseline_key).await;
     let cached_probe_profile = get_cached_camouflage_profile_entry(&probe_baseline_key).await;
@@ -568,7 +599,9 @@ pub(super) async fn fetch_camouflage_flight(
         if let Some(profile) = cached_handshake_profile.clone() {
             debug!(
                 host,
-                port, family, "camouflage refresh cooldown active, using cached handshake profile"
+                port,
+                baseline_key,
+                "camouflage refresh cooldown active, using cached handshake profile"
             );
             return Ok((
                 profile.server_records.clone(),
@@ -598,7 +631,12 @@ pub(super) async fn fetch_camouflage_flight(
     });
     if !is_refresh_leader {
         wait_for_camouflage_refresh_gate(refresh_gate).await;
-        let cached_after_wait = lookup_cached_camouflage_profile(host, port, client_hello).await;
+        let cached_after_wait = lookup_cached_camouflage_profile(
+            Some(&profile_key),
+            Some(&baseline_key),
+            &probe_baseline_key,
+        )
+        .await;
         if let Some(profile) = cached_after_wait
             .clone()
             .filter(|profile| !profile.server_records.is_empty())
@@ -733,7 +771,7 @@ pub(super) async fn establish_synthetic_camouflage_tunnel(
     noise_state: &mut Option<snow::HandshakeState>,
     derived_psk: &[u8],
     client_noise_tag: &[u8; 16],
-) -> anyhow::Result<snow::TransportState> {
+) -> anyhow::Result<crate::common::NoiseTransport> {
     let (camo_rx_buf_arc, camo_17_sizes_arc, camo_profile) =
         match fetch_camouflage_flight(camouflage_host, camouflage_port, client_hello).await {
             Ok(flight) => flight,
@@ -782,71 +820,97 @@ pub(super) async fn establish_synthetic_camouflage_tunnel(
         &remaining_17_sizes,
     )?;
 
-    tcp.write_all(&patched_server_records).await?;
-    tcp.flush().await?;
-
-    let first_delay = camo_profile.first_app_data_delay_ms;
-    if first_delay > 0 {
-        tokio::time::sleep(jitter_iat(first_delay)).await;
-    }
-
-    for (idx, &size) in camo_profile.prefix_app_data_sizes.iter().enumerate() {
-        // 与 ghost record 同一口径：明文上线的字节必须逐连接新鲜随机。
+    // 统一的 app-data 记录序列：前置小记录（装不下 Noise 响应的那一段）在
+    // 前，Noise 响应 + ghost 记录在后。它们本来就共享同一条时间轴，合并成
+    // 一个序列后下标即 app-data 序号，`gap_base` 偏移随之消失。
+    //
+    // 每条前置记录仍在此逐连接新鲜 `fill_bytes`（与 ghost 记录同一口径：
+    // ServerHello 之后写上线的明文字节在真实 TLS 1.3 里都是 AEAD 密文，
+    // 绝不能复用任何缓冲）。
+    let mut app_records: Vec<Vec<u8>> =
+        Vec::with_capacity(camo_profile.prefix_app_data_sizes.len() + noise_records.len());
+    for &size in &camo_profile.prefix_app_data_sizes {
         let mut record = vec![0u8; TLS_RECORD_HEADER_LEN + size];
         record[..3].copy_from_slice(&[0x17, 0x03, 0x03]);
         record[3..5].copy_from_slice(&(size as u16).to_be_bytes());
         rand::thread_rng().fill_bytes(&mut record[TLS_RECORD_HEADER_LEN..]);
-        tcp.write_all(&record).await?;
-        tcp.flush().await?;
+        app_records.push(record);
+    }
+    app_records.extend(noise_records);
 
-        if let Some(&gap) = camo_profile.early_app_data_gap_ms.get(idx) {
-            if gap > 0 {
-                tokio::time::sleep(jitter_iat(gap)).await;
+    // 一次突发写：ServerHello 记录组 + 全部 app-data 记录喂进同一个缓冲，
+    // 只在「显著」间隔处断开 write+flush 并 sleep。
+    //
+    // 此前只有 noise 记录循环享受这条规则，SH+CCS 与首条 app-data 的接缝、
+    // 以及每两条前置记录之间都是独立的 write+flush。socket 开了 TCP_NODELAY，
+    // 于是即便 `first_app_data_delay == 0`、`gap == 0`，这些位置也**恒定**落在
+    // 不同的 TCP 分段里——真实 TLS 1.3 服务端把 SH|CCS|EE|CERT|CV|FIN 连续
+    // 突发写出、由内核按 MSS 分段，分段边界与 TLS 记录边界并不对齐。一个
+    // 「记录边界恒等于分段边界」的服务端只需被动看一条连接即可判别，而且
+    // 每连接还白付 2–6 次 syscall。
+    //
+    // gap 下标由 `replay_gap_before_us` 统一给出（合并两段后下标轴只剩一条，
+    // 原先的 `gap_base` 偏移随之消失）。最后一条记录之后的间隔不会被查询，
+    // 与此前 `!is_last` 的语义一致。
+    //
+    // `first_app_data_delay_us` 若 >= 阈值仍会在 SH+CCS 之后断开并 sleep
+    // （部分站点确实会隔一段时间才下发 NewSessionTicket）；低于阈值（含 0）
+    // 则并入同一次突发——这正是本次修复的核心。
+    let mut burst: Vec<u8> = Vec::with_capacity(
+        patched_server_records.len() + app_records.iter().map(Vec::len).sum::<usize>(),
+    );
+    burst.extend_from_slice(&patched_server_records);
+
+    for (idx, record) in app_records.iter().enumerate() {
+        let gap_us = replay_gap_before_us(&camo_profile, idx);
+        if gap_us >= SIGNIFICANT_REPLAY_GAP_US {
+            if !burst.is_empty() {
+                tcp.write_all(&burst).await?;
+                tcp.flush().await?;
+                burst.clear();
             }
+            tokio::time::sleep(jitter_iat(gap_us)).await;
         }
+        burst.extend_from_slice(record);
     }
 
-    // 回放参考端点记录到的记录间隔，但只对「显著」间隔断开写批次。
-    //
-    // 真实 TLS 1.3 服务器把 EE/CERT/CV/FIN 连续突发写出，采样到的间隔多为
-    // 0–1ms；若对每条记录都单独 write+flush，反而会把一次突发拆成一串独立
-    // 分段，比合并写更不像真实端点。因此亚阈值间隔并入同一次写（由内核按
-    // MSS 分段，与真实突发一致），只有真正的停顿（如部分站点延迟下发
-    // NewSessionTicket）才断开并 sleep。
-    //
-    // gap 下标对齐：early_app_data_gap_ms[i] 是第 i 条与第 i+1 条 app-data
-    // 之间的间隔；前置小记录已消耗了开头 prefix_count 个间隔。
-    let gap_base = camo_profile.prefix_app_data_sizes.len();
-    let mut burst: Vec<u8> = Vec::new();
-    for (idx, record) in noise_records.iter().enumerate() {
-        burst.extend_from_slice(record);
-        let is_last = idx + 1 == noise_records.len();
-        let gap = camo_profile
-            .early_app_data_gap_ms
-            .get(gap_base + idx)
-            .copied()
-            .unwrap_or(0);
-        if !is_last && gap >= SIGNIFICANT_REPLAY_GAP_MS {
-            tcp.write_all(&burst).await?;
-            tcp.flush().await?;
-            burst.clear();
-            tokio::time::sleep(jitter_iat(gap)).await;
-        }
-    }
     if !burst.is_empty() {
         tcp.write_all(&burst).await?;
         tcp.flush().await?;
     }
     debug!("Sent Noise response (e, ee) wrapped in Application Data");
 
-    let noise = noise_state
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("Noise handshake state already consumed"))?
-        .into_transport_mode()?;
+    let noise = crate::common::NoiseTransport::new(
+        noise_state
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Noise handshake state already consumed"))?
+            .into_stateless_transport_mode()?,
+    );
     Ok(noise)
 }
 
-/// 围绕 `base_ms` 的 ±20% 对称抖动，保留亚毫秒精度。
+/// 回放序列中 **第 `idx` 条 app-data 记录之前** 的间隔（微秒）。
+///
+/// 下标推导（前置小记录与 Noise/ghost 记录被合并成同一条下标轴之后重新做过
+/// 一遍，避免 off-by-one）：`early_app_data_gap_us[j]` 的定义是「第 j 条与第
+/// j+1 条 app-data 之间的间隔」，即它**紧接在** `app_records[j]` 之后。取反
+/// 得到「某条记录之前的间隔」：
+///
+///   * `idx == 0`：ServerHello 到达 → 首条 app-data，即 `first_app_data_delay_us`；
+///   * `idx >= 1`：`early_app_data_gap_us[idx - 1]`；
+///   * 越界（采样时 gap 数少于记录数）：0，即并入同一次突发。
+///
+/// 与合并前的两段循环逐项等价：旧 prefix 循环在写完 `prefix[i]` 后 sleep
+/// `gap[i]`，旧 noise 循环在写完 `noise[i]` 后判断 `gap[prefix_count + i]`
+/// —— 两者都是「记录 j 之后 = gap[j]」，因此「记录 j 之前 = gap[j-1]」。
+pub(super) fn replay_gap_before_us(profile: &CamouflageProfile, idx: usize) -> u32 {
+    match idx.checked_sub(1) {
+        None => profile.first_app_data_delay_us,
+        Some(prev) => profile.early_app_data_gap_us.get(prev).copied().unwrap_or(0),
+    }
+}
+
+/// 围绕 `base_us`（微秒）的 ±20% 对称抖动。
 ///
 /// 旧实现 `base + jitter.saturating_sub(jitter_max)` 中两个操作数都是 u64，
 /// `saturating_sub` 把负半边整体压到 0，实际分布退化为：
@@ -856,15 +920,22 @@ pub(super) async fn establish_synthetic_camouflage_tunnel(
 ///
 /// 真实网络到达间隔既无原子、也不是单边均匀分布，这三点合起来是一个
 /// 稳定的时序指纹。
-pub(super) fn jitter_iat(base_ms: u16) -> Duration {
+///
+/// 入参量纲随 profile 从毫秒改为微秒（见 `CamouflageProfile`），分布语义
+/// 不变（对称、连续、非单边）。两点随之调整：
+///   * 输出改用 `from_nanos`，否则 `sampled` 的小数部分会被微秒量化重新
+///     引入格点——±20% 的抖动本就是为了消除格点；
+///   * 下限从「0.05 ms」改为「50 ns」。它只是防御性钳制：`spread` 恒为
+///     `base` 的 20%，所以 `base_us >= 1` 时 `sampled >= 0.8` µs，钳制不可达。
+pub(super) fn jitter_iat(base_us: u32) -> Duration {
     use rand::Rng;
-    if base_ms == 0 {
+    if base_us == 0 {
         return Duration::ZERO;
     }
-    let base = base_ms as f64;
+    let base = base_us as f64;
     let spread = base * 0.2;
     let sampled = base + rand::thread_rng().gen_range(-spread..=spread);
-    Duration::from_micros((sampled.max(0.05) * 1000.0).round() as u64)
+    Duration::from_nanos((sampled.max(0.05) * 1000.0).round() as u64)
 }
 
 pub(super) fn build_noise_response_sequence(
@@ -941,69 +1012,98 @@ pub(super) fn camouflage_refresh_gate_key(host: &str, port: u16, family: &str) -
     format!("{}:{}:gate:{}", host, port, family)
 }
 
-pub(super) async fn get_cached_camouflage_profile_pool(key: &str) -> Option<CamouflageProfilePool> {
-    let mut profiles = CAMOUFLAGE_PROFILES.lock().await;
-    profiles.get(key).cloned()
-}
-
+/// 取一个缓存 key 对应的变体。**单次加锁**，且只克隆中选的那一个变体。
+///
+/// 此前是 `get_cached_camouflage_profile_pool(key)` → `profiles.get(key).cloned()`
+/// 深拷贝**整个池**（最多 4 个变体，各含两个真实 `Vec` 分配加一次
+/// `Arc<[usize]>` 重建），出锁后再 `sample_camouflage_profile` 对每个变体
+/// `sanitize + clone` 一遍。于是每次「有没有 rank-3 条目」的查询要付两轮
+/// 全池克隆，而 `fetch_camouflage_flight` 在一次已认证握手上要查 4 次。
+/// 现在锁内直接对引用算 rank、只克隆中选者（见 `sample_camouflage_profile`
+/// 的等价性论证），临界区反而更短：进锁做的分配从 ~2×N 降到 1。
 pub(super) async fn get_cached_camouflage_profile_entry(key: &str) -> Option<CamouflageProfile> {
-    get_cached_camouflage_profile_pool(key)
-        .await
-        .as_ref()
-        .and_then(sample_camouflage_profile)
+    let mut profiles = CAMOUFLAGE_PROFILES.lock().await;
+    let pool = profiles.get(key)?;
+    sample_camouflage_profile(pool)
 }
 
+/// 按 key 查缓存 profile：指纹 key → 指纹族 baseline key → probe baseline key，
+/// 任一命中 rank 3 立即返回，否则留下 rank 最高者。
+///
+/// **此前它的签名是 `(host, port, client_hello)`，自己从 ClientHello 重新推导
+/// 指纹与 key。** 而唯一的生产调用者 `fetch_camouflage_flight` 在调用它之前
+/// 已经算过同一份指纹与同一批 key，于是 `stable_client_hello_fingerprint`
+/// 在同一次握手里对同一条约 1 KB 的 ClientHello 跑两遍——release 实测
+/// 1.60 µs/次，占 `fetch_camouflage_flight` 缓存命中总耗时（6.61 µs）的近一半，
+/// 比它全部 4 次全局锁加起来还贵。改成接收 key 之后，指纹只算一次。
+///
+/// 查找顺序 / rank 优先级 / 提前返回条件 / LRU 命中顺序与此前逐字相同。指纹化
+/// 失败时前两个 key 传 None，与此前 `if let Some(fingerprint)` 整块被跳过等价。
 pub(super) async fn lookup_cached_camouflage_profile(
-    host: &str,
-    port: u16,
-    client_hello: &[u8],
+    profile_key: Option<&str>,
+    family_baseline_key: Option<&str>,
+    probe_baseline_key: &str,
 ) -> Option<CamouflageProfile> {
     let mut best_profile = None;
     let mut best_rank = 0;
 
-    if let Some(fingerprint) = stable_client_hello_fingerprint(client_hello) {
-        let mut hex_buf = [0u8; 64];
-        let fingerprint_hex = hex_encode_fingerprint(&fingerprint, &mut hex_buf);
-        let profile_key = camouflage_profile_key(host, port, fingerprint_hex);
-        if let Some(profile) = get_cached_camouflage_profile_entry(&profile_key).await {
-            let rank = camouflage_profile_rank(&profile);
-            if rank == 3 {
-                return Some(profile);
-            }
-            if rank > best_rank {
-                best_rank = rank;
-                best_profile = Some(profile);
-            }
-        }
-        let family = if fingerprint_hex.len() >= 8 {
-            &fingerprint_hex[..8]
-        } else {
-            "probe"
-        };
-        let family_key = camouflage_baseline_key(host, port, family);
-        if let Some(profile) = get_cached_camouflage_profile_entry(&family_key).await {
-            let rank = camouflage_profile_rank(&profile);
-            if rank == 3 {
-                return Some(profile);
-            }
-            if rank > best_rank {
-                best_rank = rank;
-                best_profile = Some(profile);
-            }
-        }
-    }
-    if let Some(profile) =
-        get_cached_camouflage_profile_entry(&camouflage_baseline_key(host, port, "probe")).await
+    for key in [profile_key, family_baseline_key, Some(probe_baseline_key)]
+        .into_iter()
+        .flatten()
     {
+        let Some(profile) = get_cached_camouflage_profile_entry(key).await else {
+            continue;
+        };
         let rank = camouflage_profile_rank(&profile);
         if rank == 3 {
             return Some(profile);
         }
         if rank > best_rank {
+            best_rank = rank;
             best_profile = Some(profile);
         }
     }
     best_profile
+}
+
+/// 一条连接在伪装缓存里用到的全部 key。
+///
+/// 抽成一个结构体是为了让「ClientHello → key」的推导只存在**一处**：此前
+/// `fetch_camouflage_flight` 与 `lookup_cached_camouflage_profile` 各推导一遍，
+/// 两份逻辑必须逐字一致却没有任何机制保证，而且白付一次指纹计算。
+pub(super) struct CamouflageCacheKeys {
+    /// 逐指纹的 profile key。
+    pub(super) profile: String,
+    /// 指纹族（指纹前 8 个 hex 字符）的 baseline key。
+    pub(super) family_baseline: String,
+    /// 启动期探针写入的 baseline key，与指纹无关。
+    pub(super) probe_baseline: String,
+    pub(super) refresh_cooldown: String,
+    pub(super) refresh_gate: String,
+}
+
+/// 由 ClientHello 推出本连接的全部缓存 key；指纹化失败返回 None。
+pub(super) fn camouflage_cache_keys(
+    host: &str,
+    port: u16,
+    client_hello: &[u8],
+) -> Option<CamouflageCacheKeys> {
+    let fingerprint = stable_client_hello_fingerprint(client_hello)?;
+    let mut hex_buf = [0u8; 64];
+    let fingerprint_hex = hex_encode_fingerprint(&fingerprint, &mut hex_buf);
+    // 指纹族 key：指纹哈希前 8 个 hex 字符，不足则退回 "probe"。
+    let family = if fingerprint_hex.len() >= 8 {
+        &fingerprint_hex[..8]
+    } else {
+        "probe"
+    };
+    Some(CamouflageCacheKeys {
+        profile: camouflage_profile_key(host, port, fingerprint_hex),
+        family_baseline: camouflage_baseline_key(host, port, family),
+        probe_baseline: camouflage_baseline_key(host, port, "probe"),
+        refresh_cooldown: camouflage_refresh_cooldown_key(host, port, family),
+        refresh_gate: camouflage_refresh_gate_key(host, port, family),
+    })
 }
 
 pub(super) async fn store_camouflage_profile(key: String, profile: CamouflageProfile) {
@@ -1167,9 +1267,9 @@ pub(super) async fn read_camouflage_server_records(
     let mut server_hello_seen: Option<Instant> = None;
     let sample_deadline =
         tokio::time::Instant::now() + Duration::from_secs(CAMOUFLAGE_IO_TIMEOUT_SECS);
-    let mut first_app_data_delay_ms = None;
+    let mut first_app_data_delay_us = None;
     let mut last_app_data_seen = None;
-    let mut early_app_data_gap_ms = Vec::new();
+    let mut early_app_data_gap_us = Vec::new();
 
     loop {
         let timeout_dur = std::time::Duration::from_secs(CAMOUFLAGE_SAMPLE_IDLE_TIMEOUT_SECS);
@@ -1246,23 +1346,27 @@ pub(super) async fn read_camouflage_server_records(
                         break;
                     }
                     let now = Instant::now();
-                    if first_app_data_delay_ms.is_none() {
+                    // 微秒而非毫秒：`as_millis()` 向下截断，会把真实端点绝大
+                    // 多数 0–1 ms 的帧内间隔整体压成 0，活下来的间隔又全部落
+                    // 在整毫秒格点上（见 CamouflageProfile 的说明）。采样侧的
+                    // 10 s 上限远小于 u32 微秒的 ~71 分钟量程，饱和不可达。
+                    if first_app_data_delay_us.is_none() {
                         // 相对 ServerHello 到达时刻的真实帧内间隔（见上方注释）。
-                        first_app_data_delay_ms = Some(
+                        first_app_data_delay_us = Some(
                             server_hello_seen
                                 .map(|seen| {
                                     now.duration_since(seen)
-                                        .as_millis()
-                                        .min(u16::MAX as u128) as u16
+                                        .as_micros()
+                                        .min(u32::MAX as u128) as u32
                                 })
                                 .unwrap_or(0),
                         );
                     }
                     if let Some(last_seen) = last_app_data_seen {
-                        early_app_data_gap_ms.push(
+                        early_app_data_gap_us.push(
                             now.duration_since(last_seen)
-                                .as_millis()
-                                .min(u16::MAX as u128) as u16,
+                                .as_micros()
+                                .min(u32::MAX as u128) as u32,
                         );
                     }
                     last_app_data_seen = Some(now);
@@ -1317,8 +1421,8 @@ pub(super) async fn read_camouflage_server_records(
             early_app_data_count: app_data_sizes_arc.len().min(u8::MAX as usize) as u8,
             has_ccs,
             visible_server_record_count,
-            first_app_data_delay_ms: first_app_data_delay_ms.unwrap_or_default(),
-            early_app_data_gap_ms,
+            first_app_data_delay_us: first_app_data_delay_us.unwrap_or_default(),
+            early_app_data_gap_us,
             app_data_sizes: app_data_sizes_arc,
         },
     ))

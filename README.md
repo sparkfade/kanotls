@@ -17,7 +17,7 @@ UDP:           SOCKS5 UDP ASSOCIATE carried as UDP-over-TCP stream data
 
 kanotls uses a separate Noise channel for endpoint authentication and payload confidentiality. The Noise ephemeral public key is embedded in the ClientHello `random` field via PSK-derived XOR masking; the `key_share` extension carries an **independent** TLS-layer X25519 ephemeral key to complete the visible handshake with the reference endpoint, eliminating statistical correlation between the two fields. The server replays cached reference-endpoint record shapes — it contacts the live camouflage endpoint only on first boot and during periodic background refresh.
 
-Authentication and replay failures are handled by a shaped path with bounded pre-auth fallback for well-formed requests. Read-stage (post-authentication) failures fail closed without fallback. Fallback connections carry explicit abuse limits (concurrency caps, per-IP limits, connect timeouts, IP reputation cooldown). AEAD decryption failures silently close the connection — no alert is sent, no `close_notify` leaks.
+Authentication and replay failures are handled by a shaped path with bounded pre-auth fallback for well-formed requests. Read-stage (post-authentication) failures fail closed without fallback. Fallback connections carry explicit abuse limits (512 global concurrent, 16 per-IP concurrent, a 3 s connect timeout); the per-IP cumulative rate cooldown has been removed — it let 113 ordinary connections push an IP onto the non-forwarding branch, manufacturing a content-level, zero-false-positive discriminator. AEAD decryption failures silently close the connection — no alert is sent, no `close_notify` leaks.
 
 Detailed mechanism reference: [docs/MECHANISM.md](docs/MECHANISM.md)
 
@@ -32,8 +32,8 @@ Detailed mechanism reference: [docs/MECHANISM.md](docs/MECHANISM.md)
 - **HTTP CONNECT only**: HTTP inbound accepts only authority-form `CONNECT host:port`.
 - **Destination guardrails**: Server rejects loopback, private, link-local, multicast, broadcast, unspecified, CGNAT, reserved (`240.0.0.0/4`), and port-0 destinations.
 - **Single binary**: `cargo build --release`. Mode auto-detected from inbound protocol types.
-- **TLS fingerprint**: `firefox` (captured bootstrap; the only preset). Custom ClientHello hex via `template_path`. At load time every template is normalized: the ECH (`0xFE0D`/`0x014A`), `early_data` (`0x0119`), `use_srtp` (`0x001C`) and `0x0022` extensions are stripped, and the X25519MLKEM768 hybrid key share is regenerated with structurally valid ML-KEM coefficients per connection (servers with ML-KEM support validate them).
-- **Idle teardown**: Pin-reset idle timer per server session; resets on each successful read. Idle timeout (default 45 s, configurable with ±10% jitter) triggers graceful session teardown with Noise-encrypted `close_notify` and TCP FIN. Client-side connection idle lifecycle is fully managed by the connection pool (30s idle drain + seeded soft TTL rotation); `idle_timeout_secs` applies to the server side only. No application-layer heartbeat — kernel TCP keepalive (60 s idle, 30 s interval, 3 retries on Linux) handles dead-peer detection.
+- **TLS fingerprint**: `firefox` (captured bootstrap; the only preset). Custom ClientHello hex via `template_path`. **No extension is stripped** — the emitted extension-type list is item-for-item identical to the captured real Firefox (15 of them) and the ClientHello is 1884 bytes. Regenerated per connection: a structurally valid X25519MLKEM768 hybrid share, a real P-256 curve point, and **one** X25519 key written to both the 0x001d share and the hybrid share (real Firefox reuses the same key — NSS Bug 1902119), plus the ECH GREASE `config_id`/`enc`/`payload` fields.
+- **Idle teardown**: Pin-reset idle timer per server session; resets on each successful read. Idle timeout (default **75 s**, configurable, a **constant with no jitter**, taken from nginx's `keepalive_timeout` default) triggers graceful session teardown with Noise-encrypted `close_notify` and TCP FIN. Client-side connection idle lifecycle is fully managed by the connection pool (**115 s** idle drain, matching Firefox's `network.http.keep-alive.timeout`; soft TTL **3600 s**, matching nginx's `keepalive_time` 1h default); `idle_timeout_secs` applies to the server side only. No application-layer heartbeat — kernel TCP keepalive matches Firefox's defaults (**600 s** idle, **1 s** interval, **4** probes, no jitter). At the H2 layer the client sends an idle PING (triggered after 58 s with no peer arrival, suppressed inside the observation window), and a GOAWAY precedes teardown.
 - **Active traffic shaping**: A full-lifecycle Markov state machine (TrafficShaper) actively slices, pads, and paces every application-data (0x17) record to shaper-dictated wire lengths — plaintext size never maps to wire size. Supports an optional declarative script (`traffic_script`) for deterministic control over post-handshake packet sequences, including inter-record Delay timing (log-normal or pre-recorded IAT replay) and asymmetric FakeResponse interactions (CMD_PADDING). Record padding is zero, per RFC 8446 §5.4 — it sits on the plaintext side of the AEAD, so its content is invisible on the wire.
 - **Template hot-reload**: `template_path` hex files are polled every 30 s for mtime changes. On update, the file is re-parsed, the template cache invalidated, and new connections pick up the fresh ClientHello without restart. Failed parses are logged but preserve the previous template.
 
@@ -71,7 +71,7 @@ Start with `kanotls --config config.json`. Role auto-detection: `"protocol": "ka
         },
         "session": {
           "max_streams_per_session": 256,
-          "idle_timeout_secs": 45,
+          "idle_timeout_secs": 75,
           "traffic_script": [
             "stop=6",
             "0=L:200-250,D:0,F:0",
@@ -150,7 +150,7 @@ Start with `kanotls --config config.json`. Role auto-detection: `"protocol": "ka
         },
         "session": {
           "max_streams_per_session": 256,
-          "idle_timeout_secs": 45,
+          "idle_timeout_secs": 75,
           "traffic_script": [
             "stop=6",
             "0=L:200-250,D:0,F:0",
@@ -227,9 +227,9 @@ The client inbound `protocol` field accepts `"socks"` as an alias for `"socks5"`
 
 ### Session Tuning
 
-`idle_timeout_secs` controls server-side session idle teardown (default 45 s, with ±10% jitter). Config validation accepts `[1, 3600]`. The connection pool fully manages client-side connection idle lifecycle (30s idle drain + 120–300s seeded soft TTL rotation); this field is accepted but unused client-side. Server-side configuration is unclamped.
+`idle_timeout_secs` controls server-side session idle teardown (default 75 s, a constant with no jitter). Config validation accepts `[1, 3600]`. The connection pool fully manages client-side connection idle lifecycle (115 s idle drain + a 3600 s soft-TTL backstop); this field is accepted but unused client-side. Server-side configuration is unclamped.
 
-**Server-side** idle teardown: The session read loop uses a pin-reset idle timer (default 45 s, with ±10% jitter) that resets on each successful read. When the timer fires and no streams are active, the session tears down gracefully with a Noise-encrypted `close_notify` and TCP FIN. No application-layer heartbeat is sent — kernel TCP keepalive handles dead-peer detection.
+**Server-side** idle teardown: The session read loop uses a pin-reset idle timer (default 75 s, a constant with no jitter) that resets on each successful read. When the timer fires and no streams are active, the session tears down gracefully with a Noise-encrypted `close_notify` and TCP FIN. No application-layer heartbeat is sent — kernel TCP keepalive handles dead-peer detection.
 
 ### Traffic Script
 
@@ -261,7 +261,7 @@ Malformed scripts are non-fatal: a warning is logged at startup and the entire e
 
 ### TLS Configuration
 
-The outer TLS ClientHello is generated from the captured Firefox template (the only `fingerprint` value, and the default). Endpoint authentication and payload confidentiality come entirely from `Noise_NNpsk0` with the configured `password` — the outer TLS layer provides camouflage only. The server uses cached reference-endpoint profiles for visible record replay; `template_path` overrides the embedded Firefox template with a captured hex file. Every template (embedded or custom) is normalized at load time: ECH/early_data/use_srtp/0x0022 extensions are stripped and the X25519MLKEM768 share is re-randomized with valid coefficients.
+The outer TLS ClientHello is generated from the captured Firefox template (the only `fingerprint` value, and the default). Endpoint authentication and payload confidentiality come entirely from `Noise_NNpsk0` with the configured `password` — the outer TLS layer provides camouflage only. The server uses cached reference-endpoint profiles for visible record replay; `template_path` overrides the embedded Firefox template with a captured hex file. No extension is stripped from any template (embedded or custom); the key_share and ECH GREASE variable fields are refreshed per connection (see [MECHANISM §6](docs/MECHANISM.md#6-fingerprint-presets)).
 
 ### TLS Fingerprint Presets
 
@@ -335,7 +335,7 @@ Client fuses `[SETTINGS] [SYN] [PSH(target)] [PSH(data)]` into one coalesced flu
 
 ### Idle Teardown (Server)
 
-The session read loop (server-side only; client sessions are lifecycle-managed by the connection pool) uses a pinned `tokio::time::sleep` timer that resets on each successful read. On idle timeout tick, the session checks whether any streams are active; if idle, it sends a Noise-encrypted TLS `close_notify` (0x15) and TCP FIN, tearing down the connection gracefully. No CMD_PING heartbeat is sent at the application layer — kernel TCP keepalive (60 s idle, 30 s interval, 3 retries on Linux) serves as the dead-peer detection mechanism instead.
+The session read loop (server-side only; client sessions are lifecycle-managed by the connection pool) uses a pinned `tokio::time::sleep` timer that resets on each successful read. On idle timeout tick, the session checks whether any streams are active; if idle, it sends a Noise-encrypted TLS `close_notify` (0x15) and TCP FIN, tearing down the connection gracefully. Kernel TCP keepalive, matching Firefox's defaults (600 s idle, 1 s interval, 4 probes), serves as dead-peer detection.
 
 ## Camouflage Endpoint Caching
 
@@ -347,7 +347,7 @@ The session read loop (server-side only; client sessions are lifecycle-managed b
 
 ### Pre-Auth Fallback
 
-**Every** failure before the authenticated tunnel path is committed relays the client's traffic transparently to the camouflage endpoint — non-TLS first record, auth failure, SNI mismatch, an oversized declared record length, a stalled/partial record, or nothing sent at all. The relayed buffer contains only bytes the client actually sent, and the initial-record deadline is sampled per connection from 8–15 s, so no input a prober can construct produces a different observable.
+**Every** failure before the authenticated tunnel path is committed relays the client's traffic transparently to the camouflage endpoint — non-TLS first record, auth failure, SNI mismatch, an oversized declared record length, a stalled/partial record, or nothing sent at all. The relayed buffer contains only bytes the client actually sent, and the initial-record deadline is two fixed constants (2 s for zero bytes, 5 s once a partial record exists) — deliberately not randomized, because a real nginx's `client_header_timeout` is itself an exact constant. No input a prober can construct produces a different observable.
 
 Relaying is bounded:
 
@@ -356,10 +356,9 @@ Relaying is bounded:
 | Global concurrent fallbacks | 512 (fixed) |
 | Per-IP concurrent fallbacks | 16 (fixed) |
 | Fallback connect timeout | 3 s (fixed) |
-| IP cooldown threshold | 112 fallbacks per 3600 s window → 300 s cooldown |
 | Concurrent in-handshake connections | 512 (fixed) |
 
-When a limit is exhausted the connection cannot be relayed and takes a single unified exit: the receive queue is drained (so the close is always a clean FIN rather than an RST) and the socket is closed after a randomized 200–3000 ms delay. This is the only path that does not reach the camouflage endpoint, and it is reachable only by exhausting a limit. See [MECHANISM §5.2](docs/MECHANISM.md#52-pre-auth-fallback).
+When a limit is exhausted the connection cannot be relayed and takes a single unified exit: the receive queue is drained (so the close is always a clean FIN rather than an RST) and the socket is then closed **immediately** — which is exactly what a real nginx does when `worker_connections` is exhausted. This is the only path that does not reach the camouflage endpoint; **no single connection's content triggers it**, though a prober can reach it by holding 16 concurrent fallback connections to occupy the per-IP limit. See [MECHANISM §5.2](docs/MECHANISM.md#52-pre-auth-fallback).
 
 ### Server Outbounds
 
