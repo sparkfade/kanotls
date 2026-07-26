@@ -60,7 +60,7 @@ counter = (session_id << 24) | sequence
 
 ### 2.2 启动健康检查
 
-服务端启动时，`validate_camouflage_endpoint()` 向参考端点发送 4 次新鲜 rustls 生成的 ClientHello。每次 flight 经指纹化（random/session_id/key_share 置零，padding 扩展规范化）后，按 per-指纹 key 和指纹族 baseline key（指纹哈希的前 8 个 hex 字符）进行缓存。
+服务端启动时，`validate_camouflage_endpoint()` 向参考端点发送 4 次由模板实例化的新鲜 ClientHello（与客户端相同的 Firefox 模板）。每次 flight 经指纹化（random/session_id/key_share 置零，padding 扩展规范化）后，按 per-指纹 key 和指纹族 baseline key（指纹哈希的前 8 个 hex 字符）进行缓存。
 
 ### 2.3 逐连接回放
 
@@ -298,15 +298,16 @@ Session 读取循环（`run_read_loop`）使用 pinned `tokio::time::sleep` 定�
 
 `fingerprint` 配置字段选择 ClientHello 生成策略：
 
-| 预设　　　　　　　　　　　　　| 来源　　　　　　　　　　　| 加密套件顺序　　　　　　　　　　　　　　　　| Key Share 组　　　　　　　　 |
-| -------------------------------| ---------------------------| ---------------------------------------------| ------------------------------|
-| `firefox`　　　　　　　　　　 | 捕获的 bootstrap hex blob | AES-128-GCM, ChaCha20-Poly1305, AES-256-GCM | X25519, SECP256R1　　　　　　|
-| `rustls`　　　　　　　　　　　| 原生 rustls TLS 1.3　　　 | AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 | X25519, SECP256R1, SECP384R1 |
-| `python-openssl` / `baseline` | 捕获的 bootstrap hex blob | AES-256-GCM, ChaCha20-Poly1305, AES-128-GCM | X25519, SECP256R1　　　　　　|
+| 预设　　　　　　　　　　　　　| 来源　　　　　　　　　　　| 加密套件顺序　　　　　　　　　　　　　　　　| Key Share 组　　　　　　　　　　　　　　　 |
+| -------------------------------| ---------------------------| ---------------------------------------------| ---------------------------------------------|
+| `firefox`　　　　　　　　　　 | 捕获的 bootstrap hex blob | AES-128-GCM, ChaCha20-Poly1305, AES-256-GCM | X25519MLKEM768, X25519, SECP256R1　　　　　 |
 
-Firefox 和 Python-OpenSSL 预设精确保留捕获的记录形态（扩展顺序、填充、记录长度）。Rustls 预设使用实时 rustls 生成并对 GREASE 进行轮换。
+`firefox` 是唯一受支持的取值（亦为默认值）；其他 `fingerprint` 取值在配置校验时直接报错。该预设精确保留捕获的记录形态（扩展顺序、填充、记录长度），并对所有模板（内嵌或 `template_path` 自定义 hex）在加载时统一执行两项规范化：
 
-可通过 `template_path` 用自定义 ClientHello hex 文件覆盖 Firefox/Python-OpenSSL 模板。Rustls 预设忽略 `template_path`。
+1. **扩展剔除**：移除 ECH（`0xFE0D`/`0x014A`）、`early_data`（`0x0119`）、`use_srtp`（`0x001C`）和 `0x0022`——它们要么破坏与普通 TLS 1.3 端点的互操作性，要么对伪装没有价值。
+2. **结构合法的 X25519MLKEM768 份额**：每条连接重新生成 1216 字节混合份额——768 个系数从 [0, 3329) 均匀采样（与真实 ML-KEM.768 ek 同分布），后接随机 rho/X25519 字节。支持 ML-KEM 的服务器（OpenSSL 3.5+）会在解码时校验系数范围，对随机垃圾回 `illegal_parameter`；合法份额同时在统计上与真实 Firefox 密钥不可区分。
+
+可通过 `template_path` 用自定义 ClientHello hex 文件覆盖内嵌 Firefox 模板，规范化同样生效。
 
 ---
 

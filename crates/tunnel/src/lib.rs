@@ -2,7 +2,7 @@ pub mod client;
 pub mod common;
 pub mod control_size;
 pub mod entropy;
-pub mod fp;
+mod fp;
 pub mod server;
 mod template;
 pub mod templates;

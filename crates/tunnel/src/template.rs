@@ -8,12 +8,11 @@ use rand::{Rng, RngCore};
 use tracing::warn;
 
 use crate::fp;
-use crate::fp::FingerprintPreset;
 use crate::templates;
 use crate::utils::{
     client_hello_random_and_session_id_ranges, derive_counter_mac, derive_counter_mask,
     extract_client_hello_random_and_session_id, is_grease_value, mask_noise_ephemeral_key,
-    xor_u64_bytes, GREASE_VALUES, MAX_TLS_RECORD_PAYLOAD_LEN,
+    xor_u64_bytes, GREASE_VALUES,
 };
 
 lazy_static! {
@@ -52,10 +51,7 @@ pub struct ClientHelloTemplate {
     cipher_suites_range: Range<usize>,
     key_share_range: Range<usize>,
     auxiliary_key_share_ranges: Vec<Range<usize>>,
-    record_len_range: Range<usize>,
-    handshake_len_range: Range<usize>,
     extensions_len_range: Range<usize>,
-    append_psk_key_exchange_modes: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -91,7 +87,15 @@ impl ClientHelloTemplate {
             for range in &self.auxiliary_key_share_ranges {
                 if range.end <= out.len() {
                     let share_data = &mut out[range.clone()];
-                    if share_data.len() == 65 && share_data[0] == 0x04 {
+                    if share_data.len() == 1216 {
+                        // X25519MLKEM768 hybrid share (1184-byte ML-KEM.768
+                        // encapsulation key + 32-byte X25519). Servers with
+                        // ML-KEM support (OpenSSL 3.5+) validate the ek
+                        // coefficient range on decode and alert
+                        // illegal_parameter on random garbage, so the share
+                        // must be structurally valid.
+                        fill_mlkem768_hybrid_share(share_data);
+                    } else if share_data.len() == 65 && share_data[0] == 0x04 {
                         // A 65-byte 0x04-prefixed share is an uncompressed SEC1
                         // P-256 point: emit a real public key so DPI point
                         // validation cannot tell the share apart from a genuine
@@ -122,14 +126,6 @@ impl ClientHelloTemplate {
         session_id[16..24].copy_from_slice(&masked_counter);
         session_id[24..32].copy_from_slice(&mac);
         session_id[31] &= !0x03;
-        if self.append_psk_key_exchange_modes {
-            append_psk_key_exchange_modes_extension(
-                &mut out,
-                &self.record_len_range,
-                &self.handshake_len_range,
-                &self.extensions_len_range,
-            )?;
-        }
         apply_client_hello_randomization(
             &mut out,
             &self.cipher_suites_range,
@@ -142,6 +138,29 @@ impl ClientHelloTemplate {
 /// Generate a real ephemeral P-256 public key into `share_data` (65-byte
 /// uncompressed SEC1 point, 0x04 prefix — the exact shape ring emits).
 /// Returns false on any failure so the caller can fall back to random fill.
+/// Fill a 1216-byte X25519MLKEM768 hybrid key_share with structurally valid
+/// material. Layout: 768 ML-KEM.768 coefficients packed two-per-three-bytes
+/// as 12-bit values (1152 bytes), a 32-byte rho seed, then a 32-byte X25519
+/// public key. Coefficients are sampled uniformly from [0, 3329) — the same
+/// distribution as a genuine ML-KEM encapsulation key — so the share passes
+/// server-side mod-q decode validation (OpenSSL 3.5+ alerts
+/// illegal_parameter on out-of-range coefficients) while remaining
+/// statistically indistinguishable from a real key.
+fn fill_mlkem768_hybrid_share(share_data: &mut [u8]) {
+    const MLKEM768_Q: u16 = 3329;
+    debug_assert_eq!(share_data.len(), 1216);
+    let mut rng = rand::thread_rng();
+    for chunk in share_data[..1152].chunks_exact_mut(3) {
+        let d0: u16 = rng.gen_range(0..MLKEM768_Q);
+        let d1: u16 = rng.gen_range(0..MLKEM768_Q);
+        chunk[0] = d0 as u8;
+        chunk[1] = ((d0 >> 8) as u8) | (((d1 & 0x0F) as u8) << 4);
+        chunk[2] = (d1 >> 4) as u8;
+    }
+    // rho seed + X25519 public key: opaque random bytes.
+    rng.fill_bytes(&mut share_data[1152..]);
+}
+
 fn fill_p256_public_key(share_data: &mut [u8]) -> bool {
     let rng = ring::rand::SystemRandom::new();
     let Ok(private_key) =
@@ -230,20 +249,14 @@ fn build_client_hello_template(
     sni: &str,
     fingerprint: Option<&str>,
     custom_template_bytes: Option<&[u8]>,
-    insecure: bool,
+    _insecure: bool,
 ) -> anyhow::Result<Arc<ClientHelloTemplate>> {
-    let preset = fp::fingerprint_preset(fingerprint)?;
+    fp::validate_fingerprint(fingerprint)?;
 
-    let custom_bytes = custom_template_bytes.map(|b| b.to_vec());
-
-    let mut bytes = match preset {
-        FingerprintPreset::Firefox => {
-            custom_bytes.unwrap_or_else(|| templates::FIREFOX_BOOTSTRAP_CLIENT_HELLO.to_vec())
-        }
-        FingerprintPreset::PythonOpenSsl => custom_bytes
-            .unwrap_or_else(|| templates::PYTHON_OPENSSL_BOOTSTRAP_CLIENT_HELLO.to_vec()),
-        FingerprintPreset::Rustls => build_rustls_template_bytes(sni, fingerprint, insecure)?,
-    };
+    let raw = custom_template_bytes
+        .map(|b| b.to_vec())
+        .unwrap_or_else(|| templates::FIREFOX_BOOTSTRAP_CLIENT_HELLO.to_vec());
+    let mut bytes = strip_client_hello_extensions(&raw)?;
 
     let mut layout = parse_client_hello_layout(&bytes)?;
     if std::str::from_utf8(&bytes[layout.sni_range.clone()]).ok() != Some(sni) {
@@ -269,17 +282,12 @@ fn build_client_hello_template(
         );
     }
 
-    let append_psk_key_exchange_modes = matches!(preset, FingerprintPreset::Rustls);
-
     Ok(Arc::new(ClientHelloTemplate {
         bytes,
         cipher_suites_range: layout.cipher_suites_range,
         key_share_range: layout.key_share_range,
         auxiliary_key_share_ranges: layout.auxiliary_key_share_ranges,
-        record_len_range: layout.record_len_range,
-        handshake_len_range: layout.handshake_len_range,
         extensions_len_range: layout.extensions_len_range,
-        append_psk_key_exchange_modes,
     }))
 }
 
@@ -301,26 +309,75 @@ pub fn invalidate_client_hello_template_cache() {
     }
 }
 
-/// Append the rustls-preset psk_key_exchange_modes extension at instantiate
-/// time. The padding extension's zero-data invariant is validated once at
-/// template build time (`validate_padding_extension_zero`) and instantiation
-/// never rewrites padding bytes, so it is not re-checked here.
-fn append_psk_key_exchange_modes_extension(
-    bytes: &mut Vec<u8>,
-    record_len_range: &Range<usize>,
-    handshake_len_range: &Range<usize>,
-    extensions_len_range: &Range<usize>,
-) -> anyhow::Result<()> {
-    const PSK_KEY_EXCHANGE_MODES_EXTENSION: [u8; 6] = [0x00, 0x2D, 0x00, 0x02, 0x01, 0x00];
+/// Extensions removed from every ClientHello template at load time —
+/// embedded and custom hex alike. ECH (0xFE0D encrypted_client_hello,
+/// 0x014A), early_data (0x0119), use_srtp (0x001C) and 0x0022 are dropped:
+/// they either break interoperability with ordinary TLS 1.3 endpoints or
+/// carry no camouflage value for the probe/handshake.
+const STRIPPED_EXTENSION_TYPES: [u16; 5] = [0xFE0D, 0x014A, 0x0119, 0x001C, 0x0022];
 
-    bytes.extend_from_slice(&PSK_KEY_EXCHANGE_MODES_EXTENSION);
-    adjust_handshake_lengths(
-        bytes,
-        record_len_range,
-        handshake_len_range,
+/// Return a copy of the ClientHello record with every extension in
+/// [`STRIPPED_EXTENSION_TYPES`] removed and all three length fields (record,
+/// handshake, extensions block) rewritten to stay self-consistent.
+fn strip_client_hello_extensions(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if bytes.len() < 9 || bytes[0] != 0x16 || bytes[5] != 0x01 {
+        anyhow::bail!("template is not a TLS ClientHello record");
+    }
+    let mut cursor = 9 + 2 + 32; // handshake header + client_version + random
+    if bytes.len() <= cursor {
+        anyhow::bail!("truncated ClientHello before session_id");
+    }
+    let session_id_len = bytes[cursor] as usize;
+    cursor += 1 + session_id_len;
+    let cipher_suites_len = read_u16(bytes, cursor)? as usize;
+    cursor += 2 + cipher_suites_len;
+    if bytes.len() <= cursor {
+        anyhow::bail!("truncated ClientHello before compression methods");
+    }
+    let compression_methods_len = bytes[cursor] as usize;
+    cursor += 1 + compression_methods_len;
+    let extensions_len_range = cursor..cursor + 2;
+    let extensions_len = read_u16(bytes, cursor)? as usize;
+    cursor += 2;
+    let extensions_end = cursor + extensions_len;
+    if extensions_end > bytes.len() {
+        anyhow::bail!("truncated ClientHello extensions");
+    }
+
+    let mut removed = 0usize;
+    let mut out = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(&bytes[..cursor]);
+    let mut ecursor = cursor;
+    while ecursor + 4 <= extensions_end {
+        let ext_type = read_u16(bytes, ecursor)?;
+        let ext_len = read_u16(bytes, ecursor + 2)? as usize;
+        let ext_end = ecursor + 4 + ext_len;
+        if ext_end > extensions_end {
+            anyhow::bail!("truncated ClientHello extension {:#06x}", ext_type);
+        }
+        if STRIPPED_EXTENSION_TYPES.contains(&ext_type) {
+            removed += 4 + ext_len;
+        } else {
+            out.extend_from_slice(&bytes[ecursor..ext_end]);
+        }
+        ecursor = ext_end;
+    }
+    if removed == 0 {
+        return Ok(bytes.to_vec());
+    }
+    out.extend_from_slice(&bytes[extensions_end..]);
+
+    let delta = -(removed as isize);
+    let new_record_len = adjust_u16(read_u16(&out, 3)?, delta)?;
+    let new_handshake_len = adjust_u24(read_u24(&out, 6)?, delta)?;
+    write_u16(&mut out, 3..5, new_record_len)?;
+    write_u24(&mut out, 6..9, new_handshake_len)?;
+    write_u16(
+        &mut out,
         extensions_len_range,
-        6,
-    )
+        (extensions_len - removed) as u16,
+    )?;
+    Ok(out)
 }
 
 fn validate_padding_extension_zero(
@@ -463,6 +520,7 @@ fn find_extension(
     Ok(None)
 }
 
+#[cfg(test)]
 fn adjust_handshake_lengths(
     bytes: &mut [u8],
     record_len_range: &Range<usize>,
@@ -472,11 +530,11 @@ fn adjust_handshake_lengths(
 ) -> anyhow::Result<()> {
     let delta = added_total as isize;
     let new_record_len = adjust_u16(read_u16(bytes, record_len_range.start)?, delta)?;
-    if new_record_len as usize > MAX_TLS_RECORD_PAYLOAD_LEN {
+    if new_record_len as usize > crate::utils::MAX_TLS_RECORD_PAYLOAD_LEN {
         anyhow::bail!(
             "padded ClientHello record too large: {} > {}",
             new_record_len,
-            MAX_TLS_RECORD_PAYLOAD_LEN
+            crate::utils::MAX_TLS_RECORD_PAYLOAD_LEN
         );
     }
     let new_handshake_len = adjust_u24(read_u24(bytes, handshake_len_range.start)?, delta)?;
@@ -486,28 +544,6 @@ fn adjust_handshake_lengths(
     write_u24(bytes, handshake_len_range.clone(), new_handshake_len)?;
     write_u16(bytes, extensions_len_range.clone(), new_extensions_len)?;
     Ok(())
-}
-
-fn build_rustls_template_bytes(
-    sni: &str,
-    fingerprint: Option<&str>,
-    insecure: bool,
-) -> anyhow::Result<Vec<u8>> {
-    let mut config = if insecure {
-        fp::make_dangerous_client_config(fingerprint)?
-    } else {
-        fp::make_verified_client_config(fingerprint)?
-    };
-    config.alpn_protocols = fp::alpn_protocols_for_fingerprint(fingerprint)?;
-
-    let server_name = rustls::pki_types::ServerName::try_from(sni.to_string())
-        .map_err(|e| anyhow::anyhow!("invalid sni {}: {:?}", sni, e))?;
-    let mut tlsconn = rustls::ClientConnection::new(Arc::new(config), server_name)?;
-
-    let mut bytes = Vec::new();
-    let mut writer = std::io::Cursor::new(&mut bytes);
-    tlsconn.write_tls(&mut writer)?;
-    Ok(bytes)
 }
 
 fn parse_client_hello_layout(bytes: &[u8]) -> anyhow::Result<ClientHelloLayout> {
@@ -831,22 +867,6 @@ mod tests {
                 .or_insert(0) += 1;
         }
 
-        let mut rustls_record_lengths = BTreeMap::new();
-        let mut rustls_padding_samples = 0usize;
-        let mut rustls_ja3_extensions = BTreeSet::new();
-        for sample in 0..SAMPLES {
-            let rustls_template =
-                get_or_build_client_hello_template(SNI, Some("rustls"), None, true).unwrap();
-            let client_hello = rustls_template
-                .instantiate(&derived_psk, &psk_e, 1_700_000_000 + sample as u64)
-                .unwrap();
-            if extension_types(&client_hello).contains(&0x0015) {
-                rustls_padding_samples += 1;
-            }
-            rustls_ja3_extensions.insert(ja3_extensions_field(&client_hello));
-            *rustls_record_lengths.entry(client_hello.len()).or_insert(0) += 1;
-        }
-
         let instantiated_extensions_stable = instantiated_extension_lists.len() == 1;
         let ja3_extensions_stable = instantiated_ja3_extensions.len() == 1;
         let no_unexpected_firefox_padding = original_has_padding || firefox_padding_samples == 0;
@@ -877,14 +897,9 @@ mod tests {
              - ClientHello record length distribution: `{}`\n\
              - JA3 extensions field: `{}`\n\
              - JA3 extensions stable across runs: `{}`\n\n\
-             ## rustls/baseline synthetic padding\n\n\
-             - Padding(21) samples: `{}/{SAMPLES}`\n\
-             - ClientHello record length distribution: `{}`\n\
-             - Distinct JA3 extensions fields: `{}`\n\n\
              ## Risk notes\n\n\
              - firefox/custom capture uses `PreserveCaptured`, so the captured extension order and record length remain invariant after Noise field injection.\n\
-             - No firefox/custom micro-padding length ladder was observed; the record length distribution must stay single-valued to avoid base/base+5/base+6/base+7 learnable features.\n\
-             - rustls/baseline synthetic padding is intentionally isolated to the rustls preset and must not affect firefox/custom capture.\n",
+             - No firefox/custom micro-padding length ladder was observed; the record length distribution must stay single-valued to avoid base/base+5/base+6/base+7 learnable features.\n",
             format_extension_list(&original_extensions),
             instantiated_extension_list,
             instantiated_extensions_stable,
@@ -894,9 +909,6 @@ mod tests {
             format_distribution(&firefox_record_lengths),
             ja3_extensions_field,
             ja3_extensions_stable,
-            rustls_padding_samples,
-            format_distribution(&rustls_record_lengths),
-            rustls_ja3_extensions.len(),
         );
 
         let report_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -924,10 +936,6 @@ mod tests {
             "firefox/custom JA3 extensions changed: {:?}",
             instantiated_ja3_extensions
         );
-        assert!(
-            !rustls_record_lengths.is_empty(),
-            "rustls/baseline statistics were not collected"
-        );
     }
 
     fn template_from_bytes(bytes: Vec<u8>) -> ClientHelloTemplate {
@@ -938,10 +946,7 @@ mod tests {
             cipher_suites_range: layout.cipher_suites_range,
             key_share_range: layout.key_share_range,
             auxiliary_key_share_ranges: layout.auxiliary_key_share_ranges,
-            record_len_range: layout.record_len_range,
-            handshake_len_range: layout.handshake_len_range,
             extensions_len_range: layout.extensions_len_range,
-            append_psk_key_exchange_modes: false,
         }
     }
 
@@ -1036,10 +1041,7 @@ mod tests {
             cipher_suites_range: 76..78,
             key_share_range: 80..112,
             auxiliary_key_share_ranges: Vec::new(),
-            record_len_range: 3..5,
-            handshake_len_range: 6..9,
             extensions_len_range: 112..114,
-            append_psk_key_exchange_modes: true,
         };
         let derived_psk = [7u8; 32];
         use rand::RngCore;
@@ -1063,8 +1065,7 @@ mod tests {
         assert_ne!(&out[80..112], &[0u8; 32]);
         assert_ne!(&out[60..68], &[0u8; 8]);
         assert_ne!(&out[68..76], &[0u8; 8]);
-        assert_eq!(out.len(), 126);
-        assert_eq!(&out[120..126], &[0x00, 0x2D, 0x00, 0x02, 0x01, 0x00]);
+        assert_eq!(out.len(), 120);
     }
 
     #[test]
@@ -1105,18 +1106,92 @@ mod tests {
     }
 
     #[test]
-    fn rustls_style_template_round_trips_noise_auth() {
-        assert_template_round_trips_noise_auth(Some("rustls"));
-    }
-
-    #[test]
     fn firefox_template_round_trips_noise_auth() {
         assert_template_round_trips_noise_auth(Some("firefox"));
     }
 
     #[test]
-    fn python_openssl_template_round_trips_noise_auth() {
-        assert_template_round_trips_noise_auth(Some("python-openssl"));
+    fn unsupported_fingerprint_is_rejected() {
+        assert!(get_or_build_client_hello_template("example.com", Some("rustls"), None, true).is_err());
+        assert!(get_or_build_client_hello_template("example.com", Some("python-openssl"), None, true).is_err());
+        assert!(get_or_build_client_hello_template("example.com", Some("chrome"), None, true).is_err());
+    }
+
+    #[test]
+    fn strip_removes_target_extensions_and_keeps_lengths_consistent() {
+        let stripped = strip_client_hello_extensions(FIREFOX_BOOTSTRAP_CLIENT_HELLO).unwrap();
+        assert!(stripped.len() < FIREFOX_BOOTSTRAP_CLIENT_HELLO.len());
+        let types = extension_types(&stripped);
+        for dropped in STRIPPED_EXTENSION_TYPES {
+            assert!(
+                !types.contains(&dropped),
+                "extension {:#06x} must be stripped",
+                dropped
+            );
+        }
+        // Kept fingerprint essentials.
+        for kept in [0x0000u16, 0x0033, 0x002B, 0x000D, 0x000A, 0x0010] {
+            assert!(
+                types.contains(&kept),
+                "extension {:#06x} must be preserved",
+                kept
+            );
+        }
+        assert_eq!(read_u16(&stripped, 3).unwrap() as usize + 5, stripped.len());
+        assert_eq!(read_u24(&stripped, 6).unwrap() + 9, stripped.len());
+        // Layout must still parse: extensions block is self-consistent.
+        parse_client_hello_layout(&stripped).unwrap();
+        // Idempotent: stripping an already-clean template changes nothing.
+        let twice = strip_client_hello_extensions(&stripped).unwrap();
+        assert_eq!(stripped, twice);
+    }
+
+    #[test]
+    fn mlkem768_hybrid_share_is_structurally_valid() {
+        let mut share = [0u8; 1216];
+        fill_mlkem768_hybrid_share(&mut share);
+        // Every 12-bit coefficient must be < q = 3329 (mod-q decode check
+        // performed by ML-KEM-capable servers).
+        for chunk in share[..1152].chunks_exact(3) {
+            let d0 = chunk[0] as u16 | (((chunk[1] & 0x0F) as u16) << 8);
+            let d1 = ((chunk[1] >> 4) as u16) | ((chunk[2] as u16) << 4);
+            assert!(d0 < 3329, "coefficient {} out of range", d0);
+            assert!(d1 < 3329, "coefficient {} out of range", d1);
+        }
+        // rho + X25519 trailing bytes must not be all zero.
+        assert!(share[1152..].iter().any(|&b| b != 0));
+        // Two fills must differ (per-connection freshness).
+        let mut other = [0u8; 1216];
+        fill_mlkem768_hybrid_share(&mut other);
+        assert_ne!(share, other);
+    }
+
+    #[test]
+    fn build_template_strips_custom_bytes() {
+        // A custom template (e.g. raw Firefox capture with ECH) must go
+        // through the same stripping path as the embedded one.
+        let template = get_or_build_client_hello_template(
+            "custom-strip.example",
+            Some("firefox"),
+            Some(FIREFOX_BOOTSTRAP_CLIENT_HELLO),
+            true,
+        )
+        .unwrap();
+        let derived_psk = [7u8; 32];
+        let mut noise_init = [0u8; 48];
+        noise_init[..32].fill(7);
+        noise_init[32..48].fill(9);
+        let out = template
+            .instantiate(&derived_psk, &noise_init, 1)
+            .unwrap();
+        let types = extension_types(&out);
+        for dropped in STRIPPED_EXTENSION_TYPES {
+            assert!(
+                !types.contains(&dropped),
+                "custom template extension {:#06x} must be stripped",
+                dropped
+            );
+        }
     }
 
     #[test]
@@ -1135,7 +1210,9 @@ mod tests {
 
         let _captured_layout = parse_client_hello_layout(FIREFOX_BOOTSTRAP_CLIENT_HELLO).unwrap();
 
-        let base_len = FIREFOX_BOOTSTRAP_CLIENT_HELLO.len();
+        let base_len = strip_client_hello_extensions(FIREFOX_BOOTSTRAP_CLIENT_HELLO)
+            .unwrap()
+            .len();
         assert_eq!(out.len(), base_len);
         assert_eq!(read_u16(&out, 3).unwrap() as usize + 5, out.len());
         assert_eq!(read_u24(&out, 6).unwrap() + 9, out.len());
@@ -1153,7 +1230,9 @@ mod tests {
             .instantiate(&derived_psk, &noise_init, 1_700_000_000)
             .unwrap();
         let baseline_types = extension_types(&baseline);
-        let base_len = FIREFOX_BOOTSTRAP_CLIENT_HELLO.len();
+        let base_len = strip_client_hello_extensions(FIREFOX_BOOTSTRAP_CLIENT_HELLO)
+            .unwrap()
+            .len();
 
         for _ in 0..100 {
             let out = template
@@ -1214,32 +1293,6 @@ mod tests {
         let err =
             validate_padding_extension_zero(&bytes, &layout.extensions_len_range).unwrap_err();
         assert!(err.to_string().contains("RFC 7685"));
-    }
-
-    #[test]
-    fn python_openssl_template_preserves_captured_record_length() {
-        let template = get_or_build_client_hello_template(
-            "www.bilibili.com",
-            Some("python-openssl"),
-            None,
-            true,
-        )
-        .unwrap();
-        let derived_psk = common::derive_psk(b"python-openssl-jitter-psk");
-        let mut noise_init = [0u8; 48];
-        noise_init[..32].fill(7);
-        noise_init[32..48].fill(9);
-        let base_len = crate::templates::PYTHON_OPENSSL_BOOTSTRAP_CLIENT_HELLO.len();
-
-        for _ in 0..64 {
-            let out = template
-                .instantiate(&derived_psk, &noise_init, 1_700_000_000)
-                .unwrap();
-            assert_eq!(out.len(), base_len);
-            assert_eq!(read_u16(&out, 3).unwrap() as usize, out.len() - 5);
-            assert_eq!(read_u24(&out, 6).unwrap(), out.len() - 9);
-            parse_client_hello_layout(&out).unwrap();
-        }
     }
 
     #[test]
