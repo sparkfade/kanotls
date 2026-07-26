@@ -3,15 +3,30 @@ use lru::LruCache;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
 use super::{resolve_allowed_camouflage, FailureClass};
 
 pub(super) const MAX_IP_REPUTATION_ENTRIES: usize = 65536;
+
+/// `emit_indistinguishable_close` 关闭前的接收队列排空上限（见该函数注释）。
+const CLOSE_DRAIN_MAX_BYTES: usize = 64 * 1024;
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
+/// 关闭延迟采样区间：宽到足以淹没常量特征，又不至于长期占用 fd。
+const CLOSE_DELAY_MIN_MS: u64 = 200;
+const CLOSE_DELAY_MAX_MS: u64 = 3000;
+
+/// 转发空闲上限：两个方向都在此时长内无字节流动才终止。取值远大于常见
+/// 上游 keepalive_timeout（nginx 默认 75s），因此正常情况下总是上游先关闭、
+/// 本超时不可观测；它只用来防止「双向永久静默」的连接把 per-IP 与全局
+/// permit、fd 永久钉死——那会让限额被廉价耗尽，从而把服务器逼进
+/// `emit_indistinguishable_close` 分支。
+const PRE_AUTH_FALLBACK_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(super) struct FallbackLimits {
     pub(super) max_pre_auth_fallbacks: usize,
@@ -96,8 +111,44 @@ impl Drop for PreAuthFallbackPermit {
     }
 }
 
-pub(super) async fn emit_shaped_failure(mut client_stream: TcpStream) {
+/// 无法回落时（限额耗尽 / 冷却 / 上游不可达）的统一关闭姿态。
+///
+/// 两个要点，缺一不可：
+///
+/// 1. **先有界排空接收队列再关闭。** socket 上留有未读数据时 `close(2)` 会
+///    发 RST 而非 FIN，于是「发过 ClientHello」与「什么都没发」得到不同的
+///    关闭类型——这个分裂本身就是一个免费的判别信号。排空后关闭类型恒为
+///    FIN，与真实站点一致。
+/// 2. **关闭前插入随机延迟。** 瞬时关闭（限额耗尽）与恒定时刻关闭（握手
+///    超时）都是可测到毫秒的常量。随机延迟把这两类失败塌缩成同一个无法
+///    与彼此、也无法与网络抖动区分的分布。
+///
+/// 注意这条路径只在限额真正耗尽时才走得到——输入驱动的失败（非 TLS 首
+/// 记录、认证失败、超长 record、读超时）一律走透明转发。
+pub(super) async fn emit_indistinguishable_close(mut client_stream: TcpStream) {
+    let drain_deadline = Instant::now() + CLOSE_DRAIN_TIMEOUT;
+    let mut scratch = [0u8; 4096];
+    let mut drained = 0usize;
+    while drained < CLOSE_DRAIN_MAX_BYTES {
+        let remaining = drain_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, client_stream.read(&mut scratch)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => drained += n,
+        }
+    }
+
+    tokio::time::sleep(sample_close_delay()).await;
     let _ = client_stream.shutdown().await;
+}
+
+fn sample_close_delay() -> Duration {
+    use rand::Rng;
+    Duration::from_millis(
+        rand::thread_rng().gen_range(CLOSE_DELAY_MIN_MS..=CLOSE_DELAY_MAX_MS),
+    )
 }
 
 pub(super) async fn emit_pre_auth_failure(
@@ -117,7 +168,7 @@ pub(super) async fn emit_pre_auth_failure(
         Err(err) => debug!("pre-auth fallback unavailable: {}", err),
     }
 
-    emit_shaped_failure(client_stream).await;
+    emit_indistinguishable_close(client_stream).await;
 }
 
 pub(super) fn check_ip_reputation(ip: IpAddr) -> bool {
@@ -200,15 +251,62 @@ pub(super) async fn relay_pre_auth_fallback(
 ) -> anyhow::Result<()> {
     let (mut cr, mut cw) = tokio::io::split(client_stream);
     let (mut fr, mut fw) = tokio::io::split(&mut *fallback_stream);
+    let activity = AtomicU64::new(0);
 
-    let c2f = tokio::io::copy(&mut cr, &mut fw);
-    let f2c = tokio::io::copy(&mut fr, &mut cw);
+    let pump = async {
+        tokio::join!(
+            copy_and_propagate_eof(&mut cr, &mut fw, &activity),
+            copy_and_propagate_eof(&mut fr, &mut cw, &activity),
+        )
+    };
+    tokio::pin!(pump);
 
-    let (r1, r2) = tokio::join!(c2f, f2c);
-    debug!(?r1, ?r2, "fallback relay ended");
-
-    let _ = fallback_stream.shutdown().await;
+    loop {
+        let seen = activity.load(Ordering::Relaxed);
+        tokio::select! {
+            (r1, r2) = &mut pump => {
+                debug!(?r1, ?r2, "fallback relay ended");
+                break;
+            }
+            _ = tokio::time::sleep(PRE_AUTH_FALLBACK_IDLE_TIMEOUT) => {
+                if activity.load(Ordering::Relaxed) == seen {
+                    debug!("fallback relay idle timeout");
+                    break;
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+/// 单向泵送，并在读到 EOF 后 **shutdown 对侧写端**。
+///
+/// `tokio::io::copy` 只在 EOF 时 flush、从不调 `poll_shutdown`，而原实现又
+/// 把 `fallback_stream.shutdown()` 放在 `join!` 两向都结束之后。结果是客户端
+/// 的 `shutdown(SHUT_WR)`（curl 等的标准收尾）不会传播到上游：nginx 看不到
+/// EOF，连接一直挂到它自己的 keepalive_timeout，与直连行为可区分。
+async fn copy_and_propagate_eof<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    activity: &AtomicU64,
+) -> std::io::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n]).await?;
+        activity.fetch_add(1, Ordering::Relaxed);
+        total += n as u64;
+    }
+    let _ = writer.shutdown().await;
+    Ok(total)
 }
 
 pub(super) async fn try_capacity_limited_fallback(
@@ -224,7 +322,7 @@ pub(super) async fn try_capacity_limited_fallback(
         }
     }
 
-    emit_shaped_failure(client_stream).await;
+    emit_indistinguishable_close(client_stream).await;
 }
 
 pub(super) fn try_acquire_pre_auth_fallback_permit(

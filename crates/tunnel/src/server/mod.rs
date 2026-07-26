@@ -2,6 +2,8 @@ mod auth;
 mod camouflage;
 mod fallback;
 mod replay;
+#[cfg(test)]
+mod wire_tests;
 
 pub use camouflage::validate_camouflage_endpoint;
 
@@ -152,7 +154,10 @@ pub async fn server_accept(
     let handshake_permit = match HANDSHAKE_LIMITER.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            emit_shaped_failure(tcp).await;
+            // 限额耗尽是唯一走不到透明转发的分支（此处尚未读取任何字节，
+            // 无法构造有意义的上游请求）。统一走排空 + 随机延迟的关闭姿态，
+            // 与其他限额耗尽路径不可区分，且不再是「accept 后瞬时关闭」。
+            emit_indistinguishable_close(tcp).await;
             anyhow::bail!("server handshake limit reached")
         }
     };
@@ -165,8 +170,7 @@ pub async fn server_accept(
     let mut client_noise_tag = [0u8; 16];
 
     let mut rx_buf = Vec::new();
-    let initial_deadline =
-        tokio::time::Instant::now() + Duration::from_secs(SERVER_HANDSHAKE_TIMEOUT_SECS);
+    let initial_deadline = initial_record_deadline();
     let (typ, _) = match read_initial_client_record(&mut tcp, &mut rx_buf, initial_deadline).await
     {
         Ok(res) => res,
@@ -177,11 +181,14 @@ pub async fn server_accept(
                 FailureClass::InvalidFirstRecord
             };
             drop(handshake_permit);
-            if !rx_buf.is_empty() && !is_oversized_initial_record_error(&e) {
-                emit_pre_auth_failure(tcp, rx_buf, camouflage_host, camouflage_port, class).await;
-            } else {
-                emit_shaped_failure(tcp).await;
-            }
+            // 一律回落转发。`rx_buf` 只含客户端真实发送过的字节（可能为空），
+            // 转发给伪装端点后由它自己决定如何回应——这正是直连时会发生的事。
+            //
+            // 此前这里按「rx_buf 是否为空」与「是否超长」分流到静默关闭，
+            // 制造了两个 5 字节成本、零误报的主动探测特征：
+            //   * 连上不发数据 → 恰好 T+10.000s 静默 FIN；
+            //   * 发 `16 03 03 41 01` → 瞬时静默关闭（且因队列有未读数据发 RST）。
+            emit_pre_auth_failure(tcp, rx_buf, camouflage_host, camouflage_port, class).await;
             anyhow::bail!("Failed to read initial TLS record: {}", e)
         }
     };
@@ -786,12 +793,12 @@ mod tests {
         writer.await.unwrap();
     }
 
-    /// All failure paths close silently (TCP FIN via shutdown); no code path
-    /// emits a TLS alert anymore, so the client must observe a clean EOF with
-    /// zero application bytes.
+    /// 限额耗尽路径以干净 FIN、零应用字节收尾（不发任何 TLS 告警）。
+    /// 超时留足 `emit_indistinguishable_close` 的排空 + 随机延迟窗口
+    /// （最长 200ms + 3000ms）。
     async fn expect_shaped_close(client: &mut TcpStream) {
         let mut buf = [0u8; 7];
-        let read = tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf))
+        let read = tokio::time::timeout(Duration::from_secs(10), client.read(&mut buf))
             .await
             .expect("failure path should not hang indefinitely")
             .unwrap();
@@ -1226,40 +1233,16 @@ mod tests {
         assert_eq!(sizes, vec![23, 120, 8192, 16401]);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn oversized_initial_record_fails_closed_without_fallback() {
-        let _test_guard = PRE_AUTH_FALLBACK_TEST_LOCK.lock().await;
-        assert_pre_auth_fallback_state_clean();
-
-        let (release_tx, lock_thread) = hold_pre_auth_fallback_peer_counts_lock();
-        let (mut client, server) = connected_tcp_pair().await;
-        let psks = test_psks(b"test-psk");
-        let server_task =
-            tokio::spawn(async move { server_accept(server, &psks, "localhost", 443).await });
-
-        client
-            .write_all(&[0x16, 0x03, 0x03, 0x41, 0x01])
-            .await
-            .unwrap();
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            PRE_AUTH_FALLBACK_LIMITER.available_permits(),
-            fallback_limits().max_pre_auth_fallbacks
-        );
-
-        release_tx.send(()).unwrap();
-        lock_thread.join().unwrap();
-
-        let result = tokio::time::timeout(Duration::from_secs(2), server_task)
-            .await
-            .expect("server_accept should finish the shaped failure path")
-            .expect("server_accept task should join");
-        assert!(result.is_err());
-        expect_shaped_close(&mut client).await;
-        assert_pre_auth_fallback_state_clean();
-    }
-
+    /// 输入驱动的 pre-auth 失败必须**全部**具备回落转发资格，彼此不可区分。
+    ///
+    /// 覆盖三类探测者可零成本构造的输入：
+    ///   * 非 0x16 首记录（`17 03 03 00 00`）；
+    ///   * 认证失败的合法 ClientHello；
+    ///   * 声明长度超限的 5 字节记录头（`16 03 03 41 01`）——此前这一条会
+    ///     fail-closed 并瞬时静默关闭，是 5 字节成本、零误报的判别特征。
+    ///
+    /// 判据是「是否取走了全局回落 permit」：测试持有 peer-counts 互斥量，
+    /// 因此服务端会停在 permit 已取、per-IP 记账未完成的状态上。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn complete_pre_auth_failures_remain_fallback_eligible() {
         let _test_guard = PRE_AUTH_FALLBACK_TEST_LOCK.lock().await;
@@ -1268,6 +1251,7 @@ mod tests {
         for initial_record in [
             vec![0x17, 0x03, 0x03, 0x00, 0x00],
             build_probe_client_hello("localhost").unwrap(),
+            vec![0x16, 0x03, 0x03, 0x41, 0x01],
         ] {
             let (release_tx, lock_thread) = hold_pre_auth_fallback_peer_counts_lock();
             let (mut client, server) = connected_tcp_pair().await;
@@ -1294,7 +1278,8 @@ mod tests {
             release_tx.send(()).unwrap();
             lock_thread.join().unwrap();
 
-            let result = tokio::time::timeout(Duration::from_secs(2), server_task)
+            // 超时留足 emit_indistinguishable_close 的排空 + 随机延迟窗口。
+            let result = tokio::time::timeout(Duration::from_secs(10), server_task)
                 .await
                 .expect("server_accept should finish once fallback accounting unblocks")
                 .expect("server_accept task should join");

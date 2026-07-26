@@ -34,7 +34,7 @@ Detailed mechanism reference: [docs/MECHANISM.md](docs/MECHANISM.md)
 - **Single binary**: `cargo build --release`. Mode auto-detected from inbound protocol types.
 - **TLS fingerprint**: `firefox` (captured bootstrap; the only preset). Custom ClientHello hex via `template_path`. At load time every template is normalized: the ECH (`0xFE0D`/`0x014A`), `early_data` (`0x0119`), `use_srtp` (`0x001C`) and `0x0022` extensions are stripped, and the X25519MLKEM768 hybrid key share is regenerated with structurally valid ML-KEM coefficients per connection (servers with ML-KEM support validate them).
 - **Idle teardown**: Pin-reset idle timer per server session; resets on each successful read. Idle timeout (default 45 s, configurable with ±10% jitter) triggers graceful session teardown with Noise-encrypted `close_notify` and TCP FIN. Client-side connection idle lifecycle is fully managed by the connection pool (30s idle drain + seeded soft TTL rotation); `idle_timeout_secs` applies to the server side only. No application-layer heartbeat — kernel TCP keepalive (60 s idle, 30 s interval, 3 retries on Linux) handles dead-peer detection.
-- **Active traffic shaping**: A full-lifecycle Markov state machine (TrafficShaper) actively slices, pads, and paces every application-data (0x17) record to shaper-dictated wire lengths — plaintext size never maps to wire size. Supports an optional declarative script (`traffic_script`) for deterministic control over post-handshake packet sequences, including inter-record Delay timing (log-normal or pre-recorded IAT replay) and asymmetric FakeResponse interactions (CMD_PADDING). All padding bytes are sourced from a shared 8 MiB CSPRNG-seeded noise pool, cryptographically isomorphic to genuine AEAD ciphertext.
+- **Active traffic shaping**: A full-lifecycle Markov state machine (TrafficShaper) actively slices, pads, and paces every application-data (0x17) record to shaper-dictated wire lengths — plaintext size never maps to wire size. Supports an optional declarative script (`traffic_script`) for deterministic control over post-handshake packet sequences, including inter-record Delay timing (log-normal or pre-recorded IAT replay) and asymmetric FakeResponse interactions (CMD_PADDING). Record padding is zero, per RFC 8446 §5.4 — it sits on the plaintext side of the AEAD, so its content is invisible on the wire.
 - **Template hot-reload**: `template_path` hex files are polled every 30 s for mtime changes. On update, the file is re-parsed, the template cache invalidated, and new connections pick up the fresh ClientHello without restart. Failed parses are logged but preserve the previous template.
 
 ## Quick Start
@@ -231,8 +231,6 @@ The client inbound `protocol` field accepts `"socks"` as an alias for `"socks5"`
 
 **Server-side** idle teardown: The session read loop uses a pin-reset idle timer (default 45 s, with ±10% jitter) that resets on each successful read. When the timer fires and no streams are active, the session tears down gracefully with a Noise-encrypted `close_notify` and TCP FIN. No application-layer heartbeat is sent — kernel TCP keepalive handles dead-peer detection.
 
-Both server and client pre-allocate an 8 MiB entropy pool at startup, used for active record padding and camouflage ghost-record payload generation during synthetic replay.
-
 ### Traffic Script
 
 `traffic_script` is an **optional** declarative program that controls the size, timing, and peer-interaction behavior of post-handshake application-data records. When omitted, an embedded default script (6 rules, shown in the config examples above) is used. `session.max_streams_per_session`, `session.idle_timeout_secs`, and `session.traffic_script` are all optional — see the [Config Reference](#config-reference) for which side each field applies to. `session.post_script_shaping` selects what happens once the script is exhausted: the default `"markov"` blends into the Markov machine, while `"off"` disables post-script shaping entirely (records are emitted at their exact pending size with zero delay and no fake responses).
@@ -349,7 +347,9 @@ The session read loop (server-side only; client sessions are lifecycle-managed b
 
 ### Pre-Auth Fallback
 
-Before committing to the authenticated tunnel path, certain failures can fall back to a bounded transparent relay to the camouflage endpoint:
+**Every** failure before the authenticated tunnel path is committed relays the client's traffic transparently to the camouflage endpoint — non-TLS first record, auth failure, SNI mismatch, an oversized declared record length, a stalled/partial record, or nothing sent at all. The relayed buffer contains only bytes the client actually sent, and the initial-record deadline is sampled per connection from 8–15 s, so no input a prober can construct produces a different observable.
+
+Relaying is bounded:
 
 | Limit | Value |
 |---|---|
@@ -357,8 +357,9 @@ Before committing to the authenticated tunnel path, certain failures can fall ba
 | Per-IP concurrent fallbacks | 16 (fixed) |
 | Fallback connect timeout | 3 s (fixed) |
 | IP cooldown threshold | 112 fallbacks per 3600 s window → 300 s cooldown |
+| Concurrent in-handshake connections | 512 (fixed) |
 
-Fail-closed failures (read-stage errors, oversized records) never fall back.
+When a limit is exhausted the connection cannot be relayed and takes a single unified exit: the receive queue is drained (so the close is always a clean FIN rather than an RST) and the socket is closed after a randomized 200–3000 ms delay. This is the only path that does not reach the camouflage endpoint, and it is reachable only by exhausting a limit. See [MECHANISM §5.2](docs/MECHANISM.md#52-pre-auth-fallback).
 
 ### Server Outbounds
 
@@ -488,10 +489,10 @@ Client                                 Server                       Reference En
   |   Noise e in random; tag/counter/MAC |--- ClientHello ------------------->|
   |   in session_id; independent ks      |<-- ServerHello + flight -----------|
   |                                      |                                    |
-  |<-- ServerHello (0x16) ---------------|  (session_id echoed, random replaced)
-  |<-- Prefix 0x17 (optional) -----------|  (from entropy pool)
+  |<-- ServerHello (0x16) ---------------|  (session_id echoed; random and key_share regenerated)
+  |<-- Prefix 0x17 (optional) -----------|  (fresh CSPRNG, per connection)
   |<-- Noise response (0x17) ------------|  (e, ee + KTL1 + ghost_count)
-  |<-- Ghost 0x17 × N -------------------|  (fake ticket header + entropy)
+  |<-- Ghost 0x17 × N -------------------|  (fresh CSPRNG, per connection)
   |                                      |                                    |
   |--- CCS (6 B plain) ----------------->|  (0x14 record, unencrypted)
   |--- Finished ghost (0x17, 58 B) ----->|  (Noise-encrypted in 0x17)

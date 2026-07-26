@@ -70,12 +70,20 @@ When a client connects:
 2. The server looks up the best cached profile (prefers complete profiles: rank 3 = has both server_records and app_data_sizes).
 3. If no complete profile is cached, `fetch_camouflage_flight()` performs a live fetch to the reference endpoint (with refresh-gate deduplication).
 4. `establish_synthetic_camouflage_tunnel()`:
-   - Echoes the client's `session_id` into the cached ServerHello.
+   - Echoes the client's `session_id` into the cached ServerHello. A length mismatch means the cached profile is inconsistent with this connection, so the handshake is rejected rather than replaying an echo the client never sent (RFC 8446 §4.1.3).
    - Replaces the ServerHello `random` with fresh bytes (preserving downgrade-sentinel if present).
+   - **Regenerates the ServerHello `key_share`** — the server's ephemeral ECDHE public key — per connection, group-aware: X25519 and secp256r1 get genuine ring-generated keypairs (random bytes would not be a valid curve point, and a random 32-byte "X25519 key" sets the high bit half the time whereas a real u-coordinate never does); the ML-KEM-768 half of X25519MLKEM768 is densely packed, so uniform random bytes are both valid and correctly distributed. Without this the cached profile is replayed verbatim and the server hands out the *same* ECDHE public key on every connection — at most 4 distinct values rotating on the 300–3000 s refresh cycle. A repeated server share is cryptographically impossible for a genuine endpoint, so storing 32 bytes per flow identifies the server from two connections with no false positives. An unsupported group fails the handshake closed rather than emitting the fingerprint.
    - Emits all visible handshake records.
-   - Emits prefix 0x17 records (too small to carry Noise), filled from the `ENTROPY_POOL` (8 MiB of `rand::thread_rng()` bytes).
+   - Emits prefix 0x17 records (too small to carry Noise), filled with fresh `rand::thread_rng()` bytes.
    - Emits the Noise response wrapped in a 0x17 record (sized to match the first cached app_data size, with the Noise server public key XOR-masked in the first 32 bytes).
-   - Emits ghost 0x17 records (sized per cache), each prefixed with a 16-byte fake session-ticket structure header before entropy-pool fill, to reduce entropy fingerprinting.
+   - Emits ghost 0x17 records (sized per cache), filled with fresh `rand::thread_rng()` bytes.
+
+> **Every plaintext byte the server emits after ServerHello must be freshly random per connection.** These records impersonate NewSessionTicket, which in TLS 1.3 lives inside an encrypted record and is therefore uniformly random on the wire. Two earlier designs violated this and were removed:
+>
+> - A fixed 16-byte `22 00…00` "fake session-ticket structure header" was prefixed to every ghost record. Being constant, plaintext, and at a fixed offset, it was identifiable with a single 16-byte `memcmp` at a 2^-128 false-positive rate — and it repeated up to 255 times per connection.
+> - Payloads were drawn circularly from a process-lifetime 8 MiB entropy pool, so different connections shared byte-identical multi-hundred-byte substrings. Real AEAD ciphertext never repeats; the reuse let an observer join flows to the same server process. Measured empirically: with ~1.8 KB of ghost payload per connection, a collision appears within ~64 connections.
+>
+> `crates/tunnel/src/server/wire_tests.rs` now asserts both properties (no constant byte position, no shared 16-byte window across connections) and fails CI on regression.
 
 ### 2.4 Background Refresh
 
@@ -91,7 +99,7 @@ The original bimodal distribution (§3.1–3.4 in v1.0) passively split applicat
 
 ### 3.2 Control Class
 
-Protocol frames (CMD_SYN, CMD_FIN, CMD_SETTINGS, CMD_SYNACK, CMD_PADDING) use `encrypt_variable_block(PadFill::Zero)`. Their wire sizes are determined by a **state-aware sampler** in `control_size`:
+Protocol frames (CMD_SYN, CMD_FIN, CMD_SETTINGS, CMD_SYNACK, CMD_PADDING) use `encrypt_variable_block`. Their wire sizes are determined by a **state-aware sampler** in `control_size`:
 
 - **Handshake state** (first 6 control frames): 7 discrete sizes (33, 37, 46, 51, 64, 69, 82) mimicking HTTP/2 SETTINGS, SETTINGS_ACK, WINDOW_UPDATE, and merged variants. 5% of frames additionally sample from a truncated-normal HEADERS frame distribution (C2S: μ=450, σ=120, [250, 800]; S2C: μ=200, σ=50, [100, 400]).
 - **Transport state** (6+ control frames): 5 discrete sizes (33, 37, 41, 46, 54) mimicking PING, WINDOW_UPDATE, SETTINGS_ACK, and merged variants (no SETTINGS sizes). 10% of frames sample from the same HEADERS frame distribution.
@@ -104,8 +112,8 @@ The `TrafficShaper` (per-connection, owned by `SessionWriter::run`) intercepts a
 
 1. **Policy query**: `shaper.next_data_policy(pending_len)` returns a `ShapePolicy { target_wire_len, delay, fake, allow_full_block }`.
 2. **Slice / truncate**: if `pending` exceeds the payload capacity implied by `target_wire_len`, only that many bytes are taken; the remainder stays in `pending` for subsequent iterations. E.g. 5000 bytes of backlog against an 800-byte target → one 800-byte record emitted, 4200 bytes retained.
-3. **Precise pad**: if `pending` is smaller than the target capacity, the record is emitted at the exact `target_wire_len` with noise-pool padding.
-4. **Encrypt**: `SnowyStream::prepare_data_record(slice, target_wire_len, PadFill::Entropy)` encrypts exactly one record whose on-wire size equals `target_wire_len`.
+3. **Precise pad**: if `pending` is smaller than the target capacity, the record is emitted at the exact `target_wire_len` with zero padding.
+4. **Encrypt**: `SnowyStream::prepare_data_record(slice, target_wire_len)` encrypts exactly one record whose on-wire size equals `target_wire_len`.
 5. **Flush** + **delay** + **advance**: the record is flushed, `tokio::time::sleep(delay)` injected if non-zero, then the shaper's packet sequence number and Markov state advance.
 6. **Fake response**: if the policy carries `fake`, a `CMD_PADDING` request frame is queued on the control path before the next slice.
 
@@ -134,7 +142,7 @@ ScriptRule { len_lo, len_hi, delay: DelaySpec, expect_responses: u8, fake_jitter
 
 | Field | Meaning |
 |---|---|
-| `len_lo`..`len_hi` | The **application‑content byte count** to embed in this record. Sampled uniformly from the interval. The shaper computes `target_wire_len = MIN_DATA_WIRE_LEN + (len_lo..len_hi)`, pads to that exact wire size, and encrypts. Any real pending data up to `len_lo..len_hi` bytes is consumed; if the pending backlog is smaller, noise-pool padding fills the gap. If the backlog is larger, only a chunk is taken — the remainder stays in `pending` for the next iteration. |
+| `len_lo`..`len_hi` | The **application‑content byte count** to embed in this record. Sampled uniformly from the interval. The shaper computes `target_wire_len = MIN_DATA_WIRE_LEN + (len_lo..len_hi)`, pads to that exact wire size, and encrypts. Any real pending data up to `len_lo..len_hi` bytes is consumed; if the pending backlog is smaller, zero padding fills the gap. If the backlog is larger, only a chunk is taken — the remainder stays in `pending` for the next iteration. |
 | `delay` | `DelaySpec::None` (zero delay) or `DelaySpec::LogNormal{mu_ms, sigma_ms}` (inter-record pause sampled from a fitted log‑normal distribution). See §3.6. |
 | `expect_responses` | If `> 0`, the sender queues a `CMD_PADDING` request (opcode 0x08) on the **Control** channel. The peer, upon decoding the request, responds with `M` independently-split reply frames (§3.8). The field is set to `0` for normal unilateral-data rules. |
 | `fake_jitter` | Position jitter for the fake response: each time the rule fires, an offset is sampled uniformly from `[min(0,k), max(0,k)]` records relative to the triggering record. A negative offset emits the request *before* the triggering record (the previous record's slot); zero pins it to the triggering record; a positive offset defers it, released when the target record is emitted (any remainder is flushed once the script reaches `stop`). This decorrelates the cover-frame cluster from its triggering record. |
@@ -172,7 +180,7 @@ After packet 3 the script has exhausted its 3 rules. Packets 4–9 are emitted w
 
 1. Server receives a 0x17 record of wire size ≈ 386 bytes → Noise‑decrypt → plaintext `[len_prefix(2B) | 362B payload | padding | 0x17]` → 362 bytes delivered to the stream.
 2. After a log‑normally sampled pause (e.g. 1.8 ms), server receives a **Control‑class 0x17 record** containing a `CMD_PADDING` request (`cmd=0x08, flag=0, m=1`).
-3. Server's frame handler immediately emits 1 `CMD_PADDING` reply frame (`cmd=0x08, flag=1`, junk from noise pool) back to the client on the Control channel. This reply frame is a separate 0x17 record with a size sampled from the Control class transport pool (33–82 or 124–824 bytes, §3.2).
+3. Server's frame handler immediately emits 1 `CMD_PADDING` reply frame (`cmd=0x08, flag=1`, zero-filled junk) back to the client on the Control channel. This reply frame is a separate 0x17 record with a size sampled from the Control class transport pool (33–82 or 124–824 bytes, §3.2).
 4. The reply frame is never delivered to any stream — it is decoded and discarded at the session frame‑handler level, acting purely as cover traffic to break one‑request/one‑response symmetry.
 
 Scripts are sourced from an embedded default (6 rules, listed in §8), overridable via the `traffic_script` config field. The config value is a JSON string array: an optional `stop=N` control entry followed by indexed rules `i=L:...,D:...,F:...` whose index must match the rule's 0-based position. Config validation parses the array at startup; any malformed entry triggers a non‑fatal warning and the embedded default is used as fallback.
@@ -196,14 +204,13 @@ Inter-record delays use a single non-zero delay specification (`DelaySpec::None`
 
 The Markov `InteractiveControl` state applies a 15% delay probability; the script engine applies delays per-rule. `AsymmetricBulk` state uses zero delay (back-to-back emission) to preserve throughput.
 
-### 3.7 Noise Pool (Entropy Alignment)
+### 3.7 Record Padding
 
-All padding bytes in shaped data records and `CMD_PADDING` junk payloads are sourced from a single **8 MiB CSPRNG-seeded entropy pool** (`crates/tunnel/src/entropy.rs`, `ENTROPY_POOL`). The pool is:
-- Pre-generated from `rand::thread_rng()` (a CSPRNG) on startup (both client and server).
-- Read **circularly** via a global atomic cursor — no state beyond position; no distribution shaping or entropy modeling.
-- **Cryptographically isomorphic** to genuine AEAD ciphertext (~8 bits/byte unstructured entropy), so padded regions are statistically indistinguishable from real encrypted records in the observer's view.
+Padding bytes in shaped data records and `CMD_PADDING` junk payloads are **zero**, as specified by RFC 8446 §5.4 for TLS 1.3 record padding.
 
-`encrypt_variable_block(pad_fill: PadFill)` selects the fill source: `PadFill::Zero` for the control path, `PadFill::Entropy` for the shaped data path. This replaces the legacy zero-fill and `rand::thread_rng()` inline padding.
+An earlier design sourced these bytes from an 8 MiB CSPRNG entropy pool on the theory that padding had to be "cryptographically isomorphic to genuine AEAD ciphertext." That rationale does not hold: every one of these bytes sits on the *plaintext* side of `encrypt_variable_block` and is subsequently encrypted with ChaCha20-Poly1305, so the observer sees ciphertext that is uniformly random regardless of what plaintext went in. The pool bought nothing here while costing a cache-hostile copy across 8 MiB plus a globally contended atomic cursor per record. It has been removed.
+
+Randomness *is* required for the bytes the server writes in plaintext during the synthetic camouflage replay (§2.3); those are drawn per connection from `rand::thread_rng()`.
 
 ### 3.8 Fake Response Engine (CMD_PADDING)
 
@@ -214,24 +221,24 @@ All padding bytes in shaped data records and `CMD_PADDING` junk payloads are sou
   flag = 0 → request    1 → reply
 ```
 
-- **Request** (`flag=0`): emitted by the sender on the **Control** queue (priority) when a script rule or policy specifies `expect_responses = M`. Junk bytes from the noise pool.
-- **Reply** (`flag=1`): the receiver, upon decoding a request, immediately emits `M` **independently split** reply frames (each a separate noise-pool-filled control record of varied size) back to the sender. This deliberately breaks the one-request/one-response symmetry of the application data layer.
+- **Request** (`flag=0`): emitted by the sender on the **Control** queue (priority) when a script rule or policy specifies `expect_responses = M`. Junk bytes are zero (encrypted alongside the frame).
+- **Reply** (`flag=1`): the receiver, upon decoding a request, immediately emits `M` **independently split** reply frames (each a separate control record of varied size) back to the sender. This deliberately breaks the one-request/one-response symmetry of the application data layer.
 - Reply frames are never delivered to streams — discarded silently at the frame handler level (count as read activity for idle-timeout purposes).
-- The noise pool fills both request and reply junk, keeping all padding bytes isomorphic to ciphertext.
+- Junk bytes in both request and reply are zero; they sit on the plaintext side of the AEAD, so their content is invisible on the wire.
 
 ### 3.9 Wire Record Size Reference
 
-Every post-handshake record is a 0x17 record with a 5-byte header (`| 0x17 | 0x03 | 0x03 | len(u16 BE) |`) followed by Noise-encrypted ciphertext. Each plaintext carries: `[length_prefix(2B, BE) | payload | padding(noise-pool) | inner_content_type(1B, 0x17)]`.
+Every post-handshake record is a 0x17 record with a 5-byte header (`| 0x17 | 0x03 | 0x03 | len(u16 BE) |`) followed by Noise-encrypted ciphertext. Each plaintext carries: `[length_prefix(2B, BE) | payload | padding(zero) | inner_content_type(1B, 0x17)]`.
 
 | Record Type | Wire Size (= 5 + cipher) | Sizing Control | Padding Source |
 |---|---|---|---|
-| Shaped data record | **shaper-dictated** (24–16406) | `TrafficShaper::next_data_policy` → `prepare_data_record(target_wire_len, Entropy)` | Noise pool |
+| Shaped data record | **shaper-dictated** (24–16406) | `TrafficShaper::next_data_policy` → `prepare_data_record(target_wire_len)` | Zero (RFC 8446 §5.4) |
 | Control frame | discrete (33–82) or headed (124–824) → §3.2 | `control_size::next_control_size` → `prepare_control_record(payload, size)` | Zero |
 | Flight3 CCS | **6** (unencrypted) | Hardcoded | — |
 | Flight3 Finished ghost | **58** | 37 + 16 AEAD + 5 header | — |
 | Flight3 H2 ghost | **86 / 92 / 98** | context-hash selects variant | — |
 | Close notify alert | **24** (3 + 16 + 5) | Hardcoded `[01 00 15]` | — |
-| Ghost record (server) | **5 + cache_size** | camouflage cache | Noise pool (legacy ENTROPY_POOL) |
+| Ghost record (server) | **5 + cache_size** | camouflage cache | Fresh CSPRNG, per connection |
 
 ---
 
@@ -252,7 +259,7 @@ Every post-handshake record is a 0x17 record with a 5-byte header (`| 0x17 | 0x0
 | FIN | 0x03 | Close stream (half-close) |
 | SETTINGS | 0x04 | Session capability negotiation |
 | SYNACK | 0x07 | Stream open acknowledgment |
-| PADDING | 0x08 | Fake-response engine (§3.8); request/reply noise-pool frames |
+| PADDING | 0x08 | Fake-response engine (§3.8); request/reply cover frames |
 
 ### 4.2 Pipelined Stream Open
 
@@ -283,7 +290,24 @@ The peer observes either TCP FIN or RST (OS-dependent), with no TLS-layer alert 
 
 ### 5.2 Pre-Auth Fallback
 
-Failures before Noise authentication is committed (non-TLS first record, auth failure, SNI mismatch, handshake timeout) can optionally relay the client traffic transparently to the camouflage endpoint. This is bounded:
+Every failure before Noise authentication is committed relays the client's traffic transparently to the camouflage endpoint. This is the *only* observable for input-driven failures, and it is uniform across all of them:
+
+| Input | Observable |
+|---|---|
+| Non-TLS first record (`GET / HTTP/1.1`, …) | Transparent relay |
+| Auth failure (bad PSK / MAC / replayed ClientHello) | Transparent relay |
+| Missing SNI / SNI mismatch | Transparent relay |
+| Record header declaring an oversized length | Transparent relay |
+| Fewer than 5 bytes sent, or a stalled/partial record | Transparent relay of exactly the bytes that arrived |
+
+Two properties matter for probe resistance:
+
+- **The buffer handed to the relay contains only bytes the client actually sent.** An earlier implementation pre-filled the declared record length with zeros before reading, so a stalled ClientHello was forwarded upstream zero-padded to full length — the camouflage host then answered a request the client never made.
+- **No input can flip the behavior.** Two earlier paths failed closed and were reachable with five bytes: an oversized declared length closed instantly (and, with unread data still queued, `close(2)` emitted RST rather than FIN), and sending nothing produced a silent FIN at exactly T+10.000 s. Both now relay, and the initial-record deadline is sampled per connection from 8–15 s so there is no constant instant to measure.
+
+The relay itself propagates half-close in both directions (an unforwarded `shutdown(SHUT_WR)` would leave the upstream waiting out its own `keepalive_timeout`, which is distinguishable from a direct connection) and terminates only after 300 s with no traffic in either direction — far longer than a typical upstream idle timeout, so the upstream always closes first and this bound stays unobservable. It exists solely to stop permanently-silent connections from pinning permits and file descriptors.
+
+Relaying is bounded:
 
 | Limit | Value |
 |---|---|
@@ -291,8 +315,14 @@ Failures before Noise authentication is committed (non-TLS first record, auth fa
 | Per-IP concurrent fallbacks | 16 (fixed) |
 | Fallback connect timeout | 3 s (fixed) |
 | IP cooldown threshold | 112 fallbacks per 3600 s window → 300 s cooldown |
+| Concurrent in-handshake connections | 512 (fixed) |
 
----
+**When a limit is exhausted** the connection cannot be relayed, and takes the single unified exit `emit_indistinguishable_close()`, which:
+
+1. Drains the receive queue (bounded to 64 KiB / 200 ms) before closing, so the close is always a clean FIN. Without the drain, `close(2)` with unread data emits RST after the FIN, and that FIN-versus-FIN+RST split classifies the server from one connection based only on whether the prober sent anything.
+2. Sleeps a randomized 200–3000 ms before closing, so neither an instant close (limiter exhausted) nor a fixed-deadline close (read timeout) presents a measurable constant.
+
+This is the only path that does not reach the camouflage endpoint, and it is reachable only by exhausting a limit — not by any input a prober can construct.
 
 ## 6. Fingerprint-Specific Presets
 
@@ -313,17 +343,31 @@ A custom ClientHello hex file can override the embedded Firefox template via `te
 
 ## 7. Error Handling State Machine
 
+Every branch that a prober can reach by choosing its input ends in transparent relay. The one exit that does not reach the camouflage endpoint is gated on limit exhaustion, which no input can trigger on demand.
+
 ```
-                                 ClientHello arrives
-                                        │
-                        ┌───────────────┴─────────────────────┐
-                        │ First record is 0x16?               │
-                        └─────────────┬────────┬──────────────┘
-                                 Yes  │        │ No
+                          TCP connection accepted
+                                      │
+                        ┌─────────────┴──────────────────────┐
+                        │ Handshake limiter has capacity?    │
+                        └─────────────┬────────┬─────────────┘
+                                  Yes │        │ No
+                                      │        ▼
+                                      │   emit_indistinguishable_close
+                                      │   (drain, then FIN after 200–3000ms)
+                                      ▼
+                    Read initial record (deadline 8–15s, jittered)
+                                      │
+                        ┌─────────────┴──────────────────────┐
+                        │ Complete 0x16 record?              │
+                        └─────────────┬────────┬─────────────┘
+                                  Yes │        │ No — non-TLS type,
+                                      │        │ oversized declared length,
+                                      │        │ timeout, EOF, <5 bytes
                                       │        ▼
                                       │  Pre-Auth Fallback
-                                      │  → transparent relay
-                                      │
+                                      │  → transparent relay of exactly
+                                      │    the bytes that arrived
                                       ▼
                           Noise auth + counter replay + MAC
                           (single atomic check)
@@ -361,6 +405,8 @@ A custom ClientHello hex file can override the embedded Firefox template via `te
                          Silent close — no alert sent.
                          TCP FIN or RST (OS-dependent).
 ```
+
+Any Pre-Auth Fallback that cannot be established — global/per-IP concurrency exhausted, IP in cooldown, upstream unreachable — falls through to the same `emit_indistinguishable_close` shown at the top, so all limit-exhaustion outcomes share one observable (§5.2).
 
 ---
 

@@ -1,6 +1,6 @@
 use lazy_static::lazy_static;
 use lru::LruCache;
-use rand::Rng;
+use rand::{Rng, RngCore};
 use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,7 +33,14 @@ pub(super) const MAX_CAMOUFLAGE_APP_DATA_RECORDS: usize = 256;
 pub(super) const MAX_CAMOUFLAGE_TOTAL_RECORDS: usize = 512;
 pub(super) const MAX_CAMOUFLAGE_PREFIX_APP_DATA_RECORDS: usize = 4;
 pub(super) const CAMOUFLAGE_SAMPLE_IDLE_TIMEOUT_SECS: u64 = 5;
-pub(super) const MIN_CAMOUFLAGE_APP_DATA_RECORD_LEN: usize = 23;
+/// 合法 TLS 1.3 密文记录的最小长度：1 字节 inner content type + 16 字节
+/// AEAD tag。此前取 23，会把端点真实发出的 17–22 字节记录静默丢弃，导致
+/// 回放的记录条数与参考 flight 不一致。
+pub(super) const MIN_CAMOUFLAGE_APP_DATA_RECORD_LEN: usize = 17;
+
+/// 回放时断开写批次的间隔阈值：低于此值的间隔并入同一次突发写
+/// （见 establish_synthetic_camouflage_tunnel 中的说明）。
+pub(super) const SIGNIFICANT_REPLAY_GAP_MS: u16 = 5;
 pub(super) const MAX_CAMOUFLAGE_APP_DATA_RECORD_LEN: usize = 16401;
 
 pub(super) const CAMOUFLAGE_REFRESH_DAEMON_MIN_SECS: u64 = 300;
@@ -123,8 +130,20 @@ pub(super) fn make_control_payload(ghost_count: u16) -> [u8; HANDSHAKE_CONTROL_L
     payload
 }
 
-pub(super) fn fallback_noise_response_record_len(_sampled_sizes: &[usize]) -> usize {
-    300
+/// 参考端点未提供任何可承载 Noise 响应的记录尺寸时的兜底长度。
+///
+/// 旧实现返回硬编码的 300 且完全不看参数，于是线上会出现一个真实端点从未
+/// 产生过的固定尺寸（wire 305），一测长度即可命中。改为优先复用采样到的
+/// 最大尺寸（那是端点真实发过的），只有在完全没有可用采样时才从一个区间
+/// 随机取值——此时无论取什么都不可能保真，至少不留固定常量。
+pub(super) fn fallback_noise_response_record_len(sampled_sizes: &[usize]) -> usize {
+    if let Some(&largest) = sampled_sizes.iter().max() {
+        if largest >= MIN_NOISE_RESPONSE_RECORD_LEN {
+            return largest.min(MAX_CAMOUFLAGE_APP_DATA_RECORD_LEN);
+        }
+    }
+    use rand::Rng;
+    rand::thread_rng().gen_range(MIN_NOISE_RESPONSE_RECORD_LEN..=512)
 }
 
 pub(super) fn sanitize_camouflage_profile(mut profile: CamouflageProfile) -> CamouflageProfile {
@@ -342,6 +361,56 @@ pub(super) fn patch_server_hello_session_id_echo(
         offset += record_total;
     }
     false
+}
+
+/// Regenerate the ServerHello `key_share` — the server's ephemeral ECDHE public
+/// key — for this connection.
+///
+/// The cached camouflage profile replays the reference endpoint's ServerHello
+/// byte for byte, so without this the server hands out the *same* ECDHE public
+/// key on every connection (at most `MAX_CAMOUFLAGE_PROFILE_VARIANTS` distinct
+/// values, rotating only on the 300–3000 s refresh cycle). A genuine TLS 1.3
+/// server derives a fresh keypair per handshake; a repeated server share is
+/// cryptographically impossible for a real endpoint, so an observer that stores
+/// 32 bytes per flow identifies the server from two connections with no false
+/// positives.
+///
+/// The replacement is written in place and is exactly the same length, so no
+/// record / handshake / extension length field needs recomputing.
+/// Returns false when the group is unknown or the encoding is malformed, so the
+/// caller can fail closed rather than emit the fingerprint.
+pub(super) fn patch_server_hello_key_share(server_records: &mut [u8]) -> bool {
+    const X25519: u16 = 0x001D;
+    const SECP256R1: u16 = 0x0017;
+    const X25519MLKEM768: u16 = 0x11EC;
+    /// ML-KEM-768 ciphertext length: c1 = 3·256 coefficients packed at 10 bits
+    /// (960 B) plus c2 = 256 coefficients at 4 bits (128 B).
+    const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
+
+    let Some((group, range)) = crate::utils::server_hello_key_share_range(server_records) else {
+        return false;
+    };
+    let key_exchange = &mut server_records[range];
+
+    match group {
+        X25519 if key_exchange.len() == 32 => {
+            crate::template::fill_x25519_public_key(key_exchange)
+        }
+        SECP256R1 if key_exchange.len() == 65 => {
+            // Must be a real curve point — random bytes fail point validation.
+            crate::template::fill_p256_public_key(key_exchange)
+        }
+        X25519MLKEM768 if key_exchange.len() == MLKEM768_CIPHERTEXT_LEN + 32 => {
+            // Layout: ML-KEM-768 ciphertext ‖ X25519 public key. The ciphertext
+            // is densely packed (every 10-bit and 4-bit field value is a legal
+            // compressed coefficient), so uniform random bytes are both valid
+            // and correctly distributed. The X25519 half is not — see
+            // fill_x25519_public_key.
+            rand::thread_rng().fill_bytes(&mut key_exchange[..MLKEM768_CIPHERTEXT_LEN]);
+            crate::template::fill_x25519_public_key(&mut key_exchange[MLKEM768_CIPHERTEXT_LEN..])
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn patch_server_hello_random(server_records: &mut [u8]) {
@@ -685,24 +754,32 @@ pub(super) async fn establish_synthetic_camouflage_tunnel(
     }
 
     let mut patched_server_records = camo_rx_buf_arc.to_vec();
-    if let Some(client_session_id) = extract_client_hello_session_id(client_hello) {
-        patch_server_hello_session_id_echo(&mut patched_server_records, client_session_id);
+    // RFC 8446 §4.1.3：ServerHello 必须回显客户端发来的 legacy_session_id。
+    // 长度不匹配时缓存 profile 与本连接不自洽，若继续回放就会回显一个
+    // 客户端从未发送过的 session_id——一次协议一致性检查即可命中。
+    // 此前该返回值被丢弃，静默保留了采样端点的 echo。
+    let client_session_id = extract_client_hello_session_id(client_hello)
+        .ok_or_else(|| anyhow::anyhow!("ClientHello missing session_id for camouflage echo"))?;
+    if !patch_server_hello_session_id_echo(&mut patched_server_records, client_session_id) {
+        anyhow::bail!(
+            "cached camouflage ServerHello could not echo the client session_id (length mismatch)"
+        );
     }
     patch_server_hello_random(&mut patched_server_records);
+    if !patch_server_hello_key_share(&mut patched_server_records) {
+        anyhow::bail!(
+            "cached camouflage ServerHello key_share could not be regenerated; \
+             the endpoint negotiated an unsupported group — choose a different camouflage endpoint"
+        );
+    }
 
-    let pool = crate::entropy::entropy_pool();
-    let pool_len = pool.len();
-    let mut entropy_offset = rand::thread_rng().gen_range(0..pool_len);
-
-    let noise_sequence = build_noise_response_sequence(
+    let noise_records = build_noise_response_sequence(
         noise_state
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Noise handshake state already consumed"))?,
         derived_psk,
         client_noise_tag,
         &remaining_17_sizes,
-        pool,
-        &mut entropy_offset,
     )?;
 
     tcp.write_all(&patched_server_records).await?;
@@ -710,35 +787,56 @@ pub(super) async fn establish_synthetic_camouflage_tunnel(
 
     let first_delay = camo_profile.first_app_data_delay_ms;
     if first_delay > 0 {
-        let jittered = jitter_iat_ms(first_delay);
-        tokio::time::sleep(Duration::from_millis(jittered)).await;
+        tokio::time::sleep(jitter_iat(first_delay)).await;
     }
 
     for (idx, &size) in camo_profile.prefix_app_data_sizes.iter().enumerate() {
-        let mut record = Vec::with_capacity(TLS_RECORD_HEADER_LEN + size);
-        record.extend_from_slice(&[0x17, 0x03, 0x03]);
-        record.extend_from_slice(&(size as u16).to_be_bytes());
-        if entropy_offset + size <= pool_len {
-            record.extend_from_slice(&pool[entropy_offset..entropy_offset + size]);
-        } else {
-            let tail = pool_len - entropy_offset;
-            record.extend_from_slice(&pool[entropy_offset..]);
-            record.extend_from_slice(&pool[..size - tail]);
-        }
-        entropy_offset = (entropy_offset + size) % pool_len;
+        // 与 ghost record 同一口径：明文上线的字节必须逐连接新鲜随机。
+        let mut record = vec![0u8; TLS_RECORD_HEADER_LEN + size];
+        record[..3].copy_from_slice(&[0x17, 0x03, 0x03]);
+        record[3..5].copy_from_slice(&(size as u16).to_be_bytes());
+        rand::thread_rng().fill_bytes(&mut record[TLS_RECORD_HEADER_LEN..]);
         tcp.write_all(&record).await?;
         tcp.flush().await?;
 
         if let Some(&gap) = camo_profile.early_app_data_gap_ms.get(idx) {
             if gap > 0 {
-                let jittered = jitter_iat_ms(gap);
-                tokio::time::sleep(Duration::from_millis(jittered)).await;
+                tokio::time::sleep(jitter_iat(gap)).await;
             }
         }
     }
 
-    tcp.write_all(&noise_sequence).await?;
-    tcp.flush().await?;
+    // 回放参考端点记录到的记录间隔，但只对「显著」间隔断开写批次。
+    //
+    // 真实 TLS 1.3 服务器把 EE/CERT/CV/FIN 连续突发写出，采样到的间隔多为
+    // 0–1ms；若对每条记录都单独 write+flush，反而会把一次突发拆成一串独立
+    // 分段，比合并写更不像真实端点。因此亚阈值间隔并入同一次写（由内核按
+    // MSS 分段，与真实突发一致），只有真正的停顿（如部分站点延迟下发
+    // NewSessionTicket）才断开并 sleep。
+    //
+    // gap 下标对齐：early_app_data_gap_ms[i] 是第 i 条与第 i+1 条 app-data
+    // 之间的间隔；前置小记录已消耗了开头 prefix_count 个间隔。
+    let gap_base = camo_profile.prefix_app_data_sizes.len();
+    let mut burst: Vec<u8> = Vec::new();
+    for (idx, record) in noise_records.iter().enumerate() {
+        burst.extend_from_slice(record);
+        let is_last = idx + 1 == noise_records.len();
+        let gap = camo_profile
+            .early_app_data_gap_ms
+            .get(gap_base + idx)
+            .copied()
+            .unwrap_or(0);
+        if !is_last && gap >= SIGNIFICANT_REPLAY_GAP_MS {
+            tcp.write_all(&burst).await?;
+            tcp.flush().await?;
+            burst.clear();
+            tokio::time::sleep(jitter_iat(gap)).await;
+        }
+    }
+    if !burst.is_empty() {
+        tcp.write_all(&burst).await?;
+        tcp.flush().await?;
+    }
     debug!("Sent Noise response (e, ee) wrapped in Application Data");
 
     let noise = noise_state
@@ -748,16 +846,25 @@ pub(super) async fn establish_synthetic_camouflage_tunnel(
     Ok(noise)
 }
 
-pub(super) fn jitter_iat_ms(base_ms: u16) -> u64 {
+/// 围绕 `base_ms` 的 ±20% 对称抖动，保留亚毫秒精度。
+///
+/// 旧实现 `base + jitter.saturating_sub(jitter_max)` 中两个操作数都是 u64，
+/// `saturating_sub` 把负半边整体压到 0，实际分布退化为：
+///   * 约 50% 的样本恰好等于 `base`（一个可测的点质量）；
+///   * 取值永不低于 `base`（单边）；
+///   * 且被 `Duration::from_millis` 量化到整毫秒。
+///
+/// 真实网络到达间隔既无原子、也不是单边均匀分布，这三点合起来是一个
+/// 稳定的时序指纹。
+pub(super) fn jitter_iat(base_ms: u16) -> Duration {
     use rand::Rng;
-    let base = base_ms as u64;
-    if base == 0 {
-        return 0;
+    if base_ms == 0 {
+        return Duration::ZERO;
     }
-    let mut rng = rand::thread_rng();
-    let jitter_max = (base / 5).max(1);
-    let jitter = rng.gen_range(0..=jitter_max * 2);
-    (base + jitter.saturating_sub(jitter_max)).max(1)
+    let base = base_ms as f64;
+    let spread = base * 0.2;
+    let sampled = base + rand::thread_rng().gen_range(-spread..=spread);
+    Duration::from_micros((sampled.max(0.05) * 1000.0).round() as u64)
 }
 
 pub(super) fn build_noise_response_sequence(
@@ -765,12 +872,10 @@ pub(super) fn build_noise_response_sequence(
     derived_psk: &[u8],
     client_noise_tag: &[u8; 16],
     remaining_17_sizes: &[usize],
-    pool: &[u8],
-    entropy_offset: &mut usize,
-) -> anyhow::Result<Vec<u8>> {
-    let mut sequence = Vec::new();
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    let mut records: Vec<Vec<u8>> = Vec::new();
     if remaining_17_sizes.is_empty() {
-        return Ok(sequence);
+        return Ok(records);
     }
 
     let first_size = remaining_17_sizes[0];
@@ -795,42 +900,29 @@ pub(super) fn build_noise_response_sequence(
     let server_e_mask = derive_noise_e_mask(derived_psk, client_noise_tag);
     xor_in_place(&mut noise_payload[..32], &server_e_mask);
 
-    sequence.extend_from_slice(&[0x17, 0x03, 0x03]);
-    sequence.extend_from_slice(&(reply_len as u16).to_be_bytes());
-    sequence.extend_from_slice(&noise_payload[..reply_len]);
+    let mut noise_record = Vec::with_capacity(TLS_RECORD_HEADER_LEN + reply_len);
+    noise_record.extend_from_slice(&[0x17, 0x03, 0x03]);
+    noise_record.extend_from_slice(&(reply_len as u16).to_be_bytes());
+    noise_record.extend_from_slice(&noise_payload[..reply_len]);
+    records.push(noise_record);
 
-    let pool_len = pool.len();
-    const GHOST_TICKET_HEADER: [u8; 16] = [
-        0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00,
-    ];
+    // Ghost record 冒充的是 NewSessionTicket——在 TLS 1.3 中它位于加密
+    // record 内，线上就是均匀随机的 AEAD 密文。因此 payload 必须逐连接、
+    // 逐字节新鲜随机：
+    //   * 任何固定字节（此前这里有一个 16 字节的 `22 00…00` 伪 ticket 头）
+    //     都是一次 memcmp 即可命中、误报率 2^-128 的判别特征；
+    //   * 复用同一缓冲（此前是 8 MiB 全局熵池循环读）会让不同连接的
+    //     payload 出现逐字节相同的长片段，可被跨流拼接识别——真实密文
+    //     永不重复。
     for &size in &remaining_17_sizes[1..] {
-        sequence.extend_from_slice(&[0x17, 0x03, 0x03]);
-        sequence.extend_from_slice(&(size as u16).to_be_bytes());
-
-        if size >= GHOST_TICKET_HEADER.len() {
-            sequence.extend_from_slice(&GHOST_TICKET_HEADER);
-            let header_len = GHOST_TICKET_HEADER.len();
-            let ent_len = size - header_len;
-            let mut written = 0usize;
-            while written < ent_len {
-                let chunk = std::cmp::min(ent_len - written, pool_len - *entropy_offset);
-                sequence.extend_from_slice(&pool[*entropy_offset..*entropy_offset + chunk]);
-                *entropy_offset = (*entropy_offset + chunk) % pool_len;
-                written += chunk;
-            }
-        } else {
-            let mut written = 0usize;
-            while written < size {
-                let chunk = std::cmp::min(size - written, pool_len - *entropy_offset);
-                sequence.extend_from_slice(&pool[*entropy_offset..*entropy_offset + chunk]);
-                *entropy_offset = (*entropy_offset + chunk) % pool_len;
-                written += chunk;
-            }
-        }
+        let mut record = vec![0u8; TLS_RECORD_HEADER_LEN + size];
+        record[..3].copy_from_slice(&[0x17, 0x03, 0x03]);
+        record[3..5].copy_from_slice(&(size as u16).to_be_bytes());
+        rand::thread_rng().fill_bytes(&mut record[TLS_RECORD_HEADER_LEN..]);
+        records.push(record);
     }
 
-    Ok(sequence)
+    Ok(records)
 }
 
 pub(super) fn camouflage_profile_key(host: &str, port: u16, fingerprint_hex: &str) -> String {
@@ -1061,11 +1153,18 @@ pub(super) async fn read_camouflage_server_records(
     let mut server_records = Vec::new();
     let mut found_server_hello = false;
     let mut prefix_app_data_sizes = Vec::new();
+    let mut in_prefix_run = true;
     let mut app_data_sizes = Vec::new();
     let mut total_records = 0usize;
     let mut visible_server_record_count = 0u16;
     let mut has_ccs = false;
-    let sample_started = Instant::now();
+    // 首条 app-data 的延迟必须相对 **ServerHello 到达时刻** 度量，而不是
+    // 相对「向源站发完 ClientHello」的时刻——后者包含一整个 RTT-to-origin
+    // 加 ServerHello 传输时间。回放时这个延迟被插在本机 SH+CCS 已冲刷之后
+    // （且 socket 开了 TCP_NODELAY，分段边界独立），于是服务端会在自己的
+    // CCS 与自己的首条 app-data 之间停顿约一整个 RTT；真实 TLS 1.3 服务器
+    // 把 SH/CCS/EE/CERT/CV/FIN 连续突发写出，此处零间隔。
+    let mut server_hello_seen: Option<Instant> = None;
     let sample_deadline =
         tokio::time::Instant::now() + Duration::from_secs(CAMOUFLAGE_IO_TIMEOUT_SECS);
     let mut first_app_data_delay_ms = None;
@@ -1118,17 +1217,26 @@ pub(super) async fn read_camouflage_server_records(
                         );
                     }
                     found_server_hello = true;
+                    server_hello_seen = Some(Instant::now());
                 }
                 if c_typ == 0x14 {
                     has_ccs = true;
                 }
 
                 if found_server_hello && c_typ == 0x17 {
-                    if app_data_sizes.is_empty()
-                        && c_rec_len < MIN_NOISE_RESPONSE_RECORD_LEN
-                        && prefix_app_data_sizes.len() < MAX_CAMOUFLAGE_PREFIX_APP_DATA_RECORDS
-                    {
-                        prefix_app_data_sizes.push(c_rec_len);
+                    // 前置小记录 = flight 开头连续的、装不下 Noise 响应的那
+                    // 一段。此前的判据是 `app_data_sizes.is_empty()`，而每条
+                    // 0x17 记录随后都会被推入 app_data_sizes，因此实际最多
+                    // 只能采到 1 条，MAX_CAMOUFLAGE_PREFIX_APP_DATA_RECORDS
+                    // 不可达；端点若发 ≥2 条前置小记录，回放条数就比参考少。
+                    if in_prefix_run && c_rec_len < MIN_NOISE_RESPONSE_RECORD_LEN {
+                        if prefix_app_data_sizes.len() < MAX_CAMOUFLAGE_PREFIX_APP_DATA_RECORDS {
+                            prefix_app_data_sizes.push(c_rec_len);
+                        } else {
+                            in_prefix_run = false;
+                        }
+                    } else {
+                        in_prefix_run = false;
                     }
                     if app_data_sizes.len() >= MAX_CAMOUFLAGE_APP_DATA_RECORDS {
                         debug!(
@@ -1139,10 +1247,15 @@ pub(super) async fn read_camouflage_server_records(
                     }
                     let now = Instant::now();
                     if first_app_data_delay_ms.is_none() {
+                        // 相对 ServerHello 到达时刻的真实帧内间隔（见上方注释）。
                         first_app_data_delay_ms = Some(
-                            now.duration_since(sample_started)
-                                .as_millis()
-                                .min(u16::MAX as u128) as u16,
+                            server_hello_seen
+                                .map(|seen| {
+                                    now.duration_since(seen)
+                                        .as_millis()
+                                        .min(u16::MAX as u128) as u16
+                                })
+                                .unwrap_or(0),
                         );
                     }
                     if let Some(last_seen) = last_app_data_seen {

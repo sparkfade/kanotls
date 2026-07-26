@@ -262,13 +262,12 @@ impl SnowyStream {
             &mut self.encrypt_buf,
             payload,
             target_plaintext_len,
-            PadFill::Zero,
         )
     }
 
     /// Encrypt exactly one 0x17 application-data record whose on-wire size is
-    /// strictly `target_wire_len` (clamped to the valid record range), padded
-    /// with high-entropy noise-pool bytes. This is the single sizing-controlled
+    /// strictly `target_wire_len` (clamped to the valid record range), zero-padded
+    /// per RFC 8446 §5.4. This is the single sizing-controlled
     /// interface for the bulk data path: the upper-layer TrafficShaper dictates
     /// every record's wire length, so plaintext length never maps to wire size.
     ///
@@ -291,7 +290,6 @@ impl SnowyStream {
             &mut self.encrypt_buf,
             payload,
             target_plaintext_len,
-            PadFill::Entropy,
         )
     }
 
@@ -628,18 +626,6 @@ fn try_flush_write_buffer(stream: &mut SnowyStream, cx: &mut Context<'_>) -> io:
     Ok(())
 }
 
-/// Source of the padding bytes that fill the gap between the real payload and
-/// the caller-requested record size.
-#[derive(Clone, Copy, Debug)]
-pub enum PadFill {
-    /// Zero-fill (used by the control path, which is already size-shaped).
-    Zero,
-    /// Fill from the shared cryptographically isomorphic high-entropy noise
-    /// pool. Bytes are statistically indistinguishable from real AEAD
-    /// ciphertext, so padded records leak no structure.
-    Entropy,
-}
-
 /// Minimum on-wire size of a shaped 0x17 data record carrying zero payload
 /// bytes (2-byte length prefix + 1-byte inner content type).
 pub const MIN_DATA_WIRE_LEN: usize =
@@ -651,7 +637,6 @@ fn encrypt_variable_block(
     encrypt_buf: &mut Box<[u8; BLOCK_PLAINTEXT_SIZE]>,
     payload: &[u8],
     target_plaintext_len: usize,
-    pad_fill: PadFill,
 ) -> io::Result<()> {
     assert!(target_plaintext_len >= payload.len() + BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN);
     assert!(target_plaintext_len <= BLOCK_PLAINTEXT_SIZE);
@@ -661,10 +646,11 @@ fn encrypt_variable_block(
         let pad_start = BLOCK_LEN_PREFIX_SIZE + payload.len();
         let pad_end = target_plaintext_len - 1;
         if pad_end > pad_start {
-            match pad_fill {
-                PadFill::Zero => block[pad_start..pad_end].fill(0),
-                PadFill::Entropy => crate::entropy::fill_from_pool(&mut block[pad_start..pad_end]),
-            }
+            // 零填充：整个 block 随后由 ChaChaPoly 加密，密文对任何明文都
+            // 均匀随机，故填充内容在线上不可见——用高熵字节填充没有任何
+            // 收益。RFC 8446 §5.4 规定 TLS 1.3 的 record padding 本就是零
+            // 字节，因此零填充反而更保真。
+            block[pad_start..pad_end].fill(0);
         }
         block[..BLOCK_LEN_PREFIX_SIZE].copy_from_slice(&(payload.len() as u16).to_be_bytes());
         block[BLOCK_LEN_PREFIX_SIZE..BLOCK_LEN_PREFIX_SIZE + payload.len()]
@@ -770,7 +756,6 @@ mod poll_read_fuzz_tests {
                     &mut encrypt_buf,
                     payload,
                     target_plaintext,
-                    PadFill::Zero,
                 )
                 .unwrap();
             }

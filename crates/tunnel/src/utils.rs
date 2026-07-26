@@ -1,6 +1,8 @@
 use blake2::Digest;
 use subtle::ConstantTimeEq as _;
 
+use crate::common::TLS_RECORD_HEADER_LEN;
+
 const CLIENT_HELLO_FP_CONTEXT: &[u8] = b"kanotls-client-hello-fp-v1";
 const NOISE_E_MASK_CONTEXT: &[u8] = b"kanotls-noise-e-mask-v1";
 const COUNTER_MASK_CONTEXT: &[u8] = b"kanotls-counter-mask-v1";
@@ -312,6 +314,89 @@ fn normalize_client_hello_padding_extension(record: &mut Vec<u8>) -> Option<()> 
     record[7] = ((new_handshake_len >> 8) & 0xff) as u8;
     record[8] = (new_handshake_len & 0xff) as u8;
     Some(())
+}
+
+/// Locate the `key_share` (0x0033) extension inside the first ServerHello found
+/// in `server_records`, returning `(named_group, key_exchange_range)`.
+///
+/// ServerHello has a different shape from ClientHello — no cipher-suite list and
+/// no compression-method list — so this cannot reuse
+/// [`walk_client_hello_extensions`]. `server_records` may hold several
+/// concatenated records (ServerHello + ChangeCipherSpec); non-ServerHello
+/// records are skipped.
+///
+/// Returns `None` on any truncation or malformed length, so callers fail closed.
+pub fn server_hello_key_share_range(
+    server_records: &[u8],
+) -> Option<(u16, std::ops::Range<usize>)> {
+    const KEY_SHARE_EXTENSION_TYPE: u16 = 0x0033;
+    let mut offset = 0usize;
+    while offset + TLS_RECORD_HEADER_LEN <= server_records.len() {
+        let rec_len =
+            u16::from_be_bytes([server_records[offset + 3], server_records[offset + 4]]) as usize;
+        let record_end = offset + TLS_RECORD_HEADER_LEN + rec_len;
+        if record_end > server_records.len() {
+            return None;
+        }
+        // 0x16 handshake record whose first body byte is 0x02 == ServerHello.
+        if server_records[offset] != 0x16 || rec_len == 0 || server_records[offset + 5] != 0x02 {
+            offset = record_end;
+            continue;
+        }
+
+        // handshake header (msg_type 1 + length 3), legacy_version 2, random 32
+        let mut cursor = offset.checked_add(TLS_RECORD_HEADER_LEN + 4 + 2 + 32)?;
+        if cursor >= record_end {
+            return None;
+        }
+        let session_id_len = server_records[cursor] as usize;
+        // legacy_session_id_echo, cipher_suite 2, legacy_compression_method 1
+        cursor = cursor.checked_add(1 + session_id_len + 2 + 1)?;
+        if cursor + 2 > record_end {
+            return None;
+        }
+        let extensions_len =
+            u16::from_be_bytes([server_records[cursor], server_records[cursor + 1]]) as usize;
+        cursor += 2;
+        let extensions_end = cursor.checked_add(extensions_len)?;
+        if extensions_end > record_end {
+            return None;
+        }
+
+        while cursor + 4 <= extensions_end {
+            let ext_type = u16::from_be_bytes([server_records[cursor], server_records[cursor + 1]]);
+            let ext_len =
+                u16::from_be_bytes([server_records[cursor + 2], server_records[cursor + 3]]) as usize;
+            let data_start = cursor + 4;
+            let data_end = data_start.checked_add(ext_len)?;
+            if data_end > extensions_end {
+                return None;
+            }
+            if ext_type == KEY_SHARE_EXTENSION_TYPE {
+                // ServerHello KeyShareEntry: group(2) ‖ key_exchange(len 2 ‖ data).
+                // (HelloRetryRequest carries only selected_group(2), but HRR
+                // flights are rejected at sampling time.)
+                if ext_len < 4 {
+                    return None;
+                }
+                let group =
+                    u16::from_be_bytes([server_records[data_start], server_records[data_start + 1]]);
+                let ke_len = u16::from_be_bytes([
+                    server_records[data_start + 2],
+                    server_records[data_start + 3],
+                ]) as usize;
+                let ke_start = data_start + 4;
+                let ke_end = ke_start.checked_add(ke_len)?;
+                if ke_end > data_end {
+                    return None;
+                }
+                return Some((group, ke_start..ke_end));
+            }
+            cursor = data_end;
+        }
+        return None;
+    }
+    None
 }
 
 pub fn client_hello_key_share_range(record: &[u8]) -> Option<std::ops::Range<usize>> {
