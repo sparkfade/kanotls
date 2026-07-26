@@ -10,9 +10,6 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
 
-const MIN_STREAMS_PER_CONNECTION_TARGET: usize = 8;
-const MAX_STREAMS_PER_CONNECTION_TARGET: usize = 64;
-
 /// 隧道连接池：泛型于 [`TunnelConnector`]，由装配层注入连接工厂。
 pub struct ClientPool<C: TunnelConnector> {
     inner: Arc<PoolInner<C>>,
@@ -187,11 +184,10 @@ impl<C: TunnelConnector> PoolInner<C> {
 
     async fn replenish_locked(self: &Arc<Self>, _spawn_guard: tokio::sync::MutexGuard<'_, ()>) {
         // 统计在 read guard 下就地完成，不再把整张表克隆进 Vec。
-        let (active, live, busy, total_active_streams) = {
+        let (active, live, total_active_streams) = {
             let connections = self.connections.read().await;
             let mut active = 0usize;
             let mut live = 0usize;
-            let mut busy = 0usize;
             let mut total_active_streams = 0usize;
 
             for entry in connections.values() {
@@ -205,24 +201,20 @@ impl<C: TunnelConnector> PoolInner<C> {
                     continue;
                 }
 
-                let active_streams = entry.handle.active_streams();
-                total_active_streams = total_active_streams.saturating_add(active_streams);
-
-                if active_streams > 0 {
-                    busy += 1;
-                }
+                total_active_streams =
+                    total_active_streams.saturating_add(entry.handle.active_streams());
 
                 if entry.state() == ConnectionState::Active {
                     active += 1;
                 }
             }
-            (active, live, busy, total_active_streams)
+            (active, live, total_active_streams)
         };
 
         let pending = self.pending_spawns.load(Ordering::Relaxed);
         let waiters = self.acquire_waiters.load(Ordering::Relaxed);
         let desired_active =
-            self.desired_active_connection_count(waiters, active, busy, total_active_streams);
+            self.desired_active_connection_count(waiters, active, total_active_streams);
 
         if desired_active == 0 {
             return;
@@ -238,7 +230,6 @@ impl<C: TunnelConnector> PoolInner<C> {
         if missing > 0 {
             debug!(
                 active_connections = active,
-                busy_connections = busy,
                 total_active_streams,
                 live_connections = live,
                 pending_spawns = pending,
@@ -484,11 +475,24 @@ impl<C: TunnelConnector> PoolInner<C> {
         })
     }
 
+    /// 需要多少条**活跃**连接才能承载当前需求。
+    ///
+    /// 需求口径是「已在飞的流 + 正在等取流的调用者」，除以单连接的并发目标
+    /// 向上取整。此前在末尾还有一条「全忙则 +1」的规则：
+    /// `busy >= active && total_active_streams >= active * stream_target`
+    /// 时把 desired 抬到 `active + 1`。这条规则**恒不生效**，与阈值取值无关：
+    /// 进到这段代码时 `waiters >= 1`（`waiters == 0` 已提前返回 0），于是它的
+    /// 触发前提 `total >= active * target` 蕴含
+    /// `demand = waiters + total >= active * target + 1`，向上取整已经 ≥
+    /// `active + 1`，`max` 拿不到任何新东西。既然它在任何配置下都只是把一个
+    /// 已经成立的下界再算一遍，就不该留在这里冒充安全阀——留着会让后来者
+    /// 以为存在一条独立于流量需求的扩容路径。`busy_connections` 随之退场，
+    /// `replenish_locked` 的逐连接统计也少一个分支。等价性由
+    /// `saturation_rule_is_subsumed_by_stream_demand` 在全网格上钉住。
     fn desired_active_connection_count(
         &self,
         waiters: usize,
         active_connections: usize,
-        busy_connections: usize,
         total_active_streams: usize,
     ) -> usize {
         if waiters == 0 {
@@ -497,36 +501,46 @@ impl<C: TunnelConnector> PoolInner<C> {
 
         let stream_target = self.streams_per_connection_target();
         let demand_streams = waiters.saturating_add(total_active_streams).max(1);
-        let mut desired =
-            demand_streams.saturating_add(stream_target.saturating_sub(1)) / stream_target;
+        let desired = demand_streams.saturating_add(stream_target.saturating_sub(1)) / stream_target;
 
         if active_connections == 0 {
             return desired.min(1).min(self.target_pool_size);
         }
 
-        if desired == 0 {
-            desired = 1;
-        }
-
-        let all_active_busy = busy_connections > 0 && busy_connections >= active_connections;
-        let active_capacity_target = active_connections.saturating_mul(stream_target);
-        if all_active_busy && total_active_streams >= active_capacity_target {
-            desired = desired.max(active_connections.saturating_add(1));
-        }
-
         desired.min(self.target_pool_size)
     }
 
+    /// 单条连接的并发流目标 = 会话自己的并发上限，不再另设池级门限。
+    ///
+    /// 此前是 `clamp(max_streams_per_session / 4, 8, 64)`，默认配置下等于 64：
+    /// 并发流一到 64 就开第二条隧道，把并发**主动分散**出去。于是产生了两个
+    /// 可观测特征：(1) 同一 IP:443 上出现多条本可合并的长连接；(2) 更要命的
+    /// 是每条新连接的开头都是一次全新的、无遮蔽的内层握手。
+    ///
+    /// USENIX Security 2024 "Fingerprinting Obfuscated Proxy Traffic with
+    /// Encapsulated TLS Handshakes" 的检测器只看一条 TCP 流的**前 25 个**
+    /// 承载数据的包（Wo = 25，要求先看到 SYN/SYN-ACK），在其 burst 序列上滑动
+    /// 一个握手模板（TLS 1.3 取 Wb = 3 个 burst）。也就是说：一条连接一生只
+    /// 在**诞生那一刻**被判定一次，此后再多的内层握手都落在观测窗之外，永远
+    /// 不会被这套特征看到。多路复用之所以把 TPR 从 0.74 压到 0.15，正是因为
+    /// 别的流的字节挤进了那 25 个包；而论文自己也强调「实际收益比 TPR 差值
+    /// 更大，因为穿过防火墙的代理连接数显著减少」。
+    ///
+    /// 由此，真正的杠杆不是「流怎么在连接间分布」，而是**一共开了几条隧道
+    /// 连接**——每开一条就等于多交一份未遮蔽的样本，而审查者只需命中一次。
+    /// 阈值从 64 提到会话上限（默认 256）把「第 65..256 条流各自去开新连接、
+    /// 其内层握手裸露在新连接的前 25 包里」变成「它们复用已经预热的连接、
+    /// 内层握手落在观测窗之外」——不是更难检测，是根本不在取样范围内。
+    ///
+    /// 取会话上限而非另一个魔数，是因为 H2 里唯一有真实对应物的每连接并发
+    /// 门限就是 `SETTINGS_MAX_CONCURRENT_STREAMS`（nginx 默认 128，本项目由
+    /// `session.max_streams_per_session` 承担，会话两侧在 session.rs 中强制）。
+    /// 任何低于它的池级常量都是没有任何真实实现会有的发明物，而恰恰是它导致
+    /// 扇出。真实 Firefox 撞到 MAX_CONCURRENT_STREAMS 时**排队**，不会对同一
+    /// origin 再开一条 H2 连接；本池的扩容因此退化为纯粹的溢流阀，只在会话
+    /// 自身的并发上限确实耗尽时才动作。
     fn streams_per_connection_target(&self) -> usize {
-        let max_streams = self.session_config.max_streams_per_session.max(1);
-        max_streams
-            .saturating_div(4)
-            .clamp(
-                MIN_STREAMS_PER_CONNECTION_TARGET,
-                MAX_STREAMS_PER_CONNECTION_TARGET,
-            )
-            .min(max_streams)
-            .max(1)
+        self.session_config.max_streams_per_session.max(1)
     }
 
     async fn live_connection_count(&self) -> usize {
@@ -753,6 +767,30 @@ mod tests {
 
     fn test_session_config() -> SessionConfig {
         SessionConfig::with_limits(true, 32, 30)
+    }
+
+    /// 生命周期时限必须是**常量**，与 PSK / 安装盐无关。
+    ///
+    /// 真实实现（Firefox 的 keep-alive timeout、nginx 的 keepalive_timeout /
+    /// keepalive_time）在这两个维度上都是单一配置值。此前 soft_ttl 逐进程
+    /// 从 120–300 秒采样，既是 KanoTLS 独有的「主动回收健康 H2 连接」行为，
+    /// 又让同一客户端所有连接的寿命撞在同一点上。本测试钉住「不再按种子
+    /// 派生」，防止后续再把常量维度改回随机。
+    #[test]
+    fn psk_derived_behavior_keeps_lifecycle_timings_constant() {
+        let first = PoolBehaviorConfig::from_psk(b"first-password", &[0x11; 16]);
+        let second = PoolBehaviorConfig::from_psk(b"a-completely-different-one", &[0xAA; 16]);
+
+        for behavior in [&first, &second] {
+            assert_eq!(behavior.idle_drain_secs, crate::behavior::IDLE_DRAIN_SECS);
+            assert_eq!(behavior.soft_ttl_secs, crate::behavior::SOFT_TTL_SECS);
+        }
+
+        // 客户端的空闲上限必须高于服务端的空闲拆除（默认 75 秒），
+        // 先动手关闭的那一侧才会是服务端——与真实 H2 一致。
+        assert!(first.idle_drain_secs > 75);
+        // soft_ttl 只是资源兜底：必须远高于空闲上限，正常使用下不可观测。
+        assert!(first.soft_ttl_secs > first.idle_drain_secs * 8);
     }
 
     #[test]
@@ -1230,8 +1268,14 @@ mod tests {
         pool.inner.acquire_waiters.store(0, Ordering::Relaxed);
     }
 
+    /// 冷启动 1 条；随后的积压先由那**一条**连接吸收，直到会话并发上限确实
+    /// 不够用才扩容。
+    ///
+    /// 此前阈值是 `max_streams / 4`（这里 = 8），于是 24 个等待者就足以拉起
+    /// 3 条连接；现在阈值等于会话上限（这里 = 32），24 个等待者全部留在同一
+    /// 条连接上——每少开一条隧道就少交一份「前 25 包」的未遮蔽样本。
     #[tokio::test]
-    async fn pool_cold_resume_limits_new_connections_after_idle_gap() {
+    async fn pool_cold_resume_absorbs_backlog_on_one_connection_after_idle_gap() {
         let connector = Arc::new(FakeConnector::new(|_| FakeSession::new(0)));
         let mut behavior = test_behavior();
         behavior.min_target_pool_size = 3;
@@ -1255,14 +1299,25 @@ mod tests {
         assert_eq!(snapshot.pending_spawns, 0);
         assert_eq!(connector.sessions().await.len(), 1);
 
+        // 24 个等待者仍在单条连接的承载范围（会话上限 32）之内。
         pool.inner.acquire_waiters.store(24, Ordering::Relaxed);
         pool.inner.schedule_replenishment_if_needed().await;
         tokio::time::sleep(Duration::from_millis(40)).await;
 
         let snapshot = pool.snapshot().await;
-        assert_eq!(snapshot.active, 3);
+        assert_eq!(snapshot.active, 1);
         assert_eq!(snapshot.pending_spawns, 0);
-        assert_eq!(connector.sessions().await.len(), 3);
+        assert_eq!(connector.sessions().await.len(), 1);
+
+        // 越过会话上限后才扩容，且按需求逐档扩，不一次性铺满 target_pool_size。
+        pool.inner.acquire_waiters.store(40, Ordering::Relaxed);
+        pool.inner.schedule_replenishment_if_needed().await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let snapshot = pool.snapshot().await;
+        assert_eq!(snapshot.active, 2);
+        assert_eq!(snapshot.pending_spawns, 0);
+        assert_eq!(connector.sessions().await.len(), 2);
         pool.inner.acquire_waiters.store(0, Ordering::Relaxed);
     }
 
@@ -1291,6 +1346,247 @@ mod tests {
 
         let snapshot = pool.snapshot().await;
         assert_eq!(snapshot.active, 1);
+        assert_eq!(snapshot.pending_spawns, 0);
+        assert_eq!(connector.sessions().await.len(), 1);
+        pool.inner.acquire_waiters.store(0, Ordering::Relaxed);
+    }
+
+    /// 冷启动只允许开**一条**隧道连接，与瞬时需求高低无关。
+    ///
+    /// 真实 H2 客户端对单一 origin 通常只维持一条连接；若启动瞬间并发建起
+    /// N 条 TLS 握手指向同一 IP:443，这与 H2 多路复用语义直接矛盾，是比任何
+    /// 定时器常量都醒目的特征。`desired_active_connection_count` 的
+    /// `active_connections == 0` 分支是该性质的唯一保证——它同时压住了
+    /// `initial_connection_count`（1–3）：后者只参与 `max_live_connections`
+    /// 的上限计算，不能成为冷启动的并发建连数。
+    #[tokio::test]
+    async fn desired_connection_count_clamps_cold_start_to_one() {
+        let connector = Arc::new(FakeConnector::new(|_| FakeSession::new(0)));
+        let mut behavior = test_behavior();
+        behavior.min_target_pool_size = 16;
+        behavior.max_target_pool_size = 16;
+        behavior.min_initial_connections = 3;
+        behavior.max_initial_connections = 3;
+
+        let pool = TestPool::new_with_behavior_for_test(
+            SessionConfig::with_limits(true, 256, 30),
+            behavior,
+            connector,
+        );
+        let inner = &pool.inner;
+        // 单连接并发目标 = 会话并发上限，不再是它的 1/4。
+        assert_eq!(inner.streams_per_connection_target(), 256);
+
+        // 无人取流 ⇒ 一条都不开（不做投机预连接）。
+        assert_eq!(inner.desired_active_connection_count(0, 0, 0), 0);
+        // 池内没有连接时，无论积压多大都只开 1 条。
+        assert_eq!(inner.desired_active_connection_count(1, 0, 0), 1);
+        assert_eq!(inner.desired_active_connection_count(1_000, 0, 0), 1);
+        // 之后按并发流需求逐步扩张：会话并发上限（256）没耗尽就不加。
+        assert_eq!(inner.desired_active_connection_count(1, 1, 255), 1);
+        assert_eq!(inner.desired_active_connection_count(1, 1, 256), 2);
+        // 扩张始终受 target_pool_size 约束。
+        assert_eq!(inner.desired_active_connection_count(10_000, 8, 10_000), 16);
+    }
+
+    /// 正常浏览负载全部落在**一条**连接上。
+    ///
+    /// 论文的检测器只看一条 TCP 流的前 25 个承载数据的包：一条连接一生只在
+    /// 诞生那一刻被判一次，此后的内层握手全部落在观测窗之外。所以「多开一条
+    /// 隧道」等于「多交一份未遮蔽的样本」，而审查者只需命中一次。此前阈值 64
+    /// 让第 65 条并发流就去开新连接——把本来会藏进观测窗之外的内层握手，重新
+    /// 摆到一条新连接的前 25 个包里。
+    #[tokio::test]
+    async fn browsing_load_stays_on_a_single_connection() {
+        let connector = Arc::new(FakeConnector::new(|_| FakeSession::new(0)));
+        let mut behavior = test_behavior();
+        behavior.min_target_pool_size = 16;
+        behavior.max_target_pool_size = 16;
+
+        let pool = TestPool::new_with_behavior_for_test(
+            SessionConfig::with_limits(true, 256, 30),
+            behavior,
+            connector,
+        );
+        let inner = &pool.inner;
+
+        // 100 / 200 条并发流（含刚好在等取流的那一批）都不触发第二条连接。
+        for streams in [100usize, 200] {
+            assert_eq!(
+                inner.desired_active_connection_count(1, 1, streams),
+                1,
+                "{streams} concurrent streams must stay on one tunnel connection"
+            );
+        }
+        // 一整批 100 个调用者同时来取流，同样只用这一条。
+        assert_eq!(inner.desired_active_connection_count(100, 1, 100), 1);
+        // 边界：需求刚好等于会话并发上限时仍是 1 条。
+        assert_eq!(inner.desired_active_connection_count(56, 1, 200), 1);
+        assert_eq!(inner.desired_active_connection_count(57, 1, 200), 2);
+    }
+
+    /// 溢流阀：真正超过会话并发上限时第二条连接仍然开得出来。
+    ///
+    /// 提高阈值换来的是「更少的隧道连接」，不是「永不扩容」——会话自身的
+    /// 并发上限（session.rs 双侧强制）耗尽后，`select_active_connection` 会
+    /// 跳过满载连接，取流必须有别的去处，否则调用者只能等到 acquire_timeout。
+    #[tokio::test]
+    async fn overflow_valve_opens_second_connection_past_session_stream_limit() {
+        let connector = Arc::new(FakeConnector::new(|_| FakeSession::new(0)));
+        let mut behavior = test_behavior();
+        behavior.min_target_pool_size = 4;
+        behavior.max_target_pool_size = 4;
+        behavior.soft_ttl_secs = 30;
+        behavior.idle_drain_secs = 30;
+
+        let pool = TestPool::new_with_behavior_for_test(
+            SessionConfig::with_limits(true, 256, 30),
+            behavior,
+            connector.clone(),
+        );
+
+        pool.spawn_connections_for_test(1, false).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let sessions = connector.sessions().await;
+        // 255 条在飞 + 1 个等待者 = 256：仍在单条连接的承载范围内。
+        sessions[0].set_active_streams(255);
+        pool.inner.acquire_waiters.store(1, Ordering::Relaxed);
+        pool.inner.schedule_replenishment_if_needed().await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(connector.sessions().await.len(), 1);
+
+        // 会话并发上限耗尽，溢流阀打开。
+        sessions[0].set_active_streams(256);
+        pool.inner.acquire_waiters.store(1, Ordering::Relaxed);
+        pool.inner.schedule_replenishment_if_needed().await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let snapshot = pool.snapshot().await;
+        assert_eq!(snapshot.active, 2);
+        assert_eq!(snapshot.pending_spawns, 0);
+        assert_eq!(connector.sessions().await.len(), 2);
+        pool.inner.acquire_waiters.store(0, Ordering::Relaxed);
+    }
+
+    /// 扩容不震荡：同一份需求反复评估不会继续加连接，需求回落也不会再加。
+    #[tokio::test]
+    async fn expansion_settles_without_oscillating() {
+        let connector = Arc::new(FakeConnector::new(|_| FakeSession::new(0)));
+        let mut behavior = test_behavior();
+        behavior.min_target_pool_size = 4;
+        behavior.max_target_pool_size = 4;
+        behavior.soft_ttl_secs = 30;
+        behavior.idle_drain_secs = 30;
+
+        let pool = TestPool::new_with_behavior_for_test(
+            SessionConfig::with_limits(true, 256, 30),
+            behavior,
+            connector.clone(),
+        );
+
+        pool.spawn_connections_for_test(1, false).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        connector.sessions().await[0].set_active_streams(256);
+        pool.inner.acquire_waiters.store(1, Ordering::Relaxed);
+        pool.inner.schedule_replenishment_if_needed().await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(connector.sessions().await.len(), 2);
+
+        // 需求不变时反复评估：稳在 2 条，不继续爬。
+        for _ in 0..5 {
+            pool.inner.schedule_replenishment_if_needed().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(connector.sessions().await.len(), 2);
+
+        // 需求回落：既不再加连接，也不会因为「少了一条」而立刻补建。
+        let sessions = connector.sessions().await;
+        sessions[0].set_active_streams(10);
+        sessions[1].set_active_streams(4);
+        for _ in 0..5 {
+            pool.inner.schedule_replenishment_if_needed().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let snapshot = pool.snapshot().await;
+        assert_eq!(connector.sessions().await.len(), 2);
+        assert_eq!(snapshot.active, 2);
+        assert_eq!(snapshot.pending_spawns, 0);
+        pool.inner.acquire_waiters.store(0, Ordering::Relaxed);
+    }
+
+    /// 被删掉的「全忙则 +1」规则确实是恒等变换。
+    ///
+    /// 旧代码在末尾有
+    /// `if busy >= active && total >= active * target { desired = max(desired, active + 1) }`。
+    /// 本测试在整个参数网格上验证：只要 `waiters >= 1`（`waiters == 0` 已提前
+    /// 返回 0），该规则的触发前提就蕴含向上取整结果已经 ≥ `active + 1`，因此
+    /// 它从来拿不到任何新东西——这与阈值取 64 还是 256 无关，删除是纯化简。
+    #[tokio::test]
+    async fn saturation_rule_is_subsumed_by_stream_demand() {
+        let connector = Arc::new(FakeConnector::new(|_| FakeSession::new(0)));
+        let mut behavior = test_behavior();
+        behavior.min_target_pool_size = 16;
+        behavior.max_target_pool_size = 16;
+
+        for max_streams in [1usize, 8, 32, 64, 256] {
+            let pool = TestPool::new_with_behavior_for_test(
+                SessionConfig::with_limits(true, max_streams, 30),
+                behavior.clone(),
+                connector.clone(),
+            );
+            let inner = &pool.inner;
+            let target = inner.streams_per_connection_target();
+            assert_eq!(target, max_streams);
+
+            for waiters in 1usize..=6 {
+                for active in 1usize..=6 {
+                    for total in [
+                        active * target,
+                        active * target + 1,
+                        active * target + target / 2,
+                        (active + 1) * target,
+                    ] {
+                        let desired = inner.desired_active_connection_count(waiters, active, total);
+                        // 规则的触发前提成立时，纯需求公式已经给出 ≥ active + 1。
+                        assert!(
+                            desired >= (active + 1).min(inner.target_pool_size),
+                            "target={target} waiters={waiters} active={active} total={total} \
+                             desired={desired}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 冷启动的实际建连数：`initial_connection_count` 取到上限 3 也只有
+    /// 一次握手出去，且这条连接足以服务当前积压。
+    #[tokio::test]
+    async fn cold_start_spawns_single_connection_with_initial_count_at_max() {
+        let connector = Arc::new(FakeConnector::new(|_| FakeSession::new(0)));
+        let mut behavior = test_behavior();
+        behavior.min_target_pool_size = 16;
+        behavior.max_target_pool_size = 16;
+        behavior.min_initial_connections = 3;
+        behavior.max_initial_connections = 3;
+        behavior.soft_ttl_secs = 30;
+        behavior.idle_drain_secs = 30;
+
+        let pool = TestPool::new_with_behavior_for_test(
+            SessionConfig::with_limits(true, 256, 30),
+            behavior,
+            connector.clone(),
+        );
+
+        // 30 个并发取流请求：远超 initial_connection_count，仍在单条连接的
+        // 流目标（64）之内，因此稳态需求也是 1 条。
+        pool.inner.acquire_waiters.store(30, Ordering::Relaxed);
+        pool.inner.ensure_started().await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let snapshot = pool.snapshot().await;
+        assert_eq!(snapshot.live, 1, "cold start must not open parallel tunnels");
         assert_eq!(snapshot.pending_spawns, 0);
         assert_eq!(connector.sessions().await.len(), 1);
         pool.inner.acquire_waiters.store(0, Ordering::Relaxed);

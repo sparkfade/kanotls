@@ -28,6 +28,65 @@ use crate::utils::{
     extract_client_hello_server_name, mask_mac_flags, unmask_noise_ephemeral_key,
 };
 
+/// [`server_accept`] 的失败分类。
+///
+/// # 为什么必须是类型而不是错误文案
+///
+/// 调用方需要按「预期拒绝 vs 真正故障」选日志级别：对任何暴露在公网 443 的
+/// 端口，pre-auth 失败（端口扫描、主动探测、误连、走错 SNI 的真实浏览器）都是
+/// **常态**。若它们走 `error!`，扫描者每建一条 TCP 就能让服务端写下一行含其
+/// 可控源 IP 的日志——日志放大 / 磁盘填满，而且日志写入在 tokio worker 上同步
+/// 发生。
+///
+/// 此前这个分流是在 `kanotls/src/server.rs` 里用 `Error::to_string()` 的子串
+/// 匹配做的，而这种做法已经**静默失效过一次**：needle `"session closed"` 与
+/// 任何实际文案都不匹配（真实文案是 `"session is closed"`），把一类预期结束
+/// 长期误判成 `error!` 且无人察觉。任一条 `bail!` 的文案被改动都会复现同样的
+/// 静默失配，编译器不会给出任何提示。改成类型化之后，新增失败路径必须显式
+/// 选一个变体，漏选不会编译。
+#[derive(Debug)]
+pub enum ServerAcceptError {
+    /// **Noise 认证提交之前**的拒绝。对端已按 §5.2 得到透明回落或统一关闭
+    /// 姿态，观察不到任何差异。这类结果由对端的输入完全决定、成本为零，
+    /// 因此调用方必须记 `debug!`。
+    PreAuth(anyhow::Error),
+    /// 认证之后的内部故障（伪装采样失败、缓存 profile 与连接不自洽、
+    /// Flight 3 校验失败、配置缺陷等）。运维需要看见，记 `error!`。
+    Internal(anyhow::Error),
+}
+
+impl ServerAcceptError {
+    fn pre_auth(err: impl Into<anyhow::Error>) -> Self {
+        Self::PreAuth(err.into())
+    }
+}
+
+impl std::fmt::Display for ServerAcceptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PreAuth(err) | Self::Internal(err) => std::fmt::Display::fmt(err, f),
+        }
+    }
+}
+
+impl std::error::Error for ServerAcceptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PreAuth(err) | Self::Internal(err) => Some(err.as_ref()),
+        }
+    }
+}
+
+/// 未显式分类的 `?` 一律落到 `Internal`。
+///
+/// 方向是刻意选的：漏标一条**预期**路径只会多写一行 `error!`（吵，但安全）；
+/// 反过来把默认设成 `PreAuth` 则会让真正的故障静悄悄消失。
+impl From<anyhow::Error> for ServerAcceptError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Internal(err)
+    }
+}
+
 /// Classification of a pre-auth failure. Only `CapacityLimited` carries branch
 /// semantics (it selects the dedicated capacity-limited path inside
 /// `emit_pre_auth_failure`); the other variants just document which check
@@ -54,11 +113,23 @@ struct AuthSuccess {
     replay_check: Option<ReplayCheck>,
 }
 
+// 测试探针：本线程内「为某个候选 PSK 构建 Noise responder 状态」的次数。
+//
+// P2 重排（见 `authenticate_client_hello` 内的说明）的可观测代理指标：
+// N 用户配置下，一次握手最多只应构建 1 次 Noise 状态。用 thread-local 而非
+// 全局计数器，是因为 `authenticate_client_hello` 全程同步、不跨线程，
+// 这样并发运行的其他测试（尤其 `server_accept` 跑在 tokio worker 线程上）
+// 不会污染计数。
+#[cfg(test)]
+thread_local! {
+    static NOISE_RESPONDER_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Probes every candidate derived PSK against the ClientHello in `pld` and
-/// returns the first one that passes ephemeral-key unmasking, the Noise
-/// handshake message, the counter MAC and the replay-window checks. Each probe
-/// is a few hashes plus one AEAD decryption, so the cost stays linear in the
-/// number of configured users.
+/// returns the first one that passes the counter MAC, ephemeral-key unmasking,
+/// the Noise handshake message and the replay-window checks. Only a
+/// MAC-matching candidate ever reaches the Noise probe, so a non-matching
+/// candidate costs a few hashes and no asymmetric crypto.
 fn authenticate_client_hello(
     pld: &[u8],
     derived_psks: &[[u8; common::PSK_LEN]],
@@ -86,7 +157,42 @@ fn authenticate_client_hello(
     got_mac.copy_from_slice(&session_id[24..32]);
     mask_mac_flags(&mut got_mac);
 
+    let random_prefix: &[u8] = &random_copy[..16];
+
     for (user_index, derived_psk) in derived_psks.iter().enumerate() {
+        // counter-MAC 比对前置于 Noise 探测。
+        //
+        // 此前每个候选 PSK 的顺序是「解掩临时密钥 → build_responder →
+        // read_message → 才比对 MAC」，于是**每一个**配置用户都要先付一次
+        // 完整的 Noise 探测，而 counter-MAC 比对只要一次 keyed BLAKE2s。
+        // release 实测（2000 次迭代）：Noise 探测 ≈6.3–8.0 µs/PSK
+        // （其中 ≈7 µs 落在 `read_message`：NNpsk0 第一条消息要走
+        // mix_key_and_hash(psk) + mix_hash(e) + mix_key(e) 三段 HKDF 链再加
+        // 一次 AEAD 解密；此处**没有** X25519——`ee` 纯量乘在应答侧的
+        // `write_message` 才发生），counter-MAC ≈0.2–0.3 µs/PSK，比值 22–32×。
+        // 更要紧的是它是放大型 DoS 的杠杆：探测者用一个垃圾 ClientHello 就能
+        // 迫使服务端对每个配置用户各跑一遍完整探测，`MAX_HANDSHAKES = 512`
+        // 之下 50 用户配置每波 150–200 CPU-ms 全是无用功（重排后 5–10 CPU-ms）。
+        //
+        // 允许前置的依据：`derive_counter_mac` 的四个输入（derived_psk、
+        // client random、masked counter、random[..16]）全部取自原始
+        // ClientHello 字节，与 Noise 状态完全无关，不存在需要先跑
+        // `read_message` 才能满足的前置条件。
+        //
+        // 合取条件未变 ⇒ 认证结果严格等价：仍按 user_index 升序取首个
+        // **全部**检查通过者。MAC 命中（碰撞概率 2^-62 量级）而后续
+        // Noise / counter / replay 检查失败时必须 `continue` 继续尝试下一个
+        // PSK，不能提前返回 None——否则一次 MAC 碰撞就能顶掉真正的用户。
+        // `check_counter_replay`（会 bump LRU 顺序）与 `is_replay`（命中即
+        // 写入 REPLAY_CACHE）的调用条件集合也与重排前完全相同：两者仍然
+        // 只在「MAC 通过且 Noise 通过」时被调用，因此副作用的次数与时机不变。
+        let want_mac = derive_counter_mac(derived_psk, &random_copy, &masked_counter, random_prefix);
+        let mut want_mac_masked = want_mac;
+        mask_mac_flags(&mut want_mac_masked);
+        if !constant_time_eq(&got_mac, &want_mac_masked) {
+            continue;
+        }
+
         let recovered_e = unmask_noise_ephemeral_key(&random_copy, derived_psk, client_noise_tag);
         if recovered_e == [0u8; 32] {
             continue;
@@ -100,6 +206,8 @@ fn authenticate_client_hello(
         else {
             continue;
         };
+        #[cfg(test)]
+        NOISE_RESPONDER_BUILDS.with(|count| count.set(count.get() + 1));
         let Ok(mut noise) = builder.build_responder() else {
             continue;
         };
@@ -110,14 +218,6 @@ fn authenticate_client_hello(
                 continue;
             }
             Err(_) => continue,
-        }
-
-        let random_prefix: &[u8] = &random_copy[..16];
-        let want_mac = derive_counter_mac(derived_psk, &random_copy, &masked_counter, random_prefix);
-        let mut want_mac_masked = want_mac;
-        mask_mac_flags(&mut want_mac_masked);
-        if !constant_time_eq(&got_mac, &want_mac_masked) {
-            continue;
         }
 
         let check = check_counter_replay(derived_psk, &random_copy, masked_counter);
@@ -148,30 +248,44 @@ pub async fn server_accept(
     derived_psks: &[[u8; common::PSK_LEN]],
     camouflage_host: &str,
     camouflage_port: u16,
-) -> Result<(SnowyStream, usize), anyhow::Error> {
-    tcp.set_nodelay(true)?;
+) -> Result<(SnowyStream, usize), ServerAcceptError> {
+    // `set_nodelay` / `peer_addr` 作用在**刚 accept 出来的客户端 socket** 上，
+    // 失败由对端掌控：`connect` 之后立刻 RST，socket 进入 TCP_CLOSE。此前这两条
+    // 走的是 `?`，落到默认分类里被记成 `error!`——于是一次「connect + RST」的扫描
+    // 就能按连接数写下等量的 error 行，和这次重构要堵的那个洞是同一类。归入 PreAuth。
+    //
+    // 实测（Linux，`SO_LINGER 0` 关闭后）只有 `peer_addr` 会失败：`getpeername(2)`
+    // 返回 ENOTCONN，而 `setsockopt(TCP_NODELAY)` 仍然成功。两条都归 PreAuth 依然
+    // 正确（客户端 socket 上的 IO 错误，无任何运维价值），但可被对端触发的只有后者。
+    tcp.set_nodelay(true).map_err(ServerAcceptError::pre_auth)?;
     let _ = apply_tcp_keepalive(&tcp);
     let handshake_permit = match HANDSHAKE_LIMITER.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             // 限额耗尽是唯一走不到透明转发的分支（此处尚未读取任何字节，
-            // 无法构造有意义的上游请求）。统一走排空 + 随机延迟的关闭姿态，
-            // 与其他限额耗尽路径不可区分，且不再是「accept 后瞬时关闭」。
+            // 无法构造有意义的上游请求）。统一走「有界排空 + 立即关闭」的
+            // 姿态，与其他限额耗尽路径不可区分——这也正是真实 nginx 在
+            // worker_connections 耗尽时的行为（accept 之后立即关闭）。
             emit_indistinguishable_close(tcp).await;
-            anyhow::bail!("server handshake limit reached")
+            return Err(ServerAcceptError::pre_auth(anyhow::anyhow!(
+                "server handshake limit reached"
+            )));
         }
     };
-    let peer_addr = tcp.peer_addr()?;
+    let peer_addr = tcp.peer_addr().map_err(ServerAcceptError::pre_auth)?;
     debug!("new connection from {}", peer_addr);
 
     if derived_psks.is_empty() {
-        anyhow::bail!("server requires at least one user PSK");
+        // 配置缺陷，不是对端造成的：服务端起来了却一个用户都没有。
+        return Err(ServerAcceptError::Internal(anyhow::anyhow!(
+            "server requires at least one user PSK"
+        )));
     }
     let mut client_noise_tag = [0u8; 16];
 
     let mut rx_buf = Vec::new();
-    let initial_deadline = initial_record_deadline();
-    let (typ, _) = match read_initial_client_record(&mut tcp, &mut rx_buf, initial_deadline).await
+    let initial_deadlines = initial_record_deadlines();
+    let (typ, _) = match read_initial_client_record(&mut tcp, &mut rx_buf, initial_deadlines).await
     {
         Ok(res) => res,
         Err(e) => {
@@ -189,7 +303,10 @@ pub async fn server_accept(
             //   * 连上不发数据 → 恰好 T+10.000s 静默 FIN；
             //   * 发 `16 03 03 41 01` → 瞬时静默关闭（且因队列有未读数据发 RST）。
             emit_pre_auth_failure(tcp, rx_buf, camouflage_host, camouflage_port, class).await;
-            anyhow::bail!("Failed to read initial TLS record: {}", e)
+            return Err(ServerAcceptError::pre_auth(anyhow::anyhow!(
+                "Failed to read initial TLS record: {}",
+                e
+            )));
         }
     };
 
@@ -203,7 +320,9 @@ pub async fn server_accept(
             FailureClass::NonTlsFirstRecord,
         )
         .await;
-        anyhow::bail!("First record is not a TLS Handshake");
+        return Err(ServerAcceptError::pre_auth(anyhow::anyhow!(
+            "First record is not a TLS Handshake"
+        )));
     }
 
     let client_hello_server_name = extract_client_hello_server_name(&rx_buf).map(str::to_owned);
@@ -228,7 +347,9 @@ pub async fn server_accept(
             FailureClass::AuthFailed,
         )
         .await;
-        anyhow::bail!("Noise authentication failed");
+        return Err(ServerAcceptError::pre_auth(anyhow::anyhow!(
+            "Noise authentication failed"
+        )));
     };
 
     let client_hello_server_name = match client_hello_server_name {
@@ -244,7 +365,9 @@ pub async fn server_accept(
                 FailureClass::MissingSni,
             )
             .await;
-            anyhow::bail!("ClientHello missing valid SNI")
+            return Err(ServerAcceptError::pre_auth(anyhow::anyhow!(
+                "ClientHello missing valid SNI"
+            )));
         }
     };
     if !client_hello_server_name.eq_ignore_ascii_case(camouflage_host) {
@@ -262,11 +385,11 @@ pub async fn server_accept(
             FailureClass::SniMismatch,
         )
         .await;
-        anyhow::bail!(
+        return Err(ServerAcceptError::pre_auth(anyhow::anyhow!(
             "client hello SNI '{}' does not match configured camouflage host '{}'",
             client_hello_server_name,
             camouflage_host
-        )
+        )));
     }
 
     debug!("Noise authentication successful, proxying ClientHello to camouflage server");
@@ -283,7 +406,9 @@ pub async fn server_accept(
                 FailureClass::CapacityLimited,
             )
             .await;
-            anyhow::bail!("server active session limit reached")
+            return Err(ServerAcceptError::pre_auth(anyhow::anyhow!(
+                "server active session limit reached"
+            )));
         }
     };
 
@@ -291,7 +416,11 @@ pub async fn server_accept(
 
     if let Some(ref check) = replay_check {
         if !commit_counter_replay(check) {
-            anyhow::bail!("counter commit rejected: window advanced past sequence");
+            // 认证已通过，但同一计数器被并发提交抢先——重放，或同一客户端的
+            // 罕见竞态。对端持有有效凭据，不构成日志放大面，保持 Internal。
+            return Err(ServerAcceptError::Internal(anyhow::anyhow!(
+                "counter commit rejected: window advanced past sequence"
+            )));
         }
     }
 
@@ -322,7 +451,7 @@ pub async fn server_accept(
 
 pub(super) async fn consume_client_flight3_ghost(
     tcp: &mut TcpStream,
-    noise: &mut snow::TransportState,
+    noise: &mut common::NoiseTransport,
 ) -> anyhow::Result<()> {
     let max_wire = max_flight3_total_wire_len();
     let mut wire = vec![0u8; max_wire];
@@ -521,7 +650,7 @@ mod tests {
         (client.unwrap(), accepted.unwrap().0)
     }
 
-    fn build_tls_app_record(noise: &mut snow::TransportState, payload: &[u8]) -> Vec<u8> {
+    fn build_tls_app_record(noise: &mut common::NoiseTransport, payload: &[u8]) -> Vec<u8> {
         use crate::common::{
             BLOCK_LEN_PREFIX_SIZE, INNER_CONTENT_TYPE_APP_DATA, INNER_CONTENT_TYPE_LEN,
         };
@@ -553,7 +682,7 @@ mod tests {
     }
 
     fn build_client_flight3_and_upload(
-        noise: &mut snow::TransportState,
+        noise: &mut common::NoiseTransport,
         upload_payload: &[u8],
     ) -> Vec<u8> {
         let finished_plaintext = [0u8; FLIGHT3_FINISHED_PLAINTEXT_LEN];
@@ -580,7 +709,7 @@ mod tests {
         wire
     }
 
-    fn established_noise_pair() -> (snow::TransportState, snow::TransportState) {
+    fn established_noise_pair() -> (common::NoiseTransport, common::NoiseTransport) {
         let psk = derive_psk(b"flight3-overread-regression");
         let mut initiator = snow::Builder::new(common::NOISE_PARAMS.clone())
             .psk(0, &psk)
@@ -604,8 +733,8 @@ mod tests {
             .unwrap();
 
         (
-            initiator.into_transport_mode().unwrap(),
-            responder.into_transport_mode().unwrap(),
+            common::NoiseTransport::new(initiator.into_stateless_transport_mode().unwrap()),
+            common::NoiseTransport::new(responder.into_stateless_transport_mode().unwrap()),
         )
     }
 
@@ -829,8 +958,8 @@ mod tests {
             early_app_data_count: count,
             has_ccs: true,
             visible_server_record_count: 2,
-            first_app_data_delay_ms: 0,
-            early_app_data_gap_ms: vec![],
+            first_app_data_delay_us: 0,
+            early_app_data_gap_us: vec![],
             app_data_sizes: Arc::from(app_data_sizes.into_boxed_slice()),
         }
     }
@@ -868,6 +997,204 @@ mod tests {
         PooledProfile {
             profile,
             fetched_at: Instant::now(),
+        }
+    }
+
+    /// 测试用：走**生产路径**从 ClientHello 查缓存 profile。
+    ///
+    /// 生产代码里这两步分开是为了让指纹只算一次（`fetch_camouflage_flight`
+    /// 先 `camouflage_cache_keys`，再把 key 交给 `lookup_cached_camouflage_profile`）。
+    /// 这里把同样的两步串起来，因此这些测试仍然覆盖「ClientHello → key 推导」
+    /// 与「查找顺序 / rank 优先级」的完整链路，且 key 的推导没有第二份实现。
+    async fn lookup_cached_profile_for_client_hello(
+        host: &str,
+        port: u16,
+        client_hello: &[u8],
+    ) -> Option<CamouflageProfile> {
+        let keys = camouflage_cache_keys(host, port, client_hello);
+        lookup_cached_camouflage_profile(
+            keys.as_ref().map(|k| k.profile.as_str()),
+            keys.as_ref().map(|k| k.family_baseline.as_str()),
+            &camouflage_baseline_key(host, port, "probe"),
+        )
+        .await
+    }
+
+    /// 变体的可比较身份（`CamouflageProfile` 未派生 `PartialEq`）。
+    fn profile_identity(
+        profile: &CamouflageProfile,
+    ) -> (Vec<u8>, Vec<usize>, Vec<usize>, Vec<u32>, u32, bool) {
+        (
+            profile.server_records.to_vec(),
+            profile.prefix_app_data_sizes.clone(),
+            profile.app_data_sizes.to_vec(),
+            profile.early_app_data_gap_us.clone(),
+            profile.first_app_data_delay_us,
+            profile.has_ccs,
+        )
+    }
+
+    /// `sample_camouflage_profile` 的**旧实现**，逐字保留作为等价性参照：
+    /// 先 `sanitize + clone` 每一个变体，再按 rank 过滤出候选集合，最后
+    /// `gen_range(0..len)` 取一个。新实现只把「物化整池」换成「在引用上算
+    /// rank、只克隆中选者」，因此只要候选集合（含顺序）一致，选取语义就
+    /// 逐字一致——唯一的随机源仍是对该集合的一次均匀抽样。
+    fn legacy_sample_candidates(pool: &CamouflageProfilePool) -> Vec<CamouflageProfile> {
+        let mut usable: Vec<CamouflageProfile> = pool
+            .profiles
+            .iter()
+            .map(|entry| sanitize_camouflage_profile(entry.profile.clone()))
+            .filter(|profile| camouflage_profile_rank(profile) > 0)
+            .collect();
+        if usable.is_empty() {
+            return Vec::new();
+        }
+        let max_rank = usable
+            .iter()
+            .map(camouflage_profile_rank)
+            .max()
+            .unwrap_or(0);
+        usable.retain(|profile| camouflage_profile_rank(profile) == max_rank);
+        usable
+    }
+
+    /// `sanitize_camouflage_profile` 必须幂等。
+    ///
+    /// 这是「在引用上算 rank 等价于在 sanitize 后的克隆上算 rank」的前提之一：
+    /// 池中变体都是 sanitize 的输出，只有幂等才保证再 sanitize 一次不改变
+    /// `app_data_sizes` 是否为空（rank 的两个输入之一）。
+    #[test]
+    fn sanitize_camouflage_profile_is_idempotent() {
+        let cases = vec![
+            CamouflageProfile {
+                server_records: Arc::from(vec![0x16, 0x03, 0x03].into_boxed_slice()),
+                prefix_app_data_sizes: vec![8, 23, 31, 40, 44, 50, 99999],
+                app_data_sizes: Arc::from(vec![8, 23, 512, 6000, 20000].into_boxed_slice()),
+                first_app_data_size: Some(8),
+                early_app_data_count: 5,
+                has_ccs: true,
+                visible_server_record_count: 3,
+                first_app_data_delay_us: 1234,
+                early_app_data_gap_us: vec![1, 2, 3, 4, 5, 6],
+            },
+            // 全部尺寸越界 ⇒ sanitize 会把 app_data_sizes 清空（rank 因此下降）。
+            test_camouflage_profile(vec![0x16], vec![1, 2, 99999]),
+            test_camouflage_profile(vec![], vec![]),
+        ];
+
+        for profile in cases {
+            let once = sanitize_camouflage_profile(profile);
+            let twice = sanitize_camouflage_profile(once.clone());
+            assert_eq!(
+                profile_identity(&once),
+                profile_identity(&twice),
+                "sanitize 必须幂等"
+            );
+            assert_eq!(once.first_app_data_size, twice.first_app_data_size);
+            assert_eq!(once.early_app_data_count, twice.early_app_data_count);
+            assert_eq!(
+                camouflage_profile_rank(&once),
+                camouflage_profile_rank(&twice)
+            );
+        }
+    }
+
+    /// 入池的每个变体都必须**已经**是 sanitize 的输出。
+    ///
+    /// `push_profile_variant` 是 `CAMOUFLAGE_PROFILES` 的唯一写入路径；若哪天
+    /// 有人绕开它直接塞入未 sanitize 的 profile，`sample_camouflage_profile`
+    /// 在引用上算出的 rank 就可能高于它实际能提供的 rank。
+    #[tokio::test]
+    async fn pooled_profiles_are_stored_pre_sanitized() {
+        let key = "pre-sanitized.example:443:deadbeef".to_string();
+        // 越界尺寸 + 超量 prefix + 多余 gap：三处都会被 sanitize 削掉。
+        let mut raw = test_camouflage_profile(vec![0x16, 0x03, 0x03], vec![8, 53, 512, 99999]);
+        raw.prefix_app_data_sizes = vec![8, 23, 31, 40, 44, 50];
+        raw.early_app_data_gap_us = vec![10, 20, 30, 40, 50];
+        store_camouflage_profile(key.clone(), raw).await;
+
+        let mut profiles = CAMOUFLAGE_PROFILES.lock().await;
+        let pool = profiles.get(&key).expect("pool stored");
+        for entry in &pool.profiles {
+            let resanitized = sanitize_camouflage_profile(entry.profile.clone());
+            assert_eq!(
+                profile_identity(&entry.profile),
+                profile_identity(&resanitized),
+                "池中变体必须已经是 sanitize 的输出"
+            );
+        }
+    }
+
+    /// **选取语义等价性**：新旧实现的候选集合（含顺序）逐项相同，且抽样确实
+    /// 覆盖整个候选集合。
+    ///
+    /// 这是本次「单次加锁 + 只克隆中选者」重构的验收断言——它是纯性能改动，
+    /// 哪个变体被选中、rank 如何优先、同 rank 如何轮换都必须逐字不变。
+    #[tokio::test]
+    async fn sample_camouflage_profile_selection_matches_legacy_candidate_set() {
+        let pools = vec![
+            // 混合 rank：rank3 ×2 / rank2 / rank1 ⇒ 候选只能是那两个 rank3。
+            vec![
+                test_camouflage_profile(vec![0x16, 0x01], vec![53]),
+                test_camouflage_profile(vec![0x16, 0x02], vec![]),
+                test_camouflage_profile(vec![0x16, 0x03], vec![90, 128]),
+                test_camouflage_profile(vec![], vec![256]),
+            ],
+            // 全 rank2。
+            vec![
+                test_camouflage_profile(vec![0x16, 0x01], vec![]),
+                test_camouflage_profile(vec![0x16, 0x02], vec![]),
+            ],
+            // 全 rank0 ⇒ 无候选。
+            vec![test_camouflage_profile(vec![], vec![])],
+            // sanitize 后 app_data_sizes 被清空 ⇒ rank 从 3 掉到 2。
+            vec![
+                test_camouflage_profile(vec![0x16, 0x01], vec![1, 2]),
+                test_camouflage_profile(vec![0x16, 0x02], vec![]),
+            ],
+            vec![],
+        ];
+
+        for profiles in pools {
+            let mut pool = None;
+            for profile in &profiles {
+                pool = Some(push_profile_variant(pool, profile.clone()));
+            }
+            let pool = pool.unwrap_or(CamouflageProfilePool {
+                profiles: Default::default(),
+            });
+
+            let legacy: Vec<_> = legacy_sample_candidates(&pool)
+                .iter()
+                .map(profile_identity)
+                .collect();
+
+            if legacy.is_empty() {
+                assert!(
+                    sample_camouflage_profile(&pool).is_none(),
+                    "无可用变体时必须返回 None"
+                );
+                continue;
+            }
+
+            // 256 次抽样：既验证「结果恒在候选集合内」，也验证「每个候选都
+            // 能被抽到」（同 rank 的轮换未被收窄成固定挑第一个）。
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..256 {
+                let picked = sample_camouflage_profile(&pool).expect("候选集合非空");
+                let identity = profile_identity(&picked);
+                assert!(
+                    legacy.contains(&identity),
+                    "抽到了旧实现候选集合之外的变体：{:?}",
+                    identity
+                );
+                seen.insert(identity);
+            }
+            assert_eq!(
+                seen.len(),
+                legacy.len(),
+                "同 rank 的每个变体都必须可被抽到（旧实现是对候选集合的均匀抽样）"
+            );
         }
     }
 
@@ -956,7 +1283,7 @@ mod tests {
         ];
 
         assert!(
-            lookup_cached_camouflage_profile("never-cached.example", 443, &client_hello)
+            lookup_cached_profile_for_client_hello("never-cached.example", 443, &client_hello)
                 .await
                 .is_none(),
             "lookup against an uncached key must keep returning None"
@@ -1006,7 +1333,7 @@ mod tests {
         modified[44..76].fill(0xbb);
         modified[94..126].fill(0xcc);
 
-        let profile = lookup_cached_camouflage_profile("example.com", 443, &modified).await;
+        let profile = lookup_cached_profile_for_client_hello("example.com", 443, &modified).await;
         assert!(profile.is_some());
         assert_eq!(&*profile.unwrap().app_data_sizes, &[53, 90][..]);
     }
@@ -1029,7 +1356,7 @@ mod tests {
         .await;
 
         let profile =
-            lookup_cached_camouflage_profile("baseline.example", 443, &client_hello).await;
+            lookup_cached_profile_for_client_hello("baseline.example", 443, &client_hello).await;
         assert!(profile.is_some());
         let profile = profile.unwrap();
         assert_eq!(&*profile.app_data_sizes, &[53, 90][..]);
@@ -1049,7 +1376,7 @@ mod tests {
 
         let malformed = vec![0x16, 0x03, 0x03, 0x00, 0x05, 0x01, 0x00, 0x00, 0x01, 0x00];
         let profile =
-            lookup_cached_camouflage_profile("baseline-no-fp.example", 443, &malformed).await;
+            lookup_cached_profile_for_client_hello("baseline-no-fp.example", 443, &malformed).await;
 
         assert!(profile.is_some());
         assert_eq!(profile.unwrap().app_data_sizes.to_vec(), vec![64]);
@@ -1077,7 +1404,7 @@ mod tests {
         )
         .await;
 
-        let profile = lookup_cached_camouflage_profile("prefer.example", 443, &client_hello)
+        let profile = lookup_cached_profile_for_client_hello("prefer.example", 443, &client_hello)
             .await
             .unwrap();
 
@@ -1186,7 +1513,7 @@ mod tests {
             .await
             .is_none());
 
-        let profile = lookup_cached_camouflage_profile("probe-only.example", 443, &client_hello)
+        let profile = lookup_cached_profile_for_client_hello("probe-only.example", 443, &client_hello)
             .await
             .expect("probe fallback remains visible");
         assert_eq!(&*profile.app_data_sizes, &[53, 90][..]);
@@ -1219,16 +1546,16 @@ mod tests {
             early_app_data_count: 5,
             has_ccs: true,
             visible_server_record_count: 2,
-            first_app_data_delay_ms: 999,
-            early_app_data_gap_ms: vec![400, 2, 999, 1],
+            first_app_data_delay_us: 999,
+            early_app_data_gap_us: vec![400, 2, 999, 1],
         });
 
         assert_eq!(&*profile.app_data_sizes, &[53, 512, 6000][..]);
         assert_eq!(profile.prefix_app_data_sizes, vec![53, 512]);
         assert_eq!(profile.first_app_data_size, Some(53));
         assert_eq!(profile.early_app_data_count, 3);
-        assert_eq!(profile.first_app_data_delay_ms, 999);
-        assert_eq!(profile.early_app_data_gap_ms, vec![400, 2]);
+        assert_eq!(profile.first_app_data_delay_us, 999);
+        assert_eq!(profile.early_app_data_gap_us, vec![400, 2]);
     }
 
     #[test]
@@ -1282,15 +1609,45 @@ mod tests {
             release_tx.send(()).unwrap();
             lock_thread.join().unwrap();
 
-            // 超时留足 emit_indistinguishable_close 的排空 + 随机延迟窗口。
+            // 超时留足 emit_indistinguishable_close 的排空窗口。
             let result = tokio::time::timeout(Duration::from_secs(10), server_task)
                 .await
                 .expect("server_accept should finish once fallback accounting unblocks")
                 .expect("server_accept task should join");
-            assert!(result.is_err());
+            // 分类必须是 PreAuth：这三种输入探测者都能零成本构造，若它们落到
+            // Internal，`kanotls/src/server.rs` 就会按 error! 记录，扫描者每建
+            // 一条 TCP 就能让服务端写下一行含其可控源 IP 的日志。
+            match result {
+                Err(ServerAcceptError::PreAuth(_)) => {}
+                Err(ServerAcceptError::Internal(e)) => panic!(
+                    "input-driven pre-auth rejection classified as an internal fault ({}) — \
+                     the caller logs those at error!, which hands a scanner one attacker-\
+                     controlled log line per TCP connection",
+                    e
+                ),
+                Ok(_) => panic!("handshake must not succeed"),
+            }
             expect_shaped_close(&mut client).await;
             assert_pre_auth_fallback_state_clean();
         }
+    }
+
+    /// 配置缺陷（一个用户都没有）必须归为 `Internal`，运维要看得见。
+    ///
+    /// 与上一条测试成对：`PreAuth` / `Internal` 的边界是「这个失败是不是对端
+    /// 免费就能造出来的」，两侧各锁一条，避免整表滑向任意一边。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_user_psks_is_an_internal_fault_not_a_pre_auth_rejection() {
+        let (_client, server) = connected_tcp_pair().await;
+        let err = server_accept(server, &[], "localhost", 443)
+            .await
+            .err()
+            .expect("an inbound with zero users cannot accept");
+        assert!(
+            matches!(err, ServerAcceptError::Internal(_)),
+            "a misconfigured inbound must stay visible at error!, got {:?}",
+            err
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1612,5 +1969,88 @@ mod tests {
         let auth = authenticate_client_hello(&ch, &single, &mut tag, peer)
             .expect("single-user list should still authenticate");
         assert_eq!(auth.user_index, 0);
+    }
+
+    /// 非匹配 PSK 不得触发 Noise 状态构建。
+    ///
+    /// 这是「MAC 前置于 Noise 探测」的可观测代理指标。若哪天有人把顺序改回
+    /// 去，每个配置用户都会重新各付一次非对称探测：22× 的认证浪费，并且让
+    /// 一个垃圾 ClientHello 的 CPU 成本随用户数线性放大（`MAX_HANDSHAKES`
+    /// = 512 × 50 用户 ≈ 153 CPU-ms/波）。
+    #[test]
+    fn authenticate_client_hello_probes_noise_only_for_mac_matching_psk() {
+        let decoys: Vec<[u8; common::PSK_LEN]> = (0..15)
+            .map(|idx| derive_psk(format!("noise-probe-decoy-{}", idx).as_bytes()))
+            .collect();
+        let real = derive_psk(b"noise-probe-real-password");
+
+        let mut with_real = decoys.clone();
+        with_real.push(real);
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let mut tag = [0u8; 16];
+
+        // 命中用户排在最后：重排前这里会构建 16 次 Noise 状态。
+        let ch = build_auth_client_hello(&real);
+        NOISE_RESPONDER_BUILDS.with(|count| count.set(0));
+        let auth = authenticate_client_hello(&ch, &with_real, &mut tag, peer)
+            .expect("last user in the list must still authenticate");
+        assert_eq!(auth.user_index, decoys.len());
+        assert_eq!(
+            NOISE_RESPONDER_BUILDS.with(|count| count.get()),
+            1,
+            "只有 counter-MAC 命中的 PSK 才允许构建 Noise 状态；{} 个候选中\
+             出现多次构建说明非对称探测又跑在 MAC 之前了",
+            with_real.len()
+        );
+
+        // 完全不匹配的用户表：一次 Noise 状态都不该构建。
+        let ch = build_auth_client_hello(&real);
+        NOISE_RESPONDER_BUILDS.with(|count| count.set(0));
+        assert!(authenticate_client_hello(&ch, &decoys, &mut tag, peer).is_none());
+        assert_eq!(
+            NOISE_RESPONDER_BUILDS.with(|count| count.get()),
+            0,
+            "无人命中 counter-MAC 时不得有任何非对称探测——否则垃圾 \
+             ClientHello 的 CPU 成本随配置用户数线性放大"
+        );
+    }
+
+    /// counter-MAC 命中之后的检查链必须仍然是「失败就换下一个 PSK」，
+    /// 而不是「失败就整体返回 None」。
+    ///
+    /// 把 MAC 提到 Noise 之前后，MAC 是本轮的第一个筛子，很容易顺手写成
+    /// 「MAC 不中就 continue、中了就直接决出胜负」。那是错的：MAC 只有
+    /// 62 位有效长度，一次碰撞就能顶掉真正的用户。
+    ///
+    /// 这里用重放的 ClientHello 走通该路径——MAC 与 Noise 都会通过，只在
+    /// `is_replay` 处被拒（临时公钥已在上一次调用中写入 REPLAY_CACHE），
+    /// 因此它同时钉住了 `is_replay` 的副作用位置：仍然发生在 MAC 与 Noise
+    /// 都通过之后，重排没有改变它的调用条件。
+    #[test]
+    fn authenticate_client_hello_keeps_scanning_after_a_mac_hit_fails_later_checks() {
+        let psk = derive_psk(b"mac-hit-then-replay-rejected");
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let mut tag = [0u8; 16];
+
+        // 同一个 PSK 列两次：两轮都会命中 MAC，因此第二次调用的两轮都必须
+        // 走完整条链并各自被 is_replay 拒掉。
+        let psks = vec![psk, psk];
+        let ch = build_auth_client_hello(&psk);
+        assert!(
+            authenticate_client_hello(&ch, &psks, &mut tag, peer).is_some(),
+            "first use of a fresh ClientHello must authenticate"
+        );
+
+        NOISE_RESPONDER_BUILDS.with(|count| count.set(0));
+        assert!(
+            authenticate_client_hello(&ch, &psks, &mut tag, peer).is_none(),
+            "a replayed ClientHello must be rejected even though the counter MAC matches"
+        );
+        assert_eq!(
+            NOISE_RESPONDER_BUILDS.with(|count| count.get()),
+            2,
+            "MAC 命中但后续检查失败时必须继续扫描下一个 PSK；只探测 1 次说明\
+             提前 return 了，一次 MAC 碰撞就能顶掉真正的用户"
+        );
     }
 }

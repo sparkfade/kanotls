@@ -1,11 +1,11 @@
 use lazy_static::lazy_static;
-use snow::TransportState;
+use std::sync::OnceLock;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::debug;
 
 use crate::common::{
-    self, apply_tcp_keepalive, build_h2_ghost_plaintext, SnowyStream, AEAD_TAG_LEN,
+    self, apply_tcp_keepalive, build_h2_ghost_plaintext, NoiseTransport, SnowyStream, AEAD_TAG_LEN,
     FLIGHT3_CCS_RECORD, FLIGHT3_FINISHED_PLAINTEXT_LEN, FLIGHT3_FINISHED_RECORD_LEN,
     HANDSHAKE_CONTROL_LEN, HANDSHAKE_CONTROL_MAGIC, TLS_RECORD_HEADER_LEN,
 };
@@ -17,6 +17,32 @@ use crate::utils::{
 
 lazy_static! {
     static ref CONNECTION_COUNTER: ConnectionCounter = ConnectionCounter::new();
+}
+
+/// Flight-3 H2 幽灵记录的变体选择种子——**每进程采样一次**。
+///
+/// 此前该种子由 `client_noise_tag`、`derived_psk` 与连接计数器 `counter`
+/// 逐字节相加得到。`counter` 每条连接递增、`client_noise_tag` 每条连接
+/// 全新，于是 `build_h2_ghost_plaintext` 选出的变体**逐连接变化**，第三条
+/// Flight-3 记录的线速尺寸在 {86, 92, 98} 之间跳动。
+///
+/// 这是「方差过剩」型特征，与 §2.3 修掉的 ServerHello key_share 问题恰好
+/// 互为镜像：那边是同一条 ECDHE 公钥跨连接复用（方差不足），这边是同一个
+/// 客户端的每条连接给出不同的 H2 preface + SETTINGS + WINDOW_UPDATE 尺寸
+/// （方差过剩）。真实浏览器的 H2 SETTINGS 是编译期常量，一个 Firefox 实例
+/// 的**每一条**连接都发完全相同尺寸的 H2 前导；而 KanoTLS 连接池一次开
+/// 4–16 条连接，观察者从单一客户端 IP 就能看到这个尺寸在三个取值间抖动。
+/// 判别成本与 key_share 那侧一样低：每流只需记住一个 u16。
+///
+/// 现改为进程级 `OnceLock`：一个进程 = 一个浏览器实例 = 一组固定的
+/// SETTINGS。种子取自 CSPRNG 而**不是** PSK 派生——若从 PSK 派生，同一
+/// 部署的所有客户端会收敛到同一变体，且线上可见的记录长度就成了密钥材料
+/// 的一个 2 bit 函数，属于把秘密泄进明文可见字段。
+static H2_GHOST_CONTEXT: OnceLock<u64> = OnceLock::new();
+
+/// 取得（必要时初始化）本进程的 H2 幽灵变体种子。
+fn h2_ghost_context_hash() -> u64 {
+    *H2_GHOST_CONTEXT.get_or_init(rand::random::<u64>)
 }
 
 const CLIENT_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
@@ -187,19 +213,13 @@ pub async fn client_tunnel(
         }
     }
 
-    let mut noise = noise.into_transport_mode()?;
+    // 无状态传输态 + 外部 nonce：Flight-3 的两条消息用 n=0/1，随后原样
+    // 交给 SnowyStream 继续从 n=2 递增——线上字节与 TransportState 完全一致
+    // （论证见 `NoiseTransport`）。
+    let mut noise = NoiseTransport::new(noise.into_stateless_transport_mode()?);
 
-    let context_hash = {
-        let mut hash = [0u8; 8];
-        for i in 0..8 {
-            hash[i] = client_noise_tag[i]
-                .wrapping_add(derived_psk[i])
-                .wrapping_add(derived_psk[i + 16])
-                .wrapping_add(counter.to_be_bytes()[i]);
-        }
-        u64::from_be_bytes(hash)
-    };
-    send_client_flight3_ghost(&mut tcp, &mut noise, context_hash).await?;
+    // 变体选择必须与本连接的任何材料无关：见 `H2_GHOST_CONTEXT` 的说明。
+    send_client_flight3_ghost(&mut tcp, &mut noise, h2_ghost_context_hash()).await?;
 
     debug!(
         "Tunnel established with fingerprint {:?}",
@@ -210,7 +230,7 @@ pub async fn client_tunnel(
 
 async fn send_client_flight3_ghost(
     tcp: &mut TcpStream,
-    noise: &mut TransportState,
+    noise: &mut NoiseTransport,
     context_hash: u64,
 ) -> Result<(), anyhow::Error> {
     let finished_plaintext = [0u8; FLIGHT3_FINISHED_PLAINTEXT_LEN];
@@ -256,7 +276,8 @@ async fn send_client_flight3_ghost(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_outer_client_fingerprint;
+    use super::{h2_ghost_context_hash, resolve_outer_client_fingerprint};
+    use crate::common::{build_h2_ghost_plaintext, max_h2_ghost_plaintext_len};
 
     #[test]
     fn omitted_outer_fingerprint_keeps_default_template_path() {
@@ -269,5 +290,37 @@ mod tests {
             resolve_outer_client_fingerprint(Some(" firefox ")),
             Some("firefox")
         );
+    }
+
+    // C4 回归：H2 幽灵变体种子必须是进程常量。此前它混入 counter 与
+    // client_noise_tag，导致同一客户端的每条连接发出不同尺寸的 Flight-3
+    // 第三条记录（{86, 92, 98} 抖动），而真实 Firefox 的 H2 SETTINGS 是
+    // 编译期常量、跨连接恒定。
+    #[test]
+    fn h2_ghost_context_hash_is_process_constant() {
+        let first = h2_ghost_context_hash();
+        for _ in 0..64 {
+            assert_eq!(
+                h2_ghost_context_hash(),
+                first,
+                "H2 ghost variant seed drifted within one process"
+            );
+        }
+    }
+
+    // 由上一条推出的线上性质：本进程内每条连接的 H2 幽灵明文（因而线速
+    // 记录长度）逐字节相同。
+    #[test]
+    fn h2_ghost_plaintext_is_identical_across_connections() {
+        let baseline = build_h2_ghost_plaintext(h2_ghost_context_hash());
+        assert!(!baseline.is_empty());
+        assert!(baseline.len() <= max_h2_ghost_plaintext_len());
+        for _ in 0..64 {
+            assert_eq!(
+                build_h2_ghost_plaintext(h2_ghost_context_hash()),
+                baseline,
+                "per-connection H2 ghost plaintext must not vary within a process"
+            );
+        }
     }
 }

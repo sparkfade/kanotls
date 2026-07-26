@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use lazy_static::lazy_static;
 use rand::{Rng, RngCore};
@@ -12,7 +12,7 @@ use crate::templates;
 use crate::utils::{
     client_hello_random_and_session_id_ranges, derive_counter_mac, derive_counter_mask,
     extract_client_hello_random_and_session_id, is_grease_value, mask_noise_ephemeral_key,
-    xor_u64_bytes, GREASE_VALUES,
+    xor_u64_bytes, ECH_EXTENSION_TYPE, GREASE_VALUES,
 };
 
 lazy_static! {
@@ -45,6 +45,22 @@ impl Default for ConnectionCounter {
     }
 }
 
+/// GREASE ECH（0xFE0D）扩展中必须逐连接刷新的三个字段的偏移。
+///
+/// 此前 ECH 被整份剥离，理由是 281 字节 extension_data 逐字节重放就是跨连接
+/// 常量（§2.3 痛斥的那类特征）。但删除同时把 JA3/JA4 打成了「不对应任何已
+/// 发布 Firefox 版本」的形状，正解是刷新而非删除：`config_id`/`enc`/`payload`
+/// 逐连接重取，`type`/`cipher_suite`/所有长度字段保持恒定。
+#[derive(Debug, Clone)]
+struct EchGreaseRanges {
+    /// 1 字节 config_id。真实 Firefox 每次 GREASE ECH 都重取。
+    config_id: usize,
+    /// HPKE `enc`。长度字段不在此范围内，只刷新内容。
+    enc: Range<usize>,
+    /// 冒充 HPKE AEAD 密文的 `payload`。同样只刷新内容。
+    payload: Range<usize>,
+}
+
 #[derive(Debug)]
 pub struct ClientHelloTemplate {
     bytes: Vec<u8>,
@@ -52,6 +68,7 @@ pub struct ClientHelloTemplate {
     key_share_range: Range<usize>,
     auxiliary_key_share_ranges: Vec<Range<usize>>,
     extensions_len_range: Range<usize>,
+    ech_grease_ranges: Option<EchGreaseRanges>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +84,7 @@ struct ClientHelloLayout {
     sni_ext_len_range: Range<usize>,
     sni_list_len_range: Range<usize>,
     sni_name_len_range: Range<usize>,
+    ech_grease_ranges: Option<EchGreaseRanges>,
 }
 
 impl ClientHelloTemplate {
@@ -83,7 +101,37 @@ impl ClientHelloTemplate {
         let mut out = self.bytes.clone();
         {
             let mut rng = rand::thread_rng();
-            rng.fill_bytes(&mut out[self.key_share_range.clone()]);
+            // 此前 0x001d 主份额与混合份额尾部 32 字节都用 `fill_bytes` 填充，
+            // 于是产生了两个可观测特征：
+            //
+            // 1. 真实 X25519 公钥是 mod 2^255-19 归约后的 u 坐标，小端序下
+            //    byte 31 最高位恒为 0；均匀随机字节有一半概率置位。每条连接
+            //    泄漏 1 bit（两处同值时），误报率严格为 0，censor 每流只需读
+            //    ClientHello 里的 1 个字节。
+            // 2. 两处独立随机 ⇒ 二者必然不同。而真实 Firefox 在同时提供
+            //    x25519 与 X25519MLKEM768 时**复用同一个 X25519 密钥对**
+            //    （NSS bug 1902119，NSS 3.103：“reuse X25519 share when
+            //    offering both X25519 and Xyber768d00”）；本仓库的捕获模板
+            //    也逐字节印证：hybrid[1184..1216) == 0x001d 份额。真实
+            //    Firefox 两处恒等、我们两处恒不等，单条连接一次 32 字节
+            //    memcmp 即零误报判定。
+            //
+            // 现改为：每条连接生成**一个**真实 X25519 临时公钥，同时写入
+            // 0x001d 份额与每个混合份额的 X25519 半部。fail closed —— ring
+            // 生成失败时返回 Err，绝不回退到 `fill_bytes`：发出一个带判别
+            // 特征的 ClientHello 比连接失败更糟（与 §2.3「遇到不支持的组时
+            // fail closed」同一条理由）。
+            let x25519_public = generate_x25519_public_key().ok_or_else(|| {
+                anyhow::anyhow!("failed to generate the per-connection X25519 key_share")
+            })?;
+            let key_share = &mut out[self.key_share_range.clone()];
+            if key_share.len() != x25519_public.len() {
+                anyhow::bail!(
+                    "ClientHello key_share length must be 32 for X25519 injection: {}",
+                    key_share.len()
+                );
+            }
+            key_share.copy_from_slice(&x25519_public);
             for range in &self.auxiliary_key_share_ranges {
                 if range.end <= out.len() {
                     let share_data = &mut out[range.clone()];
@@ -94,22 +142,47 @@ impl ClientHelloTemplate {
                         // coefficient range on decode and alert
                         // illegal_parameter on random garbage, so the share
                         // must be structurally valid.
-                        fill_mlkem768_hybrid_share(share_data);
+                        fill_mlkem768_hybrid_share(share_data, &x25519_public);
                     } else if share_data.len() == 65 && share_data[0] == 0x04 {
                         // A 65-byte 0x04-prefixed share is an uncompressed SEC1
                         // P-256 point: emit a real public key so DPI point
                         // validation cannot tell the share apart from a genuine
-                        // key_share. Fall back to random fill if ring key
-                        // generation unexpectedly fails.
+                        // key_share.
+                        //
+                        // 此前 ring 生成失败时回退到 `rng.fill_bytes(&mut
+                        // share_data[1..])`，那同样是错的：64 个随机字节几乎
+                        // 必定不是合法 P-256 点，做点校验的服务器会回
+                        // illegal_parameter，而 DPI 只要验一次曲线方程就能
+                        // 零误报命中。改为 fail closed。
                         if !fill_p256_public_key(share_data) {
-                            rng.fill_bytes(&mut share_data[1..]);
+                            anyhow::bail!(
+                                "failed to generate the per-connection P-256 auxiliary key_share"
+                            );
                         }
                     } else if !share_data.is_empty() && share_data[0] == 0x04 {
+                        // 其他 0x04 前缀（P-384 97 B / P-521 133 B）只出现在
+                        // 自定义模板里；ring 不提供 P-521，这里仍是随机填充，
+                        // 因此这类份额也不是合法曲线点。内嵌 Firefox 预设不
+                        // 走这条分支，留作已知缺口。
                         rng.fill_bytes(&mut share_data[1..]);
                     } else {
                         rng.fill_bytes(share_data);
                     }
                 }
+            }
+            // GREASE ECH 的逐连接刷新。⚠️ 与上面的 X25519 结论**恰好相反**：
+            // 捕获模板的 `enc` 第 31 字节最高位是 1（0x98），真实 X25519 公钥
+            // 该位恒为 0 —— 也就是说 Firefox 的 GREASE ECH `enc` 本来就是均匀
+            // 随机字节，不是真实 HPKE 封装公钥（GREASE ECH 不做真实封装）。
+            // 所以这里必须 `fill_bytes`。后来的维护者请不要「顺手修正」成
+            // `fill_x25519_public_key`，那会**引入**一个判别特征。
+            // `payload` 冒充 AEAD 密文、`config_id` 真实 Firefox 逐连接随机，
+            // 两者同样是随机正确。cipher_suite 与所有长度字段不动（真实实现
+            // 在这两个维度上恒定，随机化它们本身就是判别特征）。
+            if let Some(ech) = &self.ech_grease_ranges {
+                out[ech.config_id] = rng.gen();
+                rng.fill_bytes(&mut out[ech.enc.clone()]);
+                rng.fill_bytes(&mut out[ech.payload.clone()]);
             }
         }
         let (random, session_id) = extract_client_hello_random_and_session_id(&mut out)
@@ -148,29 +221,49 @@ impl ClientHelloTemplate {
 /// server-side mod-q decode validation (OpenSSL 3.5+ alerts
 /// illegal_parameter on out-of-range coefficients) while remaining
 /// statistically indistinguishable from a real key.
-fn fill_mlkem768_hybrid_share(share_data: &mut [u8]) {
+///
+/// `x25519_public` 是本 ClientHello 的**唯一** X25519 临时公钥，同时也写在
+/// 0x001d 独立份额里 —— 见 `instantiate()` 中关于 NSS bug 1902119 的说明。
+/// 此前尾部 64 字节整段 `fill_bytes`，把本该是真实公钥的 [1184..1216) 也随机
+/// 化了；rho 是不透明种子，`fill_bytes` 才正确，故只有 [1152..1184) 保持随机。
+fn fill_mlkem768_hybrid_share(share_data: &mut [u8], x25519_public: &[u8; 32]) {
     const MLKEM768_Q: u16 = 3329;
-    debug_assert_eq!(share_data.len(), 1216);
+    /// ML-KEM-768 encapsulation key: 768 coefficients at 12 bits (1152 B) 后接
+    /// 32 字节 rho 种子。
+    const MLKEM768_THAT_LEN: usize = 1152;
+    const MLKEM768_EK_LEN: usize = MLKEM768_THAT_LEN + 32;
+    debug_assert_eq!(share_data.len(), MLKEM768_EK_LEN + 32);
     let mut rng = rand::thread_rng();
-    for chunk in share_data[..1152].chunks_exact_mut(3) {
+    for chunk in share_data[..MLKEM768_THAT_LEN].chunks_exact_mut(3) {
         let d0: u16 = rng.gen_range(0..MLKEM768_Q);
         let d1: u16 = rng.gen_range(0..MLKEM768_Q);
         chunk[0] = d0 as u8;
         chunk[1] = ((d0 >> 8) as u8) | (((d1 & 0x0F) as u8) << 4);
         chunk[2] = (d1 >> 4) as u8;
     }
-    // rho seed + X25519 public key: opaque random bytes.
-    rng.fill_bytes(&mut share_data[1152..]);
+    // rho seed: 真实 ek 里就是 32 字节不透明种子，均匀随机即正确。
+    rng.fill_bytes(&mut share_data[MLKEM768_THAT_LEN..MLKEM768_EK_LEN]);
+    // X25519 半部：真实公钥，且与 0x001d 份额同值。
+    share_data[MLKEM768_EK_LEN..].copy_from_slice(x25519_public);
+}
+
+/// 复用同一个 `SystemRandom`。此前 `fill_p256_public_key` /
+/// `fill_x25519_public_key` 每次调用都 `SystemRandom::new()`，而每条客户端连接
+/// 现在要做 1 次 X25519 + 1 次 P-256 生成（在连接建立路径上，由连接池摊销）。
+fn system_random() -> &'static ring::rand::SystemRandom {
+    static SYSTEM_RANDOM: OnceLock<ring::rand::SystemRandom> = OnceLock::new();
+    SYSTEM_RANDOM.get_or_init(ring::rand::SystemRandom::new)
 }
 
 /// Generate a real ephemeral P-256 public key into `share_data` (65-byte
 /// uncompressed SEC1 point, 0x04 prefix — the exact shape ring emits).
-/// Returns false on any failure so the caller can fall back to random fill.
+/// Returns false on any failure so the caller can fail closed — random bytes
+/// are not a valid curve point, so there is no acceptable fallback.
 pub(crate) fn fill_p256_public_key(share_data: &mut [u8]) -> bool {
-    let rng = ring::rand::SystemRandom::new();
-    let Ok(private_key) =
-        ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::ECDH_P256, &rng)
-    else {
+    let Ok(private_key) = ring::agreement::EphemeralPrivateKey::generate(
+        &ring::agreement::ECDH_P256,
+        system_random(),
+    ) else {
         return false;
     };
     let Ok(public_key) = private_key.compute_public_key() else {
@@ -195,21 +288,29 @@ pub(crate) fn fill_x25519_public_key(share_data: &mut [u8]) -> bool {
     if share_data.len() != 32 {
         return false;
     }
-    let rng = ring::rand::SystemRandom::new();
-    let Ok(private_key) =
-        ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::X25519, &rng)
-    else {
+    let Some(public) = generate_x25519_public_key() else {
         return false;
     };
-    let Ok(public_key) = private_key.compute_public_key() else {
-        return false;
-    };
+    share_data.copy_from_slice(&public);
+    true
+}
+
+/// 生成一个真实的 X25519 临时公钥。ClientHello 侧需要把同一个值写到多个份额
+/// 里（0x001d 与混合份额的 X25519 半部），所以这里返回值而不是就地填充。
+fn generate_x25519_public_key() -> Option<[u8; 32]> {
+    let private_key = ring::agreement::EphemeralPrivateKey::generate(
+        &ring::agreement::X25519,
+        system_random(),
+    )
+    .ok()?;
+    let public_key = private_key.compute_public_key().ok()?;
     let public_bytes = public_key.as_ref();
     if public_bytes.len() != 32 {
-        return false;
+        return None;
     }
-    share_data.copy_from_slice(public_bytes);
-    true
+    let mut out = [0u8; 32];
+    out.copy_from_slice(public_bytes);
+    Some(out)
 }
 
 pub fn get_or_build_client_hello_template(
@@ -321,6 +422,7 @@ fn build_client_hello_template(
         key_share_range: layout.key_share_range,
         auxiliary_key_share_ranges: layout.auxiliary_key_share_ranges,
         extensions_len_range: layout.extensions_len_range,
+        ech_grease_ranges: layout.ech_grease_ranges,
     }))
 }
 
@@ -342,17 +444,49 @@ pub fn invalidate_client_hello_template_cache() {
     }
 }
 
-/// Extensions removed from every ClientHello template at load time —
-/// embedded and custom hex alike. ECH (0xFE0D encrypted_client_hello,
-/// 0x014A), early_data (0x0119), use_srtp (0x001C) and 0x0022 are dropped:
-/// they either break interoperability with ordinary TLS 1.3 endpoints or
-/// carry no camouflage value for the probe/handshake.
-const STRIPPED_EXTENSION_TYPES: [u16; 5] = [0xFE0D, 0x014A, 0x0119, 0x001C, 0x0022];
+/// Extensions removed from every ClientHello template at load time — embedded
+/// and custom hex alike. **Empty by design.**
+///
+/// 此前这张表是 `[0xFE0D, 0x014A, 0x0119, 0x001C, 0x0022]`，于是内嵌模板从捕获
+/// 的 15 个扩展被剥成 12 个、1884 → 1579 字节。逐扩展重解捕获字节后，这张表
+/// 的每一条都站不住脚：
+///
+/// - `0x0119` / `0x014A` **在捕获里根本不存在**。它们是把 ECH 扩展头误读出来的
+///   产物：原始字节是 `fe 0d 01 19 | 00 00 01 00 01 4a 00 20 …`，其中 `0x0119`
+///   = 281 是 ECH 的 extension_length，`0x014a` 落在 ECH 结构体内部
+///   （`config_id=0x4a ‖ enc_len=0x0020`）。注释把 `0x0119` 标为 early_data 也
+///   是错的 —— early_data 是 `0x002A`。
+/// - `0x001C` 是 **record_size_limit** (RFC 8449)，不是注释里写的 use_srtp
+///   （use_srtp 是 `0x000E`）。捕获值 `4001` = 16385 = 2^14+1，正是 TLS 1.3
+///   TLSInnerPlaintext 的默认上限（RFC 8449 §4：该值含 content type 与 padding），
+///   也正好等于本项目的 `common::BLOCK_PLAINTEXT_SIZE`（16384 + 1）。换言之它
+///   不施加任何额外约束，双向都完全兼容：伪装端点按它限制记录尺寸的结果与不
+///   发这个扩展时一致，而这正是真实 Firefox 得到的待遇。
+/// - `0x0022` 是 **delegated_credentials** (RFC 9345)，extension_data
+///   `00080403050306030203` 是纯签名算法能力声明，无任何副作用。
+/// - `0xFE0D` 是 **GREASE ECH**。整份重放确实是跨连接常量，但正解是逐连接刷新
+///   `config_id`/`enc`/`payload`（见 [`EchGreaseRanges`] 与 `instantiate()`），
+///   而不是删除 —— 删掉它使上线扩展数变成 12 个，不对应任何已发布的 Firefox
+///   版本，JA4 的扩展计数与排序哈希直接失配。
+///
+/// 保留这套机制（而不是删掉函数）是因为它是唯一能在**自定义**模板里中和某个
+/// 无法处理的扩展、并同步重写记录/握手/扩展三处长度的地方。新增条目必须有
+/// 实测依据，不要凭猜测往里写。
+const STRIPPED_EXTENSION_TYPES: [u16; 0] = [];
 
 /// Return a copy of the ClientHello record with every extension in
 /// [`STRIPPED_EXTENSION_TYPES`] removed and all three length fields (record,
 /// handshake, extensions block) rewritten to stay self-consistent.
 fn strip_client_hello_extensions(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    strip_named_client_hello_extensions(bytes, &STRIPPED_EXTENSION_TYPES)
+}
+
+/// [`strip_client_hello_extensions`] 的实现，剥离集合作为参数传入，使剥离机制
+/// 本身可以在剥离表为空的情况下继续被测试覆盖。
+fn strip_named_client_hello_extensions(
+    bytes: &[u8],
+    stripped: &[u16],
+) -> anyhow::Result<Vec<u8>> {
     if bytes.len() < 9 || bytes[0] != 0x16 || bytes[5] != 0x01 {
         anyhow::bail!("template is not a TLS ClientHello record");
     }
@@ -388,7 +522,7 @@ fn strip_client_hello_extensions(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
         if ext_end > extensions_end {
             anyhow::bail!("truncated ClientHello extension {:#06x}", ext_type);
         }
-        if STRIPPED_EXTENSION_TYPES.contains(&ext_type) {
+        if stripped.contains(&ext_type) {
             removed += 4 + ext_len;
         } else {
             out.extend_from_slice(&bytes[ecursor..ext_end]);
@@ -439,33 +573,74 @@ fn ensure_padding_extension_data_zero(
     Ok(())
 }
 
+/// Rotate every RFC 8701 GREASE value in the ClientHello. Rotation only replaces
+/// the 2-byte value at each GREASE position, never a length or any content.
+///
+/// **对内嵌 Firefox 预设这条路径是 no-op。** 实测捕获模板
+/// （`FIREFOX_BOOTSTRAP_CLIENT_HELLO`，见 `firefox_template_has_no_grease_positions`）：
+/// cipher_suites 16 项、supported_groups 7 项、扩展类型 15 项、supported_versions
+/// 2 项，**GREASE 值 0 个**。Firefox/NSS 不在 ClientHello 里做 GREASE —— 那是
+/// Chrome/BoringSSL 的行为。此前这里的注释断言「Real Firefox/NSS uses a single
+/// GREASE value for every GREASE position within one ClientHello … and
+/// re-randomizes it per ClientHello」，两半都是错的：Firefox 根本不 GREASE，而
+/// 「所有位置同值」是 BoringSSL 明确避免的形状。该路径只对 `template_path`
+/// 提供的自定义模板（例如 Chrome 捕获）生效。
+///
+/// 此前所有 GREASE 位置被写入**同一个**值，于是对 Chrome 模板产生了两个问题：
+///
+/// 1. 不真实。BoringSSL 的 `ssl_get_grease_value` 从每连接 `grease_seed` 里按
+///    索引（cipher / group / extension1 / extension2 / version…）取**互相独立**
+///    的值，并对第二个 GREASE 扩展强制 `ret ^= 0x1010`，保证同一 ClientHello
+///    里两个 GREASE 扩展类型必不相同。
+/// 2. 不合法。RFC 8446 §4.2 要求同一 extension block 内不得出现两个相同类型的
+///    扩展；把两个 GREASE 扩展写成同值直接违反该条，严格的服务器会拒绝。
+///
+/// 现改为逐位置独立取值，并沿用 BoringSSL 的去重规则。归一化侧
+/// （`utils::normalize_client_hello_grease_positions`）把**任意** GREASE 值一律
+/// 置零，因此逐位置独立取值仍与指纹稳定性自洽。
 fn apply_client_hello_randomization(
     bytes: &mut [u8],
     cipher_suites_range: &Range<usize>,
     extensions_len_range: &Range<usize>,
 ) -> anyhow::Result<()> {
-    // Always rotate GREASE values per instantiation. GREASE rotation only
-    // replaces the 2-byte value at each GREASE position, never lengths or
-    // content. Real Firefox/NSS uses a single GREASE value for every GREASE
-    // position within one ClientHello (extension types, cipher_suites,
-    // supported_groups) and re-randomizes it per ClientHello; freezing it
-    // enables cross-deployment clustering.
     let mut rng = rand::thread_rng();
-    let grease_value = GREASE_VALUES[rng.gen_range(0..GREASE_VALUES.len())];
-    rotate_grease_extensions(bytes, extensions_len_range, grease_value)?;
-    rotate_grease_cipher_suites(bytes, cipher_suites_range, grease_value)?;
-    rotate_grease_supported_groups(bytes, extensions_len_range, grease_value)?;
+    rotate_grease_extensions(bytes, extensions_len_range, &mut rng)?;
+    rotate_grease_cipher_suites(bytes, cipher_suites_range, &mut rng)?;
+    rotate_grease_supported_groups(bytes, extensions_len_range, &mut rng)?;
+    rotate_grease_supported_versions(bytes, extensions_len_range, &mut rng)?;
 
     Ok(())
+}
+
+/// 取一个未被 `used` 占用的 GREASE 值。首选均匀随机；碰撞时先按 BoringSSL 的
+/// `ret ^= 0x1010` 翻转（GREASE 值形如 0xNANA，XOR 0x1010 后仍是合法 GREASE
+/// 值），再退化为线性扫描 —— 后者只有在自定义模板带 >2 个 GREASE 扩展时才会
+/// 触发，真实客户端里不存在。
+fn take_grease_value(rng: &mut impl Rng, used: &mut Vec<u16>) -> u16 {
+    let mut value = GREASE_VALUES[rng.gen_range(0..GREASE_VALUES.len())];
+    if used.contains(&value) {
+        let flipped = value ^ 0x1010;
+        if used.contains(&flipped) {
+            if let Some(free) = GREASE_VALUES.iter().find(|v| !used.contains(v)) {
+                value = *free;
+            }
+        } else {
+            value = flipped;
+        }
+    }
+    used.push(value);
+    value
 }
 
 fn rotate_grease_extensions(
     bytes: &mut [u8],
     extensions_len_range: &Range<usize>,
-    grease_value: u16,
+    rng: &mut impl Rng,
 ) -> anyhow::Result<()> {
     let mut cursor = extensions_len_range.end;
     let extensions_end = cursor + read_u16(bytes, extensions_len_range.start)? as usize;
+    // 扩展类型必须互不相同（RFC 8446 §4.2），因此按槽位独立取值并去重。
+    let mut used = Vec::new();
 
     while cursor + 4 <= extensions_end {
         let ext_type = read_u16(bytes, cursor)?;
@@ -475,7 +650,8 @@ fn rotate_grease_extensions(
             anyhow::bail!("truncated extension during GREASE rotation");
         }
         if is_grease_value(ext_type) {
-            bytes[cursor..cursor + 2].copy_from_slice(&grease_value.to_be_bytes());
+            let value = take_grease_value(rng, &mut used);
+            bytes[cursor..cursor + 2].copy_from_slice(&value.to_be_bytes());
         }
         cursor = ext_end;
     }
@@ -485,15 +661,17 @@ fn rotate_grease_extensions(
 fn rotate_grease_cipher_suites(
     bytes: &mut [u8],
     cipher_suites_range: &Range<usize>,
-    grease_value: u16,
+    rng: &mut impl Rng,
 ) -> anyhow::Result<()> {
     if cipher_suites_range.end > bytes.len() {
         anyhow::bail!("truncated cipher_suites during GREASE rotation");
     }
+    let mut used = Vec::new();
     let mut cursor = cipher_suites_range.start;
     while cursor + 2 <= cipher_suites_range.end {
         if is_grease_value(read_u16(bytes, cursor)?) {
-            bytes[cursor..cursor + 2].copy_from_slice(&grease_value.to_be_bytes());
+            let value = take_grease_value(rng, &mut used);
+            bytes[cursor..cursor + 2].copy_from_slice(&value.to_be_bytes());
         }
         cursor += 2;
     }
@@ -503,7 +681,7 @@ fn rotate_grease_cipher_suites(
 fn rotate_grease_supported_groups(
     bytes: &mut [u8],
     extensions_len_range: &Range<usize>,
-    grease_value: u16,
+    rng: &mut impl Rng,
 ) -> anyhow::Result<()> {
     const SUPPORTED_GROUPS_EXTENSION_TYPE: u16 = 0x000a;
     let Some(extension) = find_extension(bytes, extensions_len_range, SUPPORTED_GROUPS_EXTENSION_TYPE)? else {
@@ -515,10 +693,45 @@ fn rotate_grease_supported_groups(
     }
     let groups_len = read_u16(bytes, data_range.start)? as usize;
     let groups_end = (data_range.start + 2 + groups_len).min(data_range.end);
+    let mut used = Vec::new();
     let mut cursor = data_range.start + 2;
     while cursor + 2 <= groups_end {
         if is_grease_value(read_u16(bytes, cursor)?) {
-            bytes[cursor..cursor + 2].copy_from_slice(&grease_value.to_be_bytes());
+            let value = take_grease_value(rng, &mut used);
+            bytes[cursor..cursor + 2].copy_from_slice(&value.to_be_bytes());
+        }
+        cursor += 2;
+    }
+    Ok(())
+}
+
+/// 此前完全没有覆盖 supported_versions(0x002B)：Chrome/BoringSSL 在这里也放一个
+/// 独立的 GREASE 版本号，自定义 Chrome 模板的该值会被逐字节重放，成为跨连接
+/// 常量（原则 1）。`utils::normalize_client_hello_grease_positions` 同步新增了
+/// 该位置的置零，两侧必须成对存在，否则指纹会退化成每连接唯一。
+fn rotate_grease_supported_versions(
+    bytes: &mut [u8],
+    extensions_len_range: &Range<usize>,
+    rng: &mut impl Rng,
+) -> anyhow::Result<()> {
+    const SUPPORTED_VERSIONS_EXTENSION_TYPE: u16 = 0x002B;
+    let Some(extension) =
+        find_extension(bytes, extensions_len_range, SUPPORTED_VERSIONS_EXTENSION_TYPE)?
+    else {
+        return Ok(());
+    };
+    let data_range = extension.data_range;
+    if data_range.end > bytes.len() || data_range.end == data_range.start {
+        anyhow::bail!("truncated supported_versions during GREASE rotation");
+    }
+    let versions_len = bytes[data_range.start] as usize;
+    let versions_end = (data_range.start + 1 + versions_len).min(data_range.end);
+    let mut used = Vec::new();
+    let mut cursor = data_range.start + 1;
+    while cursor + 2 <= versions_end {
+        if is_grease_value(read_u16(bytes, cursor)?) {
+            let value = take_grease_value(rng, &mut used);
+            bytes[cursor..cursor + 2].copy_from_slice(&value.to_be_bytes());
         }
         cursor += 2;
     }
@@ -610,6 +823,7 @@ fn parse_client_hello_layout(bytes: &[u8]) -> anyhow::Result<ClientHelloLayout> 
     let mut sni_name_len_range = None;
     let mut key_share_range = None;
     let mut auxiliary_key_share_ranges = Vec::new();
+    let mut ech_grease_ranges = None;
 
     while cursor + 4 <= extensions_end {
         let ext_type = read_u16(bytes, cursor)?;
@@ -660,6 +874,9 @@ fn parse_client_hello_layout(bytes: &[u8]) -> anyhow::Result<ClientHelloLayout> 
                     share_cursor = share_end;
                 }
             }
+            ECH_EXTENSION_TYPE => {
+                ech_grease_ranges = Some(parse_ech_grease_ranges(bytes, ext_data, ext_end)?);
+            }
             _ => {}
         }
 
@@ -682,6 +899,65 @@ fn parse_client_hello_layout(bytes: &[u8]) -> anyhow::Result<ClientHelloLayout> 
             .ok_or_else(|| anyhow::anyhow!("failed to locate SNI list length"))?,
         sni_name_len_range: sni_name_len_range
             .ok_or_else(|| anyhow::anyhow!("failed to locate SNI hostname length"))?,
+        ech_grease_ranges,
+    })
+}
+
+/// 定位 GREASE ECH 里三个必须逐连接刷新的字段。
+///
+/// ECHClientHello（draft-ietf-tls-esni §5）：
+/// ```text
+/// type(1) = 0 (outer)
+///   ‖ cipher_suite { kdf_id(2) ‖ aead_id(2) }
+///   ‖ config_id(1)
+///   ‖ enc<0..2^16-1>
+///   ‖ payload<1..2^16-1>
+/// ```
+/// 捕获模板：`1 + 4 + 1 + (2+32) + (2+239) = 281` 字节，与 extension_length
+/// 精确吻合。
+///
+/// 解析失败即 `Err`（fail closed）：一个我们无法刷新的 ECH 扩展会被逐字节重放
+/// 到每条连接上，那正是 §2.3 所说的跨连接常量。让操作员在启动时就拿到错误，
+/// 而不是把这份指纹发上线。
+fn parse_ech_grease_ranges(
+    bytes: &[u8],
+    data_start: usize,
+    data_end: usize,
+) -> anyhow::Result<EchGreaseRanges> {
+    if data_end <= data_start {
+        anyhow::bail!("empty encrypted_client_hello extension_data");
+    }
+    if bytes[data_start] != 0 {
+        anyhow::bail!(
+            "unsupported ECHClientHello type {}: only outer(0) GREASE ECH carries \
+             per-connection variable fields",
+            bytes[data_start]
+        );
+    }
+    if data_end - data_start < 8 {
+        anyhow::bail!("truncated encrypted_client_hello extension");
+    }
+    let config_id = data_start + 5;
+    let enc_len = read_u16(bytes, data_start + 6)? as usize;
+    let enc_start = data_start + 8;
+    let enc_end = enc_start + enc_len;
+    if enc_end + 2 > data_end {
+        anyhow::bail!("truncated encrypted_client_hello enc field");
+    }
+    let payload_len = read_u16(bytes, enc_end)? as usize;
+    let payload_start = enc_end + 2;
+    let payload_end = payload_start + payload_len;
+    if payload_end != data_end {
+        anyhow::bail!(
+            "encrypted_client_hello payload length {} does not fill extension_data ({} bytes left)",
+            payload_len,
+            data_end.saturating_sub(payload_start)
+        );
+    }
+    Ok(EchGreaseRanges {
+        config_id,
+        enc: enc_start..enc_end,
+        payload: payload_start..payload_end,
     })
 }
 
@@ -846,12 +1122,12 @@ mod tests {
         None
     }
 
-    fn append_zero_padding_extension(bytes: &mut Vec<u8>, data_len: usize) {
+    fn append_extension(bytes: &mut Vec<u8>, ext_type: u16, data: &[u8]) {
         let layout = parse_client_hello_layout(bytes).unwrap();
-        let added_total = 4 + data_len;
-        bytes.extend_from_slice(&0x0015u16.to_be_bytes());
-        bytes.extend_from_slice(&(data_len as u16).to_be_bytes());
-        bytes.resize(bytes.len() + data_len, 0);
+        let added_total = 4 + data.len();
+        bytes.extend_from_slice(&ext_type.to_be_bytes());
+        bytes.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(data);
         adjust_handshake_lengths(
             bytes,
             &layout.record_len_range,
@@ -860,6 +1136,10 @@ mod tests {
             added_total,
         )
         .unwrap();
+    }
+
+    fn append_zero_padding_extension(bytes: &mut Vec<u8>, data_len: usize) {
+        append_extension(bytes, 0x0015, &vec![0u8; data_len]);
     }
 
     /// Intentional file side effect: writes a human-readable distribution
@@ -902,6 +1182,13 @@ mod tests {
 
         let instantiated_extensions_stable = instantiated_extension_lists.len() == 1;
         let ja3_extensions_stable = instantiated_ja3_extensions.len() == 1;
+        // 此前剥离 0x0022/0x001C/0xFE0D 使上线扩展从捕获的 15 个变成 12 个，
+        // 不对应任何已发布的 Firefox 版本，JA4 的扩展计数与排序哈希直接失配。
+        let extensions_match_capture =
+            instantiated_extension_lists.len() == 1 && {
+                let instantiated = instantiated_extension_lists.iter().next().unwrap();
+                *instantiated == format_extension_list(&original_extensions)
+            };
         let no_unexpected_firefox_padding = original_has_padding || firefox_padding_samples == 0;
         let no_firefox_micro_jumps = firefox_record_lengths.len() == 1;
 
@@ -924,6 +1211,7 @@ mod tests {
              - Original template extension list: `{}`\n\
              - Instantiated extension list: `{}`\n\
              - Extension list stable across instantiation: `{}`\n\
+             - Instantiated extension list identical to capture: `{}`\n\
              - Original template has padding(21): `{}`\n\
              - Instantiated padding(21) samples: `{}/{SAMPLES}`\n\
              - Padding status: `{}`\n\
@@ -936,6 +1224,7 @@ mod tests {
             format_extension_list(&original_extensions),
             instantiated_extension_list,
             instantiated_extensions_stable,
+            extensions_match_capture,
             original_has_padding,
             firefox_padding_samples,
             no_unexpected_firefox_padding,
@@ -954,6 +1243,12 @@ mod tests {
             instantiated_extensions_stable,
             "firefox/custom extension list changed: {:?}",
             instantiated_extension_lists
+        );
+        assert!(
+            extensions_match_capture,
+            "上线扩展列表必须与捕获逐项相同（JA3/JA4 门禁）：instantiated={:?} capture={}",
+            instantiated_extension_lists,
+            format_extension_list(&original_extensions)
         );
         assert!(
             no_unexpected_firefox_padding,
@@ -980,6 +1275,7 @@ mod tests {
             key_share_range: layout.key_share_range,
             auxiliary_key_share_ranges: layout.auxiliary_key_share_ranges,
             extensions_len_range: layout.extensions_len_range,
+            ech_grease_ranges: layout.ech_grease_ranges,
         }
     }
 
@@ -1148,6 +1444,7 @@ mod tests {
             key_share_range: 80..112,
             auxiliary_key_share_ranges: Vec::new(),
             extensions_len_range: 112..114,
+            ech_grease_ranges: None,
         };
         let derived_psk = [7u8; 32];
         use rand::RngCore;
@@ -1199,6 +1496,7 @@ mod tests {
             sni_ext_len_range: 30..32,
             sni_list_len_range: 34..36,
             sni_name_len_range: 37..39,
+            ech_grease_ranges: None,
         };
 
         set_sni_in_place(&mut bytes, &layout, "example.com").unwrap();
@@ -1223,39 +1521,62 @@ mod tests {
         assert!(get_or_build_client_hello_template("example.com", Some("chrome"), None, true).is_err());
     }
 
+    /// 捕获模板的 15 个扩展类型（顺序即上线顺序）。JA3 的扩展字段与 JA4 的扩展
+    /// 计数/排序哈希都直接由这张表决定，任何偏离都不再对应任何已发布的 Firefox。
+    const CAPTURED_EXTENSION_TYPES: [u16; 15] = [
+        0x0000, // server_name
+        0x0017, // extended_master_secret
+        0xff01, // renegotiation_info
+        0x000a, // supported_groups
+        0x000b, // ec_point_formats
+        0x0010, // application_layer_protocol_negotiation
+        0x0005, // status_request
+        0x0022, // delegated_credentials (RFC 9345)
+        0x0012, // signed_certificate_timestamp
+        0x0033, // key_share
+        0x002b, // supported_versions
+        0x000d, // signature_algorithms
+        0x001c, // record_size_limit (RFC 8449)
+        0x001b, // compress_certificate
+        0xfe0d, // encrypted_client_hello (GREASE ECH)
+    ];
+
+    /// 此前剥离表把捕获的 15 个扩展砍成 12 个（`0x0022` delegated_credentials、
+    /// `0x001C` record_size_limit、`0xFE0D` GREASE ECH），CH 长度 1884 → 1579。
+    /// 现在剥离表为空（依据见 [`STRIPPED_EXTENSION_TYPES`]），本测试固化「剥离
+    /// 对捕获模板是恒等变换」以及机制本身仍然自洽可用。
     #[test]
     fn strip_removes_target_extensions_and_keeps_lengths_consistent() {
         let stripped = strip_client_hello_extensions(FIREFOX_BOOTSTRAP_CLIENT_HELLO).unwrap();
-        assert!(stripped.len() < FIREFOX_BOOTSTRAP_CLIENT_HELLO.len());
-        let types = extension_types(&stripped);
-        for dropped in STRIPPED_EXTENSION_TYPES {
-            assert!(
-                !types.contains(&dropped),
-                "extension {:#06x} must be stripped",
-                dropped
-            );
-        }
-        // Kept fingerprint essentials.
-        for kept in [0x0000u16, 0x0033, 0x002B, 0x000D, 0x000A, 0x0010] {
-            assert!(
-                types.contains(&kept),
-                "extension {:#06x} must be preserved",
-                kept
-            );
-        }
+        assert_eq!(
+            stripped, FIREFOX_BOOTSTRAP_CLIENT_HELLO,
+            "剥离表为空，捕获模板必须逐字节不变"
+        );
+        assert_eq!(extension_types(&stripped), CAPTURED_EXTENSION_TYPES.to_vec());
         assert_eq!(read_u16(&stripped, 3).unwrap() as usize + 5, stripped.len());
         assert_eq!(read_u24(&stripped, 6).unwrap() + 9, stripped.len());
         // Layout must still parse: extensions block is self-consistent.
         parse_client_hello_layout(&stripped).unwrap();
+
+        // 机制自身仍须正确：给一个人工加了 use_srtp(0x000E) 的模板做剥离，
+        // 三处长度字段都要同步重写、扩展块仍自洽。
+        let mut with_extra = FIREFOX_BOOTSTRAP_CLIENT_HELLO.to_vec();
+        append_extension(&mut with_extra, 0x000E, &[0x00, 0x00]);
+        let removed = strip_named_client_hello_extensions(&with_extra, &[0x000E]).unwrap();
+        assert_eq!(removed, FIREFOX_BOOTSTRAP_CLIENT_HELLO);
+        assert_eq!(read_u16(&removed, 3).unwrap() as usize + 5, removed.len());
+        assert_eq!(read_u24(&removed, 6).unwrap() + 9, removed.len());
+        parse_client_hello_layout(&removed).unwrap();
         // Idempotent: stripping an already-clean template changes nothing.
-        let twice = strip_client_hello_extensions(&stripped).unwrap();
-        assert_eq!(stripped, twice);
+        let twice = strip_named_client_hello_extensions(&removed, &[0x000E]).unwrap();
+        assert_eq!(removed, twice);
     }
 
     #[test]
     fn mlkem768_hybrid_share_is_structurally_valid() {
+        let x25519 = [0x5au8; 32];
         let mut share = [0u8; 1216];
-        fill_mlkem768_hybrid_share(&mut share);
+        fill_mlkem768_hybrid_share(&mut share, &x25519);
         // Every 12-bit coefficient must be < q = 3329 (mod-q decode check
         // performed by ML-KEM-capable servers).
         for chunk in share[..1152].chunks_exact(3) {
@@ -1264,18 +1585,21 @@ mod tests {
             assert!(d0 < 3329, "coefficient {} out of range", d0);
             assert!(d1 < 3329, "coefficient {} out of range", d1);
         }
-        // rho + X25519 trailing bytes must not be all zero.
-        assert!(share[1152..].iter().any(|&b| b != 0));
-        // Two fills must differ (per-connection freshness).
+        // rho seed must be random, not all zero.
+        assert!(share[1152..1184].iter().any(|&b| b != 0));
+        // X25519 半部必须原样写入调用方传进来的公钥（与 0x001d 份额同值）。
+        assert_eq!(&share[1184..1216], &x25519);
+        // Two fills must differ in the ML-KEM/rho part (per-connection freshness).
         let mut other = [0u8; 1216];
-        fill_mlkem768_hybrid_share(&mut other);
-        assert_ne!(share, other);
+        fill_mlkem768_hybrid_share(&mut other, &x25519);
+        assert_ne!(share[..1184], other[..1184]);
     }
 
+    /// 自定义模板（这里就用捕获原样）必须与内嵌路径走同一套规范化。剥离表为空，
+    /// 因此上线扩展列表必须与捕获逐项相同 —— 此前这条测试断言的是「ECH 等被剥
+    /// 掉」，语义已随剥离表一起反转。
     #[test]
-    fn build_template_strips_custom_bytes() {
-        // A custom template (e.g. raw Firefox capture with ECH) must go
-        // through the same stripping path as the embedded one.
+    fn build_template_keeps_custom_bytes_extension_shape() {
         let template = get_or_build_client_hello_template(
             "custom-strip.example",
             Some("firefox"),
@@ -1287,17 +1611,13 @@ mod tests {
         let mut noise_init = [0u8; 48];
         noise_init[..32].fill(7);
         noise_init[32..48].fill(9);
-        let out = template
-            .instantiate(&derived_psk, &noise_init, 1)
-            .unwrap();
-        let types = extension_types(&out);
-        for dropped in STRIPPED_EXTENSION_TYPES {
-            assert!(
-                !types.contains(&dropped),
-                "custom template extension {:#06x} must be stripped",
-                dropped
-            );
-        }
+        let out = template.instantiate(&derived_psk, &noise_init, 1).unwrap();
+        assert_eq!(
+            extension_types(&out),
+            CAPTURED_EXTENSION_TYPES.to_vec(),
+            "自定义模板的扩展列表必须与捕获逐项相同"
+        );
+        assert!(STRIPPED_EXTENSION_TYPES.is_empty());
     }
 
     #[test]
@@ -1316,12 +1636,68 @@ mod tests {
 
         let _captured_layout = parse_client_hello_layout(FIREFOX_BOOTSTRAP_CLIENT_HELLO).unwrap();
 
-        let base_len = strip_client_hello_extensions(FIREFOX_BOOTSTRAP_CLIENT_HELLO)
-            .unwrap()
-            .len();
-        assert_eq!(out.len(), base_len);
+        // 剥离表为空 ⇒ 实例化长度只随 SNI 长度变化，与捕获的 1884 字节差值就是
+        // SNI 长度差。此前剥离 3 个扩展让 CH 变成 1579 字节。
+        let sni_delta = "example.com".len() as isize - "io-wiki.org".len() as isize;
+        assert_eq!(
+            out.len() as isize,
+            FIREFOX_BOOTSTRAP_CLIENT_HELLO.len() as isize + sni_delta
+        );
         assert_eq!(read_u16(&out, 3).unwrap() as usize + 5, out.len());
         assert_eq!(read_u24(&out, 6).unwrap() + 9, out.len());
+    }
+
+    /// **本任务最重要的回归门禁。** 实例化出的 ClientHello 必须与捕获的真实
+    /// Firefox ClientHello 逐字节相同，唯一允许不同的就是逐连接必须新鲜的那些
+    /// 字段。这一条同时把 JA3（cipher_suites / 扩展列表 / supported_groups /
+    /// ec_point_formats）与 JA4（扩展计数 + 排序哈希 + sigalg 哈希）钉在捕获值上。
+    ///
+    /// 用与捕获相同的 SNI（`io-wiki.org`）实例化，这样偏移不发生位移，可以直接
+    /// 逐字节比。
+    #[test]
+    fn instantiated_client_hello_matches_capture_outside_variable_fields() {
+        const CAPTURED_SNI: &str = "io-wiki.org";
+        let template =
+            get_or_build_client_hello_template(CAPTURED_SNI, Some("firefox"), None, true).unwrap();
+        let derived_psk = common::derive_psk(b"capture-identity-psk");
+        let mut noise_init = [0u8; 48];
+        noise_init[..32].fill(7);
+        noise_init[32..48].fill(9);
+        let out = template
+            .instantiate(&derived_psk, &noise_init, 1_700_000_000)
+            .unwrap();
+
+        assert_eq!(out.len(), FIREFOX_BOOTSTRAP_CLIENT_HELLO.len());
+        assert_eq!(
+            extension_types(&out),
+            extension_types(FIREFOX_BOOTSTRAP_CLIENT_HELLO),
+            "实例化的扩展类型列表必须与捕获逐项相同（顺序与类型都一致）"
+        );
+        assert_eq!(extension_types(&out), CAPTURED_EXTENSION_TYPES.to_vec());
+
+        let layout = parse_client_hello_layout(&out).unwrap();
+        let (random_range, session_id_range) =
+            client_hello_random_and_session_id_ranges(&out).unwrap();
+        let ech = layout
+            .ech_grease_ranges
+            .clone()
+            .expect("捕获模板必须带 GREASE ECH");
+        let mut variable = vec![random_range, session_id_range, layout.key_share_range.clone()];
+        variable.extend(layout.auxiliary_key_share_ranges.iter().cloned());
+        variable.push(ech.config_id..ech.config_id + 1);
+        variable.push(ech.enc.clone());
+        variable.push(ech.payload.clone());
+
+        let mut expected = FIREFOX_BOOTSTRAP_CLIENT_HELLO.to_vec();
+        let mut actual = out.clone();
+        for range in &variable {
+            expected[range.clone()].fill(0);
+            actual[range.clone()].fill(0);
+        }
+        assert_eq!(
+            actual, expected,
+            "除逐连接可变字段外，实例化的 ClientHello 必须与捕获逐字节相同"
+        );
     }
 
     #[test]
@@ -1336,9 +1712,12 @@ mod tests {
             .instantiate(&derived_psk, &noise_init, 1_700_000_000)
             .unwrap();
         let baseline_types = extension_types(&baseline);
-        let base_len = strip_client_hello_extensions(FIREFOX_BOOTSTRAP_CLIENT_HELLO)
-            .unwrap()
-            .len();
+        assert_eq!(
+            baseline_types,
+            CAPTURED_EXTENSION_TYPES.to_vec(),
+            "上线扩展列表必须是捕获的 15 个（此前被剥成 12 个，JA4 失配）"
+        );
+        let base_len = baseline.len();
 
         for _ in 0..100 {
             let out = template
@@ -1517,6 +1896,22 @@ mod tests {
             }
         }
 
+        // supported_versions 的列表长度是 u8（不同于 supported_groups 的 u16）。
+        if let Some(extension) = find_extension(bytes, &layout.extensions_len_range, 0x002b).unwrap()
+        {
+            let versions_len = bytes[extension.data_range.start] as usize;
+            let versions_end =
+                (extension.data_range.start + 1 + versions_len).min(extension.data_range.end);
+            let mut cursor = extension.data_range.start + 1;
+            while cursor + 2 <= versions_end {
+                let value = read_u16(bytes, cursor).unwrap();
+                if is_grease_value(value) {
+                    values.push(value);
+                }
+                cursor += 2;
+            }
+        }
+
         values
     }
 
@@ -1553,13 +1948,52 @@ mod tests {
             .expect("instantiated P-256 share must be a valid curve point");
     }
 
+    /// 实测：捕获的 Firefox ClientHello 里 GREASE 值 **0 个**（cipher_suites 16
+    /// 项、supported_groups 7 项、扩展类型 15 项、supported_versions 2 项，全无
+    /// 0x?A?A 形态的值）。Firefox/NSS 不在 ClientHello 做 GREASE，那是
+    /// Chrome/BoringSSL 的行为。此前 `apply_client_hello_randomization` 的注释断言
+    /// 「Real Firefox/NSS uses a single GREASE value for every GREASE position …」，
+    /// 与实测相反。本测试把「Firefox 不 GREASE」这个事实固化下来 —— 顺带说明
+    /// GREASE 轮换路径对默认预设完全无作用，只对自定义模板生效。
     #[test]
-    fn grease_positions_rotate_to_single_per_connection_value() {
+    fn firefox_template_has_no_grease_positions() {
+        assert!(
+            instantiated_grease_values(FIREFOX_BOOTSTRAP_CLIENT_HELLO).is_empty(),
+            "捕获的 Firefox ClientHello 必须不含任何 GREASE 值"
+        );
+        let template =
+            get_or_build_client_hello_template("example.com", Some("firefox"), None, true).unwrap();
+        let derived_psk = common::derive_psk(b"firefox-no-grease-psk");
+        let mut noise_init = [0u8; 48];
+        noise_init[..32].fill(7);
+        noise_init[32..48].fill(9);
+        let out = template
+            .instantiate(&derived_psk, &noise_init, 1_700_000_000)
+            .unwrap();
+        assert!(
+            instantiated_grease_values(&out).is_empty(),
+            "实例化不得凭空引入 GREASE 值：Firefox 在此维度上恒定，随机化本身就是特征"
+        );
+    }
+
+    /// GREASE 轮换的语义已从「一条 ClientHello 内所有位置同值」**反转**为「逐位置
+    /// 独立取值」。依据：BoringSSL 的 `ssl_get_grease_value` 从每连接 grease_seed
+    /// 里按索引（cipher / group / extension1 / extension2 / version）取互相独立的
+    /// 值，并对第二个 GREASE 扩展强制 `ret ^= 0x1010`，保证同一 ClientHello 里两个
+    /// GREASE 扩展类型必不相同 —— 后者同时也是 RFC 8446 §4.2 的硬要求（同一
+    /// extension block 内不得有重复类型）。把所有位置写成同值既不像 Chrome，也会
+    /// 产出非法的 ClientHello。
+    ///
+    /// 该测试跑在人工构造的字节数组上：内嵌 Firefox 模板不含 GREASE（见
+    /// `firefox_template_has_no_grease_positions`），这条路径只覆盖自定义模板。
+    #[test]
+    fn grease_positions_rotate_independently_per_connection() {
         let mut bytes = FIREFOX_BOOTSTRAP_CLIENT_HELLO.to_vec();
         let layout = parse_client_hello_layout(&bytes).unwrap();
 
         // Inject one GREASE value per position class (same-length patches):
-        // cipher_suites[0], supported_groups[0], and one extension type slot.
+        // cipher_suites[0], supported_groups[0], supported_versions[0], and two
+        // extension type slots (BoringSSL emits exactly two GREASE extensions).
         bytes[layout.cipher_suites_range.start..layout.cipher_suites_range.start + 2]
             .copy_from_slice(&0x0A0Au16.to_be_bytes());
         let groups_extension = find_extension(&bytes, &layout.extensions_len_range, 0x000a)
@@ -1568,11 +2002,19 @@ mod tests {
         let first_group_offset = groups_extension.data_range.start + 2;
         bytes[first_group_offset..first_group_offset + 2]
             .copy_from_slice(&0x1A1Au16.to_be_bytes());
-        let ems_extension = find_extension(&bytes, &layout.extensions_len_range, 0x0017)
+        let versions_extension = find_extension(&bytes, &layout.extensions_len_range, 0x002b)
             .unwrap()
-            .expect("firefox template must carry extended_master_secret");
-        let ems_type_offset = ems_extension.data_range.start - 4;
-        bytes[ems_type_offset..ems_type_offset + 2].copy_from_slice(&0x2A2Au16.to_be_bytes());
+            .expect("firefox template must carry supported_versions");
+        let first_version_offset = versions_extension.data_range.start + 1;
+        bytes[first_version_offset..first_version_offset + 2]
+            .copy_from_slice(&0x3A3Au16.to_be_bytes());
+        for (ext_type, grease) in [(0x0017u16, 0x2A2Au16), (0x0012u16, 0x4A4Au16)] {
+            let extension = find_extension(&bytes, &layout.extensions_len_range, ext_type)
+                .unwrap()
+                .unwrap_or_else(|| panic!("firefox template must carry {:#06x}", ext_type));
+            let type_offset = extension.data_range.start - 4;
+            bytes[type_offset..type_offset + 2].copy_from_slice(&grease.to_be_bytes());
+        }
 
         let template = template_from_bytes(bytes);
         let derived_psk = common::derive_psk(b"grease-rotation-psk");
@@ -1580,41 +2022,316 @@ mod tests {
         noise_init[..32].fill(7);
         noise_init[32..48].fill(9);
 
-        let grease_value_of = |counter: u64| {
+        // 每次实例化：5 个 GREASE 位置全部保持合法 GREASE 值，两个 GREASE 扩展
+        // 类型互不相同（RFC 8446 §4.2 + BoringSSL 的 ^0x1010 规则）。
+        let sample = |counter: u64| {
             let out = template
                 .instantiate(&derived_psk, &noise_init, counter)
                 .unwrap();
             let values = instantiated_grease_values(&out);
             assert_eq!(
                 values.len(),
-                3,
-                "expected GREASE at all three injected positions, got {:?}",
+                5,
+                "expected GREASE at all five injected positions, got {:?}",
                 values
             );
-            let first = values[0];
-            assert!(
-                GREASE_VALUES.contains(&first),
-                "rotated GREASE value {:#06x} must stay a valid GREASE value",
-                first
+            for value in &values {
+                assert!(
+                    GREASE_VALUES.contains(value),
+                    "rotated GREASE value {:#06x} must stay a valid GREASE value",
+                    value
+                );
+            }
+            let ext_values: Vec<u16> = extension_types(&out)
+                .into_iter()
+                .filter(|t| is_grease_value(*t))
+                .collect();
+            assert_eq!(ext_values.len(), 2);
+            assert_ne!(
+                ext_values[0], ext_values[1],
+                "同一 ClientHello 内两个 GREASE 扩展类型必须不同（RFC 8446 §4.2）"
             );
-            assert!(
-                values.iter().all(|&value| value == first),
-                "all GREASE positions must share one value per ClientHello: {:?}",
-                values
-            );
-            first
+            // 归一化必须能抹平任意 GREASE 取值 —— 逐位置独立取值与指纹稳定性
+            // 自洽的前提。
+            values
         };
 
-        let first = grease_value_of(1_700_000_000);
-        let mut second = grease_value_of(1_700_000_001);
-        if second == first {
-            // 1/16 collision chance per draw; retry once before failing.
-            second = grease_value_of(1_700_000_002);
+        // 逐连接重新取值。此前这条断言只重试一次，两次撞上同一个值的概率不可
+        // 忽略（16 个候选、多个位置，实测约 1/256 偶发变红）。现在按位置聚合
+        // 多轮采样：只要任一位置在若干轮中出现过 ≥2 个不同取值即证明重新随机
+        // 化；32 轮里某个位置全程恒定的概率是 16^-31，不可能偶发。
+        const ROUNDS: usize = 32;
+        let mut observed: Vec<BTreeSet<u16>> = vec![BTreeSet::new(); 5];
+        for round in 0..ROUNDS {
+            let values = sample(1_700_000_000 + round as u64);
+            for (slot, value) in values.into_iter().enumerate() {
+                observed[slot].insert(value);
+            }
         }
-        assert_ne!(
-            first, second,
-            "GREASE value must be re-randomized across connections"
+        for (slot, values) in observed.iter().enumerate() {
+            assert!(
+                values.len() > 1,
+                "GREASE 位置 {} 在 {} 轮里恒为 {:?}，必须逐连接重新随机化",
+                slot,
+                ROUNDS,
+                values
+            );
+        }
+    }
+
+    /// GREASE 归一化必须把任意取值抹平，否则逐位置独立取值会让指纹每连接唯一。
+    #[test]
+    fn grease_rotation_stays_fingerprint_invariant() {
+        let mut bytes = FIREFOX_BOOTSTRAP_CLIENT_HELLO.to_vec();
+        let layout = parse_client_hello_layout(&bytes).unwrap();
+        bytes[layout.cipher_suites_range.start..layout.cipher_suites_range.start + 2]
+            .copy_from_slice(&0x0A0Au16.to_be_bytes());
+        let versions_extension = find_extension(&bytes, &layout.extensions_len_range, 0x002b)
+            .unwrap()
+            .unwrap();
+        let first_version_offset = versions_extension.data_range.start + 1;
+        bytes[first_version_offset..first_version_offset + 2]
+            .copy_from_slice(&0x3A3Au16.to_be_bytes());
+        let ems_extension = find_extension(&bytes, &layout.extensions_len_range, 0x0017)
+            .unwrap()
+            .unwrap();
+        let ems_type_offset = ems_extension.data_range.start - 4;
+        bytes[ems_type_offset..ems_type_offset + 2].copy_from_slice(&0x2A2Au16.to_be_bytes());
+
+        let template = template_from_bytes(bytes);
+        let derived_psk = common::derive_psk(b"grease-fingerprint-psk");
+        let mut noise_init = [0u8; 48];
+        noise_init[..32].fill(7);
+        noise_init[32..48].fill(9);
+
+        let mut fingerprints = BTreeSet::new();
+        for counter in 0..32u64 {
+            let out = template
+                .instantiate(&derived_psk, &noise_init, counter + 1)
+                .unwrap();
+            fingerprints.insert(
+                stable_client_hello_fingerprint(&out).expect("fingerprint GREASE template"),
+            );
+        }
+        assert_eq!(
+            fingerprints.len(),
+            1,
+            "GREASE 逐位置独立取值后，归一化后的指纹仍必须跨连接唯一稳定"
         );
+    }
+
+    /// **C18 回归门禁。** 此前 0x001d 主份额与混合份额尾部 32 字节都用
+    /// `fill_bytes` 填充，于是每条连接在 ClientHello 里泄漏可判别的比特：真实
+    /// X25519 公钥是 mod 2^255-19 归约后的 u 坐标，小端序下 byte 31 最高位恒为 0，
+    /// 而均匀随机字节有一半概率置位。误报率严格为 0，censor 每流只需读 1–2 字节。
+    ///
+    /// 注意：ring 的 X25519 `agree_ephemeral` 对任意 32 字节对端公钥都接受、不做
+    /// 任何校验（不同于 P-256 的点校验），所以这里没有「用 ECDH 成功证明合法」
+    /// 这条路 —— MSB 断言才是真正有效的检验。N 次采样偶然全部通过的概率是 2^-N。
+    #[test]
+    fn instantiated_x25519_key_shares_have_msb_clear_and_are_fresh() {
+        const SAMPLES: usize = 64;
+        let template =
+            get_or_build_client_hello_template("example.com", Some("firefox"), None, true).unwrap();
+        let derived_psk = common::derive_psk(b"x25519-msb-psk");
+        let mut noise_init = [0u8; 48];
+        noise_init[..32].fill(7);
+        noise_init[32..48].fill(9);
+
+        let mut main_shares = BTreeSet::new();
+        let mut hybrid_tails = BTreeSet::new();
+        for sample in 0..SAMPLES {
+            let out = template
+                .instantiate(&derived_psk, &noise_init, sample as u64 + 1)
+                .unwrap();
+            let layout = parse_client_hello_layout(&out).unwrap();
+
+            let main = out[layout.key_share_range.clone()].to_vec();
+            assert_eq!(main.len(), 32);
+            assert_eq!(
+                main[31] & 0x80,
+                0,
+                "sample {}: 0x001d key_share byte 31 MSB set — 真实 X25519 公钥该位恒为 0",
+                sample
+            );
+
+            let hybrid_range = layout
+                .auxiliary_key_share_ranges
+                .iter()
+                .find(|range| range.end - range.start == 1216)
+                .expect("firefox template must carry a 1216-byte X25519MLKEM768 share");
+            let hybrid = &out[hybrid_range.clone()];
+            let tail = hybrid[1184..1216].to_vec();
+            assert_eq!(
+                tail[31] & 0x80,
+                0,
+                "sample {}: hybrid share[1215] MSB set — [1184..1216) 必须是真实 X25519 公钥",
+                sample
+            );
+
+            // 真实 Firefox 在同时提供 x25519 与 X25519MLKEM768 时复用同一个 X25519
+            // 密钥对（NSS bug 1902119 / NSS 3.103），捕获模板逐字节印证。两处独立
+            // 生成会让「两份额不相等」成为单连接、零误报的判别特征。
+            assert_eq!(
+                tail, main,
+                "sample {}: 混合份额的 X25519 半部必须与 0x001d 份额同值",
+                sample
+            );
+
+            // ML-KEM 系数段必须仍全部落在 [0, 3329)。
+            for chunk in hybrid[..1152].chunks_exact(3) {
+                let d0 = chunk[0] as u16 | (((chunk[1] & 0x0F) as u16) << 8);
+                let d1 = ((chunk[1] >> 4) as u16) | ((chunk[2] as u16) << 4);
+                assert!(d0 < 3329 && d1 < 3329, "ML-KEM coefficient out of range");
+            }
+
+            main_shares.insert(main);
+            hybrid_tails.insert(tail);
+        }
+
+        // 不能为了修 MSB 而退化成常量 —— 那会触发「能被稳定识别 = 会被封」。
+        assert_eq!(
+            main_shares.len(),
+            SAMPLES,
+            "0x001d key_share 必须逐连接不同"
+        );
+        assert_eq!(
+            hybrid_tails.len(),
+            SAMPLES,
+            "混合份额的 X25519 半部必须逐连接不同"
+        );
+    }
+
+    /// 捕获模板的 ECH `enc` 第 31 字节最高位是 1（0x98），真实 X25519 公钥该位恒为
+    /// 0 —— 也就是说 Firefox 的 GREASE ECH `enc` 是均匀随机字节，不是真实 HPKE
+    /// 封装公钥。本测试把这个反直觉的事实固化：`enc` 上不得出现 MSB 恒清零的偏置
+    /// （那正是「顺手改成 fill_x25519_public_key」会引入的特征）。
+    #[test]
+    fn ech_grease_fields_are_uniform_random_not_x25519_keys() {
+        const SAMPLES: usize = 128;
+        let template =
+            get_or_build_client_hello_template("example.com", Some("firefox"), None, true).unwrap();
+        let derived_psk = common::derive_psk(b"ech-grease-psk");
+        let mut noise_init = [0u8; 48];
+        noise_init[..32].fill(7);
+        noise_init[32..48].fill(9);
+
+        let captured_layout = parse_client_hello_layout(FIREFOX_BOOTSTRAP_CLIENT_HELLO).unwrap();
+        let captured_ech = captured_layout
+            .ech_grease_ranges
+            .clone()
+            .expect("捕获模板必须带 GREASE ECH");
+        assert_eq!(captured_ech.enc.end - captured_ech.enc.start, 32);
+        assert_eq!(captured_ech.payload.end - captured_ech.payload.start, 239);
+        assert_ne!(
+            FIREFOX_BOOTSTRAP_CLIENT_HELLO[captured_ech.enc.end - 1] & 0x80,
+            0,
+            "捕获的 ECH enc byte 31 最高位是 1 —— 它不是真实 X25519 公钥"
+        );
+
+        let mut enc_msb_set = 0usize;
+        let mut config_ids = BTreeSet::new();
+        let mut encs = BTreeSet::new();
+        let mut payloads = BTreeSet::new();
+        for sample in 0..SAMPLES {
+            let out = template
+                .instantiate(&derived_psk, &noise_init, sample as u64 + 1)
+                .unwrap();
+            let layout = parse_client_hello_layout(&out).unwrap();
+            let ech = layout.ech_grease_ranges.clone().expect("ECH must survive");
+            // cipher_suite（kdf‖aead）与所有长度字段必须恒定 —— 真实端点的 HPKE
+            // 套件是编译期常量，随机化它本身就是判别特征。
+            assert_eq!(out[ech.config_id - 5], 0, "ECHClientHello.type 必须恒为 outer(0)");
+            assert_eq!(&out[ech.config_id - 4..ech.config_id], &[0x00, 0x01, 0x00, 0x01]);
+            assert_eq!(ech.enc.end - ech.enc.start, 32);
+            assert_eq!(ech.payload.end - ech.payload.start, 239);
+
+            if out[ech.enc.end - 1] & 0x80 != 0 {
+                enc_msb_set += 1;
+            }
+            config_ids.insert(out[ech.config_id]);
+            encs.insert(out[ech.enc.clone()].to_vec());
+            payloads.insert(out[ech.payload.clone()].to_vec());
+        }
+
+        // 均匀随机 ⇒ 期望 SAMPLES/2 次置位。真实密钥会给 0；容差远宽于噪声。
+        assert!(
+            enc_msb_set > SAMPLES / 8 && enc_msb_set < SAMPLES * 7 / 8,
+            "ECH enc byte 31 MSB 在 {}/{} 个样本中置位 —— GREASE ECH 的 enc 必须是均匀\
+             随机字节，任何偏置（尤其是恒为 0，即误用真实 X25519 公钥）都是特征",
+            enc_msb_set,
+            SAMPLES
+        );
+        assert_eq!(encs.len(), SAMPLES, "ECH enc 必须逐连接刷新");
+        assert_eq!(payloads.len(), SAMPLES, "ECH payload 必须逐连接刷新");
+        assert!(
+            config_ids.len() > 32,
+            "ECH config_id 必须逐连接随机（{} 个不同值 / {} 样本）",
+            config_ids.len(),
+            SAMPLES
+        );
+    }
+
+    /// **2c 强耦合门禁。** ECH 的三个字段逐连接刷新，若指纹归一化不同步扩展，
+    /// 每条连接的稳定指纹都会不同 ⇒ 服务端按指纹 key 的伪装 profile 缓存退化成
+    /// 每连接一条 ⇒ 每条客户端连接都触发一次对伪装端点的实时 fetch（既是性能
+    /// 回退，也是一个新的可观测行为）。
+    #[test]
+    fn stable_fingerprint_is_invariant_across_ech_refresh() {
+        const SAMPLES: usize = 32;
+        let template =
+            get_or_build_client_hello_template("example.com", Some("firefox"), None, true).unwrap();
+        let derived_psk = common::derive_psk(b"ech-fingerprint-psk");
+        let mut noise_init = [0u8; 48];
+        noise_init[..32].fill(7);
+        noise_init[32..48].fill(9);
+
+        let mut fingerprints = BTreeSet::new();
+        let mut ech_fields = BTreeSet::new();
+        for sample in 0..SAMPLES {
+            let out = template
+                .instantiate(&derived_psk, &noise_init, sample as u64 + 1)
+                .unwrap();
+            let layout = parse_client_hello_layout(&out).unwrap();
+            let ech = layout.ech_grease_ranges.clone().unwrap();
+            ech_fields.insert(out[ech.config_id..ech.payload.end].to_vec());
+            fingerprints
+                .insert(stable_client_hello_fingerprint(&out).expect("fingerprint with ECH"));
+        }
+        assert_eq!(
+            ech_fields.len(),
+            SAMPLES,
+            "前提：ECH 字段确实逐连接变化，否则本测试无意义"
+        );
+        assert_eq!(
+            fingerprints.len(),
+            1,
+            "ECH 存在时，多次 instantiate 的 stable_client_hello_fingerprint 必须完全相同"
+        );
+    }
+
+    /// ECH 归一化只允许动 `config_id`/`enc`/`payload`，长度字段与 cipher_suite 必须
+    /// 原样保留 —— 长度自洽被破坏会让整条记录无法解析，抹平 cipher_suite 则丢失
+    /// 真实的指纹信息。
+    #[test]
+    fn malformed_ech_extension_is_rejected_at_template_build() {
+        // enc_len 被改成 33，payload 长度便无法填满 extension_data。
+        let mut bytes = FIREFOX_BOOTSTRAP_CLIENT_HELLO.to_vec();
+        let layout = parse_client_hello_layout(&bytes).unwrap();
+        let ech = layout.ech_grease_ranges.clone().unwrap();
+        let enc_len_offset = ech.enc.start - 2;
+        write_u16(&mut bytes, enc_len_offset..enc_len_offset + 2, 33).unwrap();
+        let err = parse_client_hello_layout(&bytes).unwrap_err();
+        assert!(
+            err.to_string().contains("encrypted_client_hello"),
+            "无法刷新的 ECH 必须在模板构建期 fail closed，而不是逐字节重放：{}",
+            err
+        );
+
+        // 非 outer(0) 类型同样 fail closed：inner(1) 没有可刷新的字段。
+        let mut inner = FIREFOX_BOOTSTRAP_CLIENT_HELLO.to_vec();
+        inner[ech.config_id - 5] = 1;
+        assert!(parse_client_hello_layout(&inner).is_err());
     }
 
     #[test]

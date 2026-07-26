@@ -281,6 +281,225 @@ fn ghost_record_sizes_match_the_replayed_profile() {
     assert_eq!(observed, sizes);
 }
 
+/// 构造一个只关心时间轴的 profile（尺寸字段取合法占位值）。
+fn timing_profile(first_delay_us: u32, gaps_us: Vec<u32>) -> super::camouflage::CamouflageProfile {
+    super::camouflage::CamouflageProfile {
+        server_records: std::sync::Arc::from(vec![].into_boxed_slice()),
+        prefix_app_data_sizes: vec![],
+        app_data_sizes: std::sync::Arc::from(vec![].into_boxed_slice()),
+        first_app_data_size: None,
+        early_app_data_count: 0,
+        has_ccs: true,
+        visible_server_record_count: 2,
+        first_app_data_delay_us: first_delay_us,
+        early_app_data_gap_us: gaps_us,
+    }
+}
+
+/// 写批次的划分必须只由**采样到的真实间隔**驱动，且下标映射不得 off-by-one。
+///
+/// 此前只有 Noise/ghost 记录那一段循环做合批；`ServerHello+CCS ↔ 首条 app-data`
+/// 的接缝、以及每两条前置小记录之间都是各自独立的 `write_all + flush`。socket
+/// 开了 TCP_NODELAY，于是即使采样到的间隔是 0，这些位置也**恒定**落在不同的
+/// TCP 分段里——真实 TLS 1.3 服务端把 SH|CCS|EE|CERT|CV|FIN 连续突发写出、由
+/// 内核按 MSS 分段，记录边界与分段边界并不对齐。
+///
+/// 合并两段后下标轴只剩一条，本测试正是为了固定那次重新推导的结果。
+#[test]
+fn replay_burst_breaks_only_on_sampled_significant_gaps() {
+    use super::camouflage::{replay_gap_before_us, SIGNIFICANT_REPLAY_GAP_US};
+
+    // early_app_data_gap_us[j] 紧接在第 j 条 app-data 之后，因此第 idx 条
+    // 之前的间隔是 gap[idx-1]；第 0 条之前的是 first_app_data_delay_us。
+    let profile = timing_profile(1_200, vec![0, 40_000, 900, 7_500]);
+    assert_eq!(replay_gap_before_us(&profile, 0), 1_200);
+    assert_eq!(replay_gap_before_us(&profile, 1), 0);
+    assert_eq!(replay_gap_before_us(&profile, 2), 40_000);
+    assert_eq!(replay_gap_before_us(&profile, 3), 900);
+    assert_eq!(replay_gap_before_us(&profile, 4), 7_500);
+    // 采样到的 gap 少于记录数时并入同一次突发，不得 panic。
+    assert_eq!(replay_gap_before_us(&profile, 5), 0);
+    assert_eq!(replay_gap_before_us(&profile, 99), 0);
+
+    // 以上时间轴对应 6 条 app-data 记录 → 恰好 3 次 write+flush：
+    //   [SH+CCS, rec0, rec1] | [rec2] | [rec3, rec4, rec5]
+    // 断点只落在 40_000µs 与 7_500µs 两处，1_200µs / 0 / 900µs 全部合批。
+    let breaks: Vec<usize> = (0..6)
+        .filter(|&idx| replay_gap_before_us(&profile, idx) >= SIGNIFICANT_REPLAY_GAP_US)
+        .collect();
+    assert_eq!(
+        breaks,
+        vec![2, 4],
+        "batch boundaries must track the sampled gaps, not the record boundaries"
+    );
+
+    // 全零时间轴（真实端点的常见情形）必须产生**恰好一次**写：任何断点都是
+    // 我们自己凭空造出来的分段边界。
+    let burst_profile = timing_profile(0, vec![0, 0, 0]);
+    assert!(
+        (0..4).all(|idx| replay_gap_before_us(&burst_profile, idx) < SIGNIFICANT_REPLAY_GAP_US),
+        "a flight sampled with zero inter-record gaps must be replayed as one burst"
+    );
+
+    // 阈值本身不带随机抖动：断点位置由真实测量值决定，而不是由随机数决定。
+    // （真实端点的突发形态是确定的；在这个维度上随机化本身就是判别特征。）
+    let boundary = timing_profile(SIGNIFICANT_REPLAY_GAP_US, vec![SIGNIFICANT_REPLAY_GAP_US - 1]);
+    for _ in 0..64 {
+        assert!(replay_gap_before_us(&boundary, 0) >= SIGNIFICANT_REPLAY_GAP_US);
+        assert!(replay_gap_before_us(&boundary, 1) < SIGNIFICANT_REPLAY_GAP_US);
+    }
+}
+
+/// 跑一遍真正的合成回放发送路径，返回 (完整字节流, app-data payload 区间)。
+///
+/// 通过预置一个 rank-3 缓存 profile 让 `fetch_camouflage_flight` 直接命中缓存，
+/// 因此不产生任何网络 I/O。
+async fn replay_flight_over_socket(
+    host: &str,
+    prefix_sizes: Vec<usize>,
+    app_data_sizes: Vec<usize>,
+) -> (Vec<u8>, Vec<std::ops::Range<usize>>) {
+    use super::camouflage::{
+        camouflage_profile_key, establish_synthetic_camouflage_tunnel, store_camouflage_profile,
+        CamouflageProfile,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let template =
+        crate::template::get_or_build_client_hello_template(host, Some("firefox"), None, true)
+            .unwrap();
+    let (noise, derived_psk) = responder_handshake();
+    let client_noise_tag = [0x5au8; 16];
+    let client_hello = template.instantiate(&derived_psk, &[7u8; 48], 1).unwrap();
+
+    let fingerprint = crate::utils::stable_client_hello_fingerprint(&client_hello).unwrap();
+    // 缓存的 ServerHello 必须回显 32 字节 session_id（模板 CH 的长度）。
+    let server_records = synthetic_server_hello(0x001D, 32);
+    let server_records_len = server_records.len();
+    let gaps = vec![0u32; app_data_sizes.len().saturating_sub(1)];
+    store_camouflage_profile(
+        camouflage_profile_key(host, 443, &hex::encode(fingerprint)),
+        CamouflageProfile {
+            server_records: std::sync::Arc::from(server_records.into_boxed_slice()),
+            prefix_app_data_sizes: prefix_sizes.clone(),
+            first_app_data_size: app_data_sizes.first().copied(),
+            early_app_data_count: app_data_sizes.len() as u8,
+            has_ccs: true,
+            visible_server_record_count: 1,
+            first_app_data_delay_us: 0,
+            early_app_data_gap_us: gaps,
+            app_data_sizes: std::sync::Arc::from(app_data_sizes.clone().into_boxed_slice()),
+        },
+    )
+    .await;
+
+    let expected_len = server_records_len
+        + app_data_sizes
+            .iter()
+            .map(|&size| TLS_RECORD_HEADER_LEN + size)
+            .sum::<usize>();
+
+    let (mut client, mut server) = connected_pair().await;
+    let mut state = Some(noise);
+    let replay_host = host.to_owned();
+    let server_task = tokio::spawn(async move {
+        establish_synthetic_camouflage_tunnel(
+            &mut server,
+            &client_hello,
+            &replay_host,
+            443,
+            &mut state,
+            &derived_psk,
+            &client_noise_tag,
+        )
+        .await
+        .map(|_| ())
+    });
+
+    let mut wire = vec![0u8; expected_len];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.read_exact(&mut wire),
+    )
+    .await
+    .expect("replay must not hang");
+    let _ = client.shutdown().await;
+    // 先看服务端的错误——它比 read 侧的 early-eof 有信息量得多。
+    server_task.await.unwrap().expect("replay must succeed");
+    read.expect("replay must deliver the full flight");
+
+    // 只切 app-data 区间：ServerHello 记录组是 TLS 明文结构，不参与断言。
+    let mut payloads = Vec::new();
+    let mut offset = server_records_len;
+    while offset + TLS_RECORD_HEADER_LEN <= wire.len() {
+        assert_eq!(wire[offset], 0x17, "app-data record type at {}", offset);
+        let len = u16::from_be_bytes([wire[offset + 3], wire[offset + 4]]) as usize;
+        let start = offset + TLS_RECORD_HEADER_LEN;
+        payloads.push(start..start + len);
+        offset = start + len;
+    }
+    assert_eq!(offset, wire.len(), "trailing bytes outside any record");
+    (wire, payloads)
+}
+
+/// 合成回放的记录条数 / 尺寸 / 顺序必须严格复刻采样 profile，且**每一条**
+/// app-data payload（含前置小记录）都逐连接新鲜随机。
+///
+/// 前置小记录此前完全没有被覆盖：它们在 `establish_synthetic_camouflage_tunnel`
+/// 里就地生成，而现有的 ghost 断言只覆盖 `build_noise_response_sequence`。把
+/// 三段（SH 记录组 / 前置记录 / Noise+ghost 记录）合并成同一次突发写时，最容易
+/// 退化的正是「为了少一次分配而复用缓冲」——那会让不同连接的 payload 出现逐
+/// 字节相同的长片段，可跨流拼接识别（真实 AEAD 密文永不重复）。
+#[tokio::test]
+async fn synthetic_replay_preserves_record_shape_and_freshens_every_payload() {
+    // app_data_sizes 的开头两条 < MIN_NOISE_RESPONSE_RECORD_LEN(54)，正是被
+    // 归入 prefix_app_data_sizes 的那一段；其余三条承载 Noise 响应 + ghost。
+    let prefix_sizes = vec![23usize, 31];
+    let app_data_sizes = vec![23usize, 31, 200, 77, 4096];
+
+    let mut flights = Vec::new();
+    for idx in 0..4 {
+        flights.push(
+            replay_flight_over_socket(
+                &format!("burst-replay-{}.test", idx),
+                prefix_sizes.clone(),
+                app_data_sizes.clone(),
+            )
+            .await,
+        );
+    }
+
+    for (bytes, payloads) in &flights {
+        let observed: Vec<usize> = payloads.iter().map(|range| range.len()).collect();
+        assert_eq!(
+            observed, app_data_sizes,
+            "replayed record sizes/count/order must match the sampled profile exactly"
+        );
+        assert_eq!(bytes[0], 0x16, "flight must open with the ServerHello record");
+    }
+
+    // 跨连接不得出现逐字节重复的 16 字节窗口（含前置小记录的 payload）。
+    let mut windows: std::collections::HashMap<&[u8], usize> = std::collections::HashMap::new();
+    for (flight_idx, (bytes, payloads)) in flights.iter().enumerate() {
+        let mut local = std::collections::HashSet::new();
+        for payload in payloads {
+            for window in bytes[payload.clone()].windows(REPEAT_WINDOW) {
+                local.insert(window);
+            }
+        }
+        for window in local {
+            if let Some(previous) = windows.insert(window, flight_idx) {
+                panic!(
+                    "flights {} and {} share an identical {}-byte payload window — every \
+                     plaintext byte written after ServerHello must be freshly generated \
+                     per connection",
+                    previous, flight_idx, REPEAT_WINDOW
+                );
+            }
+        }
+    }
+}
+
 /// 回放抖动必须是围绕 base 的对称连续分布，不得有点质量、不得单边。
 ///
 /// 旧实现用 `u64` 做 `jitter.saturating_sub(jitter_max)`，负半边被整体压到
@@ -290,15 +509,15 @@ fn ghost_record_sizes_match_the_replayed_profile() {
 fn replay_jitter_has_no_point_mass_and_is_two_sided() {
     use super::camouflage::jitter_iat;
 
-    const BASE_MS: u16 = 100;
+    const BASE_US: u32 = 100_000;
     const ROUNDS: usize = 4000;
-    let base = std::time::Duration::from_millis(BASE_MS as u64);
+    let base = std::time::Duration::from_micros(BASE_US as u64);
 
     let mut below = 0usize;
     let mut above = 0usize;
     let mut histogram: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
     for _ in 0..ROUNDS {
-        let sample = jitter_iat(BASE_MS);
+        let sample = jitter_iat(BASE_US);
         match sample.cmp(&base) {
             std::cmp::Ordering::Less => below += 1,
             std::cmp::Ordering::Greater => above += 1,
@@ -344,6 +563,104 @@ fn replay_jitter_of_zero_base_is_zero() {
     assert_eq!(super::camouflage::jitter_iat(0), std::time::Duration::ZERO);
 }
 
+/// 亚毫秒基值必须以亚毫秒精度存活。
+///
+/// 此前 profile 以整毫秒存储、采样端又用 `as_millis()` 向下截断：真实端点
+/// 绝大多数 0–1 ms 的帧内间隔被整体压成 0，活下来的也全部落在整毫秒格点上，
+/// `jitter_iat` 的 ±20% 只是围绕整毫秒中心散开。量纲改成微秒后，若输出仍被
+/// 量化回格点，这次改动就等于没做。
+#[test]
+fn replay_jitter_preserves_sub_millisecond_bases() {
+    use super::camouflage::jitter_iat;
+
+    const BASE_US: u32 = 700;
+    const ROUNDS: usize = 512;
+    let mut distinct = std::collections::HashSet::new();
+    for _ in 0..ROUNDS {
+        let sample = jitter_iat(BASE_US);
+        assert!(
+            sample >= std::time::Duration::from_nanos(560_000)
+                && sample <= std::time::Duration::from_nanos(840_000),
+            "sample {:?} outside the ±20% window around {}us",
+            sample,
+            BASE_US
+        );
+        distinct.insert(sample.as_nanos());
+    }
+    assert!(
+        distinct.len() * 2 > ROUNDS,
+        "only {} distinct values out of {} draws — a sub-millisecond base must not be \
+         re-quantized onto a grid",
+        distinct.len(),
+        ROUNDS
+    );
+}
+
+/// 服务端自己引入的 pre-auth 时间常量必须**短**，且必须是**常量**。
+///
+/// 两条原则在这里同时生效，而此前的实现各违反一条：
+///
+///   * 「能被稳定识别 = 会被封」：读超时后走的是回落转发，探测者观察到的
+///     关闭时刻 = 我们的超时 + 上游超时。8–15 s 的读超时叠在上游的精确
+///     60.000 s 上，一次连接即可测出这个正偏移。
+///   * 「全随机 = 会被封」：真实 nginx 的 `client_header_timeout` 是精确常量，
+///     真实服务器没有随机超时。用抖动去「消除常量」，等于在一个真实实现恒定
+///     的维度上引入随机性——那本身就是判别特征。
+///
+/// 正确解法是让我们那一项**不可观测**：取短的固定值，让上游的真实常量占绝对
+/// 主导。因此这里断言「预算固定 + 足够短」，而不是断言它有分布。
+#[tokio::test]
+async fn initial_record_timeouts_are_short_and_constant() {
+    use super::auth::initial_record_deadlines;
+
+    const ROUNDS: usize = 64;
+    let mut zero_byte = Vec::with_capacity(ROUNDS);
+    let mut partial = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let origin = tokio::time::Instant::now();
+        let deadlines = initial_record_deadlines();
+        zero_byte.push(deadlines.zero_byte.saturating_duration_since(origin));
+        partial.push(deadlines.partial.saturating_duration_since(origin));
+    }
+
+    let spread = |samples: &[std::time::Duration]| {
+        *samples.iter().max().unwrap() - *samples.iter().min().unwrap()
+    };
+    // 调度噪声只有微秒量级；任何 gen_range 都会让跨度跳到秒量级。
+    assert!(
+        spread(&zero_byte) < std::time::Duration::from_millis(50),
+        "zero-byte read budget varies by {:?} across connections — a randomized timeout is \
+         itself a discriminator, real servers use an exact client_header_timeout",
+        spread(&zero_byte)
+    );
+    assert!(
+        spread(&partial) < std::time::Duration::from_millis(50),
+        "partial-record read budget varies by {:?} across connections",
+        spread(&partial)
+    );
+
+    // 上界留 100ms 松弛：measured = 常量 + 取 origin 与函数内 now() 之间的
+    // 调度延迟，恒略大于常量本身。
+    const SLACK: std::time::Duration = std::time::Duration::from_millis(100);
+    let zero_byte_budget = zero_byte[0];
+    let partial_budget = partial[0];
+    assert!(
+        zero_byte_budget <= std::time::Duration::from_secs(3) + SLACK,
+        "zero-byte read budget {:?} is added on top of the upstream timeout and must stay \
+         small enough to disappear into it",
+        zero_byte_budget
+    );
+    assert!(
+        partial_budget <= std::time::Duration::from_secs(5) + SLACK,
+        "partial-record read budget {:?} is added on top of the upstream timeout",
+        partial_budget
+    );
+    assert!(
+        zero_byte_budget <= partial_budget,
+        "a fragmented ClientHello must get at least as much time as a silent connection"
+    );
+}
+
 async fn connected_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -364,6 +681,11 @@ async fn connected_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
 /// 判据不能只看第一次 read：FIN 先到，客户端读到 EOF 时 RST 可能还在路上。
 /// 必须在 EOF 之后再写一次——RST 已到达时写会得到 BrokenPipe / ConnectionReset，
 /// 未发生 RST 时写正常返回。两种输入必须给出相同结果。
+///
+/// 关闭**时刻**同样不得随输入变化。删掉此前那段 200–3000 ms 随机延迟之后，
+/// 关闭时刻就等于排空窗口本身，因此这条不变量从「被随机延迟盖住」变成
+/// 「必须显式成立」：排空循环无论读到多少字节都跑满 `CLOSE_DRAIN_TIMEOUT`，
+/// 于是「发过 ClientHello」与「什么都没发」得到同一个关闭时刻。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn indistinguishable_close_drains_before_closing() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -376,6 +698,7 @@ async fn indistinguishable_close_drains_before_closing() {
             client.flush().await.unwrap();
         }
 
+        let started = std::time::Instant::now();
         let closer = tokio::spawn(super::fallback::emit_indistinguishable_close(server));
 
         let mut buf = [0u8; 16];
@@ -383,12 +706,13 @@ async fn indistinguishable_close_drains_before_closing() {
             .await
             .expect("close must not hang")
             .expect("close must surface as a clean EOF");
+        let elapsed = started.elapsed();
         assert_eq!(n, 0, "close must not emit any application bytes");
 
         // 给可能的 RST 留出到达时间，再用一次写探测连接是否已被重置。
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         let post_eof_write = client.write_all(b"probe").await.map_err(|e| e.kind());
-        observations.push((payload.len(), post_eof_write));
+        observations.push((payload.len(), post_eof_write, elapsed));
         closer.await.unwrap();
     }
 
@@ -399,24 +723,81 @@ async fn indistinguishable_close_drains_before_closing() {
          lets a prober classify the server with a single connection",
         observations
     );
+
+    let timing_gap = observations[0]
+        .2
+        .abs_diff(observations[1].2);
+    assert!(
+        timing_gap <= std::time::Duration::from_millis(250),
+        "close instant differs by {:?} between a silent client and one that sent a \
+         ClientHello — the drain must run out its full budget either way, otherwise the \
+         close time itself classifies the input ({:?})",
+        timing_gap,
+        observations
+    );
 }
 
-/// 关闭必须带随机延迟：瞬时关闭是可测到毫秒的常量。
+/// 限额耗尽路径的关闭必须是一个**短的常量**，不得是随机延迟。
+///
+/// 此前这条测试断言的是反面（「关闭必须带随机延迟」，`elapsed >= 150ms`），
+/// 依据是「瞬时关闭是可测到毫秒的常量」。那个依据在当时成立，但它要掩盖的
+/// 对象已经消失：随后 §5.2 把**全部输入驱动的失败**（读超时、非 TLS 首记录、
+/// 认证失败、超长 record）都改走了透明转发，`emit_indistinguishable_close`
+/// 只剩「服务端此刻没有容量」一种成因。于是 200–3000 ms 的均匀延迟不再是在
+/// 抹平两个常量，而是在一个真实实现恒定的维度上凭空造出一个分布——正是原则 2
+/// 点名的那类特征，且 `U[0.2, 3.0] s` 的直方图形状一眼可辨。
+///
+/// 反转后要锁的是两件事，缺一不可：
+///   * **短**：关闭时刻必须落在排空窗口量级，不得有秒级尾巴。真实 nginx 在
+///     `worker_connections` 耗尽时就是 accept 之后立即关闭。
+///   * **常量**：跨连接的跨度必须小到只剩调度噪声。任何重新引入的随机化都会
+///     把跨度顶到几百毫秒以上。
+///
+/// 采样并发进行，因此本测试的墙钟开销只有一个排空窗口。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn indistinguishable_close_is_not_instantaneous() {
+async fn indistinguishable_close_is_a_short_constant_not_a_random_delay() {
     use tokio::io::AsyncReadExt;
 
-    let (mut client, server) = connected_pair().await;
-    let started = std::time::Instant::now();
-    let closer = tokio::spawn(super::fallback::emit_indistinguishable_close(server));
-    let mut buf = [0u8; 16];
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), client.read(&mut buf))
-        .await
-        .expect("close must not hang");
-    closer.await.unwrap();
+    const SAMPLES: usize = 10;
+    let mut tasks = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let (mut client, server) = connected_pair().await;
+        tasks.push(tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let closer = tokio::spawn(super::fallback::emit_indistinguishable_close(server));
+            let mut buf = [0u8; 16];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(10), client.read(&mut buf))
+                .await
+                .expect("close must not hang")
+                .expect("close must surface as a clean EOF");
+            let elapsed = started.elapsed();
+            closer.await.unwrap();
+            assert_eq!(n, 0, "close must not emit any application bytes");
+            elapsed
+        }));
+    }
+
+    let mut elapsed = Vec::with_capacity(SAMPLES);
+    for task in tasks {
+        elapsed.push(task.await.unwrap());
+    }
+
+    let slowest = *elapsed.iter().max().unwrap();
+    let spread = slowest - *elapsed.iter().min().unwrap();
     assert!(
-        started.elapsed() >= std::time::Duration::from_millis(150),
-        "close fired after {:?} — an instantaneous close is a constant a prober can measure",
-        started.elapsed()
+        slowest <= std::time::Duration::from_millis(900),
+        "slowest close fired after {:?} — the only self-inflicted delay on this path is the \
+         bounded receive-queue drain; a multi-second tail means a synthetic delay came back \
+         (and it holds an fd exactly when the server is already out of capacity)",
+        slowest
+    );
+    assert!(
+        spread <= std::time::Duration::from_millis(250),
+        "close time varies by {:?} across {} connections — a randomized close is itself the \
+         discriminator: no real implementation samples its close instant from a distribution, \
+         so the histogram of this branch would be a synthetic shape (samples: {:?})",
+        spread,
+        SAMPLES,
+        elapsed
     );
 }

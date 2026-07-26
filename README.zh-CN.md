@@ -17,7 +17,7 @@ UDP:           SOCKS5 UDP ASSOCIATE 通过 UDP-over-TCP stream data 承载
 
 kanotls 使用独立 Noise 通道完成端点认证和载荷加密。Noise 临时公钥通过 PSK 派生掩码嵌入 ClientHello 的 `random` 字段；`key_share` 扩展承载**独立的** TLS 层 X25519 临时密钥用于与参考站点完成可见握手，消除了两字段间的统计关联。服务端回放缓存的参考端点 record 形态——仅在首次启动和定期后台刷新时才实际连接伪装端点。
 
-认证与重放失败走受限的 pre-auth 回落路径。读取阶段（认证后）失败走 fail-closed 永不回落。回落连接带有显式防滥用限制（并发上限、每 IP 限制、连接超时、IP 信誉冷却）。AEAD 解密失败静默关闭连接——不发送告警，不以 `close_notify` 泄露。
+认证与重放失败走受限的 pre-auth 回落路径。读取阶段（认证后）失败走 fail-closed 永不回落。回落连接带有显式防滥用限制（全局并发 512、单 IP 并发 16、连接超时 3 秒）；单 IP 累计速率冷却已移除——它会让 113 条普通连接就把该 IP 推进「不转发」分支，制造一个内容级的零误报判别。AEAD 解密失败静默关闭连接——不发送告警，不以 `close_notify` 泄露。
 
 详细机制参考：[docs/MECHANISM.zh-CN.md](docs/MECHANISM.zh-CN.md)
 
@@ -32,8 +32,8 @@ kanotls 使用独立 Noise 通道完成端点认证和载荷加密。Noise 临�
 - **HTTP CONNECT only**：HTTP inbound 仅接受 authority-form `CONNECT host:port`。
 - **目的地址保护**：服务端拒绝 loopback / private / link-local / multicast / broadcast / unspecified / CGNAT / reserved（`240.0.0.0/4`）/ port-0。
 - **单二进制部署**：`cargo build --release`。角色从入站协议类型自动识别。
-- **TLS 指纹**：`firefox`（捕获的 bootstrap，唯一预设）。支持通过 `template_path` 注入自定义 ClientHello hex。所有模板在加载时统一规范化：剔除 ECH（`0xFE0D`/`0x014A`）、`early_data`（`0x0119`）、`use_srtp`（`0x001C`）和 `0x0022` 扩展，并逐连接重新生成系数合法的 X25519MLKEM768 混合密钥份额（支持 ML-KEM 的服务器会校验系数范围）。
-- **空闲拆除**：服务端 Session 使用 pin-reset 空闲定时器，每次成功读取时重置。空闲超时（默认 45 秒，可配置，含 ±10% 抖动）触发优雅 session 拆除（Noise 加密的 `close_notify` + TCP FIN）。客户端侧连接空闲生命周期由连接池全权管理（30s 空闲排干 + 种子化 soft TTL 轮换），`idle_timeout_secs` 仅服务端生效。无应用层心跳——内核 TCP keepalive（空闲 60 秒，间隔 30 秒，Linux 上 3 次重试）处理死端检测。
+- **TLS 指纹**：`firefox`（捕获的 bootstrap，唯一预设）。支持通过 `template_path` 注入自定义 ClientHello hex。**不剥离任何扩展**——上线的扩展类型列表与捕获的真实 Firefox 逐项相同（15 个），ClientHello 总长 1884 字节。逐连接重新生成：系数合法的 X25519MLKEM768 混合份额、真实 P-256 曲线点、以及**一个** X25519 密钥写入 0x001d 与混合份额两处（真实 Firefox 复用同一密钥，NSS Bug 1902119），ECH GREASE 的 `config_id`/`enc`/`payload` 三个字段亦逐连接刷新。
+- **空闲拆除**：服务端 Session 使用 pin-reset 空闲定时器，每次成功读取时重置。空闲超时（默认 **75 秒**，可配置，**常量、无抖动**，取 nginx `keepalive_timeout` 默认值）触发优雅 session 拆除（Noise 加密的 `close_notify` + TCP FIN）。客户端侧连接空闲生命周期由连接池全权管理（**115 秒**空闲排干，对齐 Firefox `network.http.keep-alive.timeout`；soft TTL **3600 秒**，对齐 nginx `keepalive_time` 默认 1 小时），`idle_timeout_secs` 仅服务端生效。无应用层心跳——内核 TCP keepalive 对齐 Firefox 默认值（空闲 **600 秒**、间隔 **1 秒**、**4 次**探测，不加抖动）。H2 层另有客户端发起的空闲 PING（58 秒无对端到达触发，观测窗口内抑制），拆除前发 GOAWAY。
 - **主动流量整形**：全生命周期 Markov 状态机（TrafficShaper）主动对每条应用数据（0x17）记录进行切分、填充和节拍控制，记录线速尺寸由 shaper 策略决定——明文长度不再映射至线速尺寸。支持可选的声明式流量脚本（`traffic_script`）对握手后包序列进行确定性控制，包括记录间 Delay 时序（对数正态或预录制 IAT 回放）与非对称 FakeResponse 交互（CMD_PADDING）。记录填充为零字节（RFC 8446 §5.4）——它位于 AEAD 的明文一侧，内容在线上不可见。
 - **模板热重载**：`template_path` hex 文件每 30 秒轮询 mtime 变更。更新时文件被重新解析，模板缓存失效，新连接立即使用新 ClientHello 而无需重启。解析失败记录警告但保留旧模板。
 
@@ -71,7 +71,7 @@ cargo build --release
         },
         "session": {
           "max_streams_per_session": 256,
-          "idle_timeout_secs": 45,
+          "idle_timeout_secs": 75,
           "traffic_script": [
             "stop=6",
             "0=L:200-250,D:0,F:0",
@@ -150,7 +150,7 @@ cargo build --release
         },
         "session": {
           "max_streams_per_session": 256,
-          "idle_timeout_secs": 45,
+          "idle_timeout_secs": 75,
           "traffic_script": [
             "stop=6",
             "0=L:200-250,D:0,F:0",
@@ -227,9 +227,9 @@ sing-box 风格规则，按顺序评估，首个匹配生效。规则的 `inboun
 
 ### Session 调优
 
-`idle_timeout_secs` 在服务端控制 session 空闲拆除（默认 45 秒，含 ±10% 抖动）。配置验证接受 `[1, 3600]` 区间。客户端侧的连接空闲生命周期由连接池全权接管（30s 空闲排干 + 120–300s 种子化 soft TTL 轮换），此字段在客户端侧接受但不生效。服务端侧不做 clamp。
+`idle_timeout_secs` 在服务端控制 session 空闲拆除（默认 75 秒，常量、无抖动）。配置验证接受 `[1, 3600]` 区间。客户端侧的连接空闲生命周期由连接池全权接管（115 秒空闲排干 + 3600 秒 soft TTL 兜底），此字段在客户端侧接受但不生效。服务端侧不做 clamp。
 
-**服务端**空闲拆除机制：Session 读取循环使用 pin-reset 空闲定时器（默认 45 秒，含 ±10% 抖动），每次成功读取时重置。定时器触发且无活跃流时，Session 优雅拆除（Noise 加密的 `close_notify` + TCP FIN）。不发送应用层心跳——内核 TCP keepalive 处理死端检测。
+**服务端**空闲拆除机制：Session 读取循环使用 pin-reset 空闲定时器（默认 75 秒，常量、无抖动），每次成功读取时重置。定时器触发且无活跃流时，Session 优雅拆除（Noise 加密的 `close_notify` + TCP FIN）。不发送应用层心跳——内核 TCP keepalive 处理死端检测。
 
 ### 流量脚本
 
@@ -261,7 +261,7 @@ sing-box 风格规则，按顺序评估，首个匹配生效。规则的 `inboun
 
 ### TLS 配置
 
-外层 TLS ClientHello 由捕获的 Firefox 模板生成（`fingerprint` 唯一取值，亦为默认值）。端点认证和载荷加密完全由 `Noise_NNpsk0` 与配置的 `password` 提供，外层 TLS 仅提供伪装。服务端使用缓存的参考端点 profile 完成可见 record 回放；`template_path` 可用捕获的 hex 文件覆盖内嵌 Firefox 模板。所有模板（内嵌或自定义）在加载时统一规范化：剔除 ECH/early_data/use_srtp/0x0022 扩展，并将 X25519MLKEM768 份额重新随机化为系数合法的结构。
+外层 TLS ClientHello 由捕获的 Firefox 模板生成（`fingerprint` 唯一取值，亦为默认值）。端点认证和载荷加密完全由 `Noise_NNpsk0` 与配置的 `password` 提供，外层 TLS 仅提供伪装。服务端使用缓存的参考端点 profile 完成可见 record 回放；`template_path` 可用捕获的 hex 文件覆盖内嵌 Firefox 模板。所有模板（内嵌或自定义）在加载时不剥离任何扩展；逐连接刷新 key_share 与 ECH GREASE 的变量字段（详见 [MECHANISM §6](docs/MECHANISM.zh-CN.md#6-指纹预设)）。
 
 ### TLS 指纹预设
 
@@ -335,7 +335,7 @@ ClientHello 保持正常 TLS record 结构。TLS 1.3 中预期为随机的字段
 
 ### 空闲拆除（服务端）
 
-Session 读取循环（仅服务端；客户端由连接池管理）使用 pinned `tokio::time::sleep` 定时器，每次成功读取时重置。空闲超时 tick 时，session 检查是否存在活跃流；若无活跃流，则发送 Noise 加密的 TLS `close_notify`（0x15）和 TCP FIN，优雅拆除连接。不在应用层发送 CMD_PING 心跳——内核 TCP keepalive（空闲 60 秒，间隔 30 秒，Linux 上 3 次重试）作为死端检测机制。
+Session 读取循环（仅服务端；客户端由连接池管理）使用 pinned `tokio::time::sleep` 定时器，每次成功读取时重置。空闲超时 tick 时，session 检查是否存在活跃流；若无活跃流，则发送 Noise 加密的 TLS `close_notify`（0x15）和 TCP FIN，优雅拆除连接。内核 TCP keepalive 对齐 Firefox 默认值（空闲 600 秒、间隔 1 秒、4 次探测）作为死端检测。
 
 ## 伪装端点缓存
 
@@ -347,7 +347,7 @@ Session 读取循环（仅服务端；客户端由连接池管理）使用 pinne
 
 ### Pre-Auth 回落
 
-提交到认证隧道路径之前的**每一种**失败，都会把客户端流量透明转发到伪装端点——非 TLS 首记录、认证失败、SNI 不匹配、记录头声明长度超限、记录截断/挂起，乃至什么都没发。交给转发的缓冲只含客户端真实发送过的字节；初始记录截止时间逐连接从 8–15 秒采样。因此探测者无法用任何构造出的输入得到不同的可观测结果。
+提交到认证隧道路径之前的**每一种**失败，都会把客户端流量透明转发到伪装端点——非 TLS 首记录、认证失败、SNI 不匹配、记录头声明长度超限、记录截断/挂起，乃至什么都没发。交给转发的缓冲只含客户端真实发送过的字节；初始记录截止时间是两个固定常量（零字节 2 秒 / 已收到部分 5 秒）——刻意不随机化，因为真实 nginx 的 `client_header_timeout` 就是精确常量。因此探测者无法用任何构造出的输入得到不同的可观测结果。
 
 转发受以下限额约束：
 
@@ -356,10 +356,9 @@ Session 读取循环（仅服务端；客户端由连接池管理）使用 pinne
 | 全局并发回落 | 512（固定值） |
 | 每 IP 并发回落 | 16（固定值） |
 | 回落连接超时 | 3 秒（固定值） |
-| IP 冷却阈值 | 3600 秒窗口内 112 次 → 300 秒冷却 |
 | 并发握手中连接数 | 512（固定值） |
 
-限额耗尽时连接无法转发，统一走唯一出口：先排空接收队列（使关闭恒为干净 FIN 而非 RST），再随机等待 200–3000 毫秒后关闭。这是唯一不抵达伪装端点的路径，且只能通过耗尽限额到达。详见 [MECHANISM §5.2](docs/MECHANISM.zh-CN.md#52-pre-auth-回落)。
+限额耗尽时连接无法转发，统一走唯一出口：先排空接收队列（使关闭恒为干净 FIN 而非 RST），随后**立即关闭**——真实 nginx 在 `worker_connections` 耗尽时给出的正是 accept 后立即关闭。这是唯一不抵达伪装端点的路径；**单条连接的内容无法触发它**，但探测者可通过持有 16 条并发回落连接占满单 IP 限额来抵达。详见 [MECHANISM §5.2](docs/MECHANISM.zh-CN.md#52-pre-auth-回落)。
 
 ### 服务端出站
 

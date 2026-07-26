@@ -114,6 +114,7 @@ pub fn stable_client_hello_fingerprint(record: &[u8]) -> Option<[u8; 32]> {
     session_id.fill(0);
     normalize_client_hello_key_shares(&mut normalized)?;
     normalize_client_hello_grease_positions(&mut normalized)?;
+    normalize_client_hello_ech_extension(&mut normalized)?;
     normalize_client_hello_padding_extension(&mut normalized)?;
     Some(hash_with_key(CLIENT_HELLO_FP_CONTEXT, &normalized))
 }
@@ -128,6 +129,11 @@ pub(crate) const GREASE_VALUES: [u16; 16] = [
 pub(crate) fn is_grease_value(value: u16) -> bool {
     GREASE_VALUES.contains(&value)
 }
+
+/// `encrypted_client_hello`（draft-ietf-tls-esni）扩展类型。template.rs 逐连接
+/// 刷新它的 `config_id`/`enc`/`payload`，本模块负责在指纹归一化时把同样三个
+/// 字段置零 —— 两侧必须指向同一个扩展类型，故常量只定义一份。
+pub(crate) const ECH_EXTENSION_TYPE: u16 = 0xFE0D;
 
 /// 将 key_share(0x0033) 扩展中所有 share 条目的 key 字节全部置零（不动任何
 /// 长度字段）。实例化每连接随机化 X25519 与辅助 P-256 share，只置零单个
@@ -171,11 +177,86 @@ fn normalize_client_hello_key_shares(record: &mut [u8]) -> Option<()> {
     Some(())
 }
 
+/// 将 GREASE ECH（`0xFE0D` encrypted_client_hello）中逐连接变化的字段置零：
+/// `config_id`(1 B)、`enc`、`payload`。
+///
+/// 此前 ECH 被整份剥离，所以指纹侧无需处理。恢复 ECH 后这三个字段逐连接刷新
+/// （template.rs `instantiate()`），若不归一化，每条连接的稳定指纹都不同 ⇒
+/// 服务端按指纹 key 的伪装 profile 缓存退化成每连接一条 ⇒ 每条客户端连接都
+/// 触发一次对伪装端点的实时 fetch。那既是巨大的性能回退，也是一个新的可观测
+/// 行为（服务端对每个客户端连接都向伪装站点发起一次连接）。
+///
+/// `cipher_suite`(kdf‖aead)、`type` 与**所有长度字段**一律不动：真实端点的 HPKE
+/// 套件是编译期常量、长度也恒定，它们携带真实的指纹信息，抹平反而丢信息。
+/// 结构截断时返回 None（与 [`normalize_client_hello_key_shares`] 一致地 fail
+/// closed）。
+fn normalize_client_hello_ech_extension(record: &mut [u8]) -> Option<()> {
+    let mut zero_ranges = Vec::new();
+    let mut malformed = false;
+    walk_client_hello_extensions(record, |ext_type, entry| {
+        if ext_type != ECH_EXTENSION_TYPE || malformed {
+            return;
+        }
+        let data = entry.start + 4;
+        let end = entry.end;
+        if end == data {
+            malformed = true;
+            return;
+        }
+        // ECHClientHello.type: outer(0) 才有 config_id/enc/payload；
+        // inner(1) 是 Empty，没有任何逐连接字段可归一化。
+        if record[data] != 0 {
+            return;
+        }
+        // type(1) ‖ kdf(2) ‖ aead(2) ‖ config_id(1) ‖ enc_len(2)
+        if end - data < 8 {
+            malformed = true;
+            return;
+        }
+        let enc_len = u16::from_be_bytes([record[data + 6], record[data + 7]]) as usize;
+        let enc_start = data + 8;
+        let Some(enc_end) = enc_start.checked_add(enc_len) else {
+            malformed = true;
+            return;
+        };
+        if enc_end.saturating_add(2) > end {
+            malformed = true;
+            return;
+        }
+        let payload_len = u16::from_be_bytes([record[enc_end], record[enc_end + 1]]) as usize;
+        let payload_start = enc_end + 2;
+        let Some(payload_end) = payload_start.checked_add(payload_len) else {
+            malformed = true;
+            return;
+        };
+        if payload_end != end {
+            malformed = true;
+            return;
+        }
+        zero_ranges.push(data + 5..data + 6);
+        zero_ranges.push(enc_start..enc_end);
+        zero_ranges.push(payload_start..payload_end);
+    })?;
+    if malformed {
+        return None;
+    }
+    for range in zero_ranges {
+        record[range].fill(0);
+    }
+    Some(())
+}
+
 /// 将所有 GREASE 出现位置置零：cipher_suites 列表中的 2 字节值、每个扩展的
 /// 2 字节 ext_type 字段（GREASE 扩展 len 通常为 0，置零 type 不影响遍历）、
-/// supported_groups(0x000a) 扩展 data 内的 group 列表。长度字段一律不动。
+/// supported_groups(0x000a) 与 supported_versions(0x002b) 扩展 data 内的列表项。
+/// 长度字段一律不动。
+///
+/// supported_versions 此前未被覆盖：Chrome/BoringSSL 在该列表里也放一个独立的
+/// GREASE 版本号，而 template.rs 新增了对它的逐连接轮换，两侧必须成对存在 ——
+/// 只轮换不归一化会让指纹每连接唯一。
 fn normalize_client_hello_grease_positions(record: &mut [u8]) -> Option<()> {
     const SUPPORTED_GROUPS_EXTENSION_TYPE: u16 = 0x000a;
+    const SUPPORTED_VERSIONS_EXTENSION_TYPE: u16 = 0x002b;
 
     let (_, session_id_range) = client_hello_random_and_session_id_ranges(record)?;
     let cipher_suites_len_start = session_id_range.end;
@@ -206,27 +287,47 @@ fn normalize_client_hello_grease_positions(record: &mut [u8]) -> Option<()> {
             zero_ranges.push(entry.start..entry.start + 2);
             return;
         }
-        if ext_type != SUPPORTED_GROUPS_EXTENSION_TYPE {
-            return;
-        }
         let ext_data = entry.start + 4;
         let ext_end = entry.end;
-        if ext_end - ext_data < 2 {
-            malformed = true;
-            return;
-        }
-        let groups_len = u16::from_be_bytes([record[ext_data], record[ext_data + 1]]) as usize;
-        let Some(groups_end) = ext_data.checked_add(2).and_then(|v| v.checked_add(groups_len))
-        else {
-            malformed = true;
-            return;
+        // supported_groups 的列表长度是 u16，supported_versions 是 u8。
+        let (list_start, list_end) = match ext_type {
+            SUPPORTED_GROUPS_EXTENSION_TYPE => {
+                if ext_end - ext_data < 2 {
+                    malformed = true;
+                    return;
+                }
+                let list_len =
+                    u16::from_be_bytes([record[ext_data], record[ext_data + 1]]) as usize;
+                let Some(list_end) =
+                    ext_data.checked_add(2).and_then(|v| v.checked_add(list_len))
+                else {
+                    malformed = true;
+                    return;
+                };
+                (ext_data + 2, list_end)
+            }
+            SUPPORTED_VERSIONS_EXTENSION_TYPE => {
+                if ext_end == ext_data {
+                    malformed = true;
+                    return;
+                }
+                let list_len = record[ext_data] as usize;
+                let Some(list_end) =
+                    ext_data.checked_add(1).and_then(|v| v.checked_add(list_len))
+                else {
+                    malformed = true;
+                    return;
+                };
+                (ext_data + 1, list_end)
+            }
+            _ => return,
         };
-        if groups_end > ext_end {
+        if list_end > ext_end {
             malformed = true;
             return;
         }
-        let mut cursor = ext_data + 2;
-        while cursor + 2 <= groups_end {
+        let mut cursor = list_start;
+        while cursor + 2 <= list_end {
             if is_grease_value(u16::from_be_bytes([record[cursor], record[cursor + 1]])) {
                 zero_ranges.push(cursor..cursor + 2);
             }
@@ -884,6 +985,150 @@ mod tests {
         assert_eq!(
             stable_client_hello_fingerprint(&record_a),
             stable_client_hello_fingerprint(&record_b)
+        );
+    }
+
+    /// 合成一条带 GREASE ECH（0xFE0D）的最小 ClientHello。
+    /// extension_data = type(1)=0 ‖ kdf(2) ‖ aead(2) ‖ config_id(1)
+    ///                  ‖ enc_len(2)=4 ‖ enc(4) ‖ payload_len(2)=6 ‖ payload(6)
+    fn client_hello_with_ech(config_id: u8, enc: [u8; 4], payload: [u8; 6]) -> Vec<u8> {
+        let mut ech_data = vec![0x00, 0x00, 0x01, 0x00, 0x01, config_id];
+        ech_data.extend_from_slice(&4u16.to_be_bytes());
+        ech_data.extend_from_slice(&enc);
+        ech_data.extend_from_slice(&6u16.to_be_bytes());
+        ech_data.extend_from_slice(&payload);
+        assert_eq!(ech_data.len(), 20);
+
+        let mut record = vec![0u8; 84];
+        record[0] = 0x16;
+        record[5] = 0x01;
+        record[43] = 32; // session_id_len
+        record[76] = 0x00; // cipher_suites_len = 2
+        record[77] = 0x02;
+        record[78] = 0x13;
+        record[79] = 0x01;
+        record[80] = 0x01; // compression_methods_len = 1
+        record[81] = 0x00;
+        // extensions_len
+        let extensions_len = (4 + ech_data.len()) as u16;
+        record[82..84].copy_from_slice(&extensions_len.to_be_bytes());
+        record.extend_from_slice(&0xfe0du16.to_be_bytes());
+        record.extend_from_slice(&(ech_data.len() as u16).to_be_bytes());
+        record.extend_from_slice(&ech_data);
+        let total = record.len();
+        record[3..5].copy_from_slice(&((total - 5) as u16).to_be_bytes());
+        record[6] = 0;
+        record[7..9].copy_from_slice(&((total - 9) as u16).to_be_bytes());
+        record
+    }
+
+    /// 恢复 ECH 后 `config_id`/`enc`/`payload` 逐连接刷新，若不归一化则每条连接
+    /// 指纹唯一 ⇒ 伪装 profile 缓存退化成每连接一条 ⇒ 每条连接都对伪装端点发起
+    /// 一次实时 fetch。
+    #[test]
+    fn stable_client_hello_fingerprint_ignores_ech_variable_fields() {
+        let a = client_hello_with_ech(0x4a, [1, 2, 3, 4], [9, 9, 9, 9, 9, 9]);
+        let b = client_hello_with_ech(0xf1, [0xaa, 0xbb, 0xcc, 0xdd], [1, 2, 3, 4, 5, 6]);
+        assert_ne!(a, b, "前提：两条记录的 ECH 可变字段确实不同");
+        assert_eq!(
+            stable_client_hello_fingerprint(&a),
+            stable_client_hello_fingerprint(&b)
+        );
+
+        // cipher_suite（kdf‖aead）不是逐连接字段，必须仍然改变指纹 —— 真实端点的
+        // HPKE 套件是编译期常量，抹平它会丢掉真实的指纹信息。
+        let mut c = a.clone();
+        let ech_data_start = c.len() - 22;
+        c[ech_data_start + 3] = 0x00;
+        c[ech_data_start + 4] = 0x02; // aead 0x0001 -> 0x0002
+        assert_ne!(
+            stable_client_hello_fingerprint(&a),
+            stable_client_hello_fingerprint(&c)
+        );
+    }
+
+    /// 归一化只置零 config_id/enc/payload，不动任何长度字段 —— 记录/握手/扩展三处
+    /// 长度以及 ECH 内部的 enc_len/payload_len 都必须保持自洽。
+    #[test]
+    fn normalize_ech_extension_touches_only_variable_fields() {
+        let record = client_hello_with_ech(0x4a, [1, 2, 3, 4], [9, 9, 9, 9, 9, 9]);
+        let mut normalized = record.clone();
+        normalize_client_hello_ech_extension(&mut normalized).expect("well-formed ECH");
+
+        assert_eq!(normalized.len(), record.len());
+        let ech_data_start = record.len() - 20;
+        let mut expected = record.clone();
+        expected[ech_data_start + 5] = 0; // config_id
+        expected[ech_data_start + 8..ech_data_start + 12].fill(0); // enc
+        expected[ech_data_start + 14..ech_data_start + 20].fill(0); // payload
+        assert_eq!(normalized, expected);
+
+        // 长度自洽未被破坏。
+        assert_eq!(
+            u16::from_be_bytes([normalized[3], normalized[4]]) as usize + 5,
+            normalized.len()
+        );
+        assert_eq!(
+            u16::from_be_bytes([normalized[ech_data_start + 6], normalized[ech_data_start + 7]]),
+            4
+        );
+        assert_eq!(
+            u16::from_be_bytes([normalized[ech_data_start + 12], normalized[ech_data_start + 13]]),
+            6
+        );
+        // 归一化幂等。
+        let mut twice = normalized.clone();
+        normalize_client_hello_ech_extension(&mut twice).unwrap();
+        assert_eq!(twice, normalized);
+    }
+
+    /// 结构截断的 ECH 与截断的 key_share 一样 fail closed（返回 None），调用方据此
+    /// 走 baseline 兜底而不是用一个半解析的偏移集做归一化。
+    #[test]
+    fn stable_client_hello_fingerprint_rejects_truncated_ech() {
+        let mut record = client_hello_with_ech(0x4a, [1, 2, 3, 4], [9, 9, 9, 9, 9, 9]);
+        let ech_data_start = record.len() - 20;
+        // enc_len 5 ⇒ payload 无法填满 extension_data。
+        record[ech_data_start + 6..ech_data_start + 8].copy_from_slice(&5u16.to_be_bytes());
+        assert_eq!(stable_client_hello_fingerprint(&record), None);
+    }
+
+    /// supported_versions 里的 GREASE 版本号此前既不轮换也不归一化。template.rs 新增
+    /// 了轮换，归一化必须同步覆盖，否则自定义 Chrome 模板的指纹会每连接唯一。
+    #[test]
+    fn stable_client_hello_fingerprint_ignores_supported_versions_grease() {
+        fn build(grease: u16) -> Vec<u8> {
+            let mut record = vec![0u8; 84];
+            record[0] = 0x16;
+            record[5] = 0x01;
+            record[43] = 32;
+            record[76] = 0x00;
+            record[77] = 0x02;
+            record[78] = 0x13;
+            record[79] = 0x01;
+            record[80] = 0x01;
+            record[81] = 0x00;
+            record[82..84].copy_from_slice(&11u16.to_be_bytes());
+            record.extend_from_slice(&0x002bu16.to_be_bytes());
+            record.extend_from_slice(&7u16.to_be_bytes());
+            record.push(6); // supported_versions list length (u8)
+            record.extend_from_slice(&grease.to_be_bytes());
+            record.extend_from_slice(&0x0304u16.to_be_bytes());
+            record.extend_from_slice(&0x0303u16.to_be_bytes());
+            let total = record.len();
+            record[3..5].copy_from_slice(&((total - 5) as u16).to_be_bytes());
+            record[7..9].copy_from_slice(&((total - 9) as u16).to_be_bytes());
+            record
+        }
+
+        assert_eq!(
+            stable_client_hello_fingerprint(&build(0x0a0a)),
+            stable_client_hello_fingerprint(&build(0xfafa))
+        );
+        // 非 GREASE 版本号差异仍须改变指纹。
+        assert_ne!(
+            stable_client_hello_fingerprint(&build(0x0a0a)),
+            stable_client_hello_fingerprint(&build(0x0305))
         );
     }
 

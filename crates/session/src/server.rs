@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use crate::frame::{Frame, CMD_SYNACK};
 use crate::session::{
     register_stream_locked, unregister_stream_locked, BufferedPayload, PendingAcceptFlushResult,
@@ -116,10 +117,10 @@ pub struct ServerStream {
 }
 
 impl ServerStream {
-    pub async fn read(&mut self) -> Option<Vec<u8>> {
+    pub async fn read(&mut self) -> Option<Bytes> {
         loop {
             if let Ok(payload) = self.data_rx.try_recv() {
-                return Some(payload.into_vec());
+                return Some(payload.into_bytes());
             }
             if let Some(data) = self.try_drain_pending_data() {
                 return Some(data);
@@ -130,7 +131,7 @@ impl ServerStream {
 
             tokio::select! {
                 payload = self.data_rx.recv() => {
-                    return payload.map(BufferedPayload::into_vec);
+                    return payload.map(BufferedPayload::into_bytes);
                 }
                 _ = self.pending_notify.notified() => {
                     continue;
@@ -145,11 +146,11 @@ impl ServerStream {
         }
     }
 
-    fn try_drain_pending_data(&self) -> Option<Vec<u8>> {
+    fn try_drain_pending_data(&self) -> Option<Bytes> {
         let mut pending = self.pending_data.try_lock().ok()?;
         // pop_front 在队列排空时自动移除条目。
         let payload = pending.pop_front(self.sid)?;
-        Some(payload.into_vec())
+        Some(payload.into_bytes())
     }
 
     pub async fn write(&self, data: &[u8]) -> Result<(), anyhow::Error> {

@@ -1,17 +1,86 @@
+use bytes::Bytes;
 use crate::frame::{coalesce_encoded_frames, encode_psh_frames, Frame, MAX_PAYLOAD_LEN};
 use crate::session::{
-    mark_stream_read_closed_locked, remember_closing_stream_sync, unregister_stream_locked,
-    BufferedPayload, FlushBehavior, PendingData, PendingWrite, SharedTunnelWriter, StreamHandle,
-    TrafficClass,
+    mark_stream_read_closed_locked, peer_never_processed, remember_closing_stream_sync,
+    unregister_stream_locked, BufferedPayload, FlushBehavior, PendingData, PendingWrite,
+    SharedTunnelWriter, StreamHandle, TrafficClass,
 };
 use anyhow::Error;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::{mpsc, oneshot, Notify, RwLock};
 
 const SYNACK_TIMEOUT_SECS: u64 = 10;
+
+/// 对端 GOAWAY 判定「这条流从未被处理」时，本流对外报出的错误前缀。
+///
+/// **为什么需要一个可区分的错误**：连接池把 `streams_per_connection_target`
+/// 提到 256（= `max_streams_per_session`）之后，一条隧道连接的死亡最多牵连
+/// 256 条流，而 KanoTLS 没有流迁移。真实 H2 的爆炸半径一样大，但浏览器在
+/// **HTTP 层**对幂等请求做重试；SOCKS 代理没有这一层，应用只看到 socket 被
+/// 关闭。此前无论「对端已经把请求转给源站后才断」还是「对端连 SYN 都没读到」，
+/// 上层拿到的都是同一个泛型错误（`session writer closed` / EOF），于是**没有
+/// 任何一条流可以被安全地重试**——重试一条可能已经执行过的非幂等请求比不重试
+/// 更糟。
+///
+/// 拿到 GOAWAY 的 `last_stream_id` 之后这两种情形第一次可分：`stream_id`
+/// 高于它 ⇒ 对端的读循环根本没走到这条流的 CMD_SYN ⇒ 重试无副作用。
+///
+/// 前缀是给跨 crate 调用方（`kanotls/**`）的稳定标识；不想匹配字符串的调用方
+/// 用 [`Stream::peer_never_processed`]。
+pub const PEER_NEVER_PROCESSED_ERROR: &str = "stream was never processed by the peer";
+
+/// 「开流未发出」的宽限期：本端迟迟不写第一个字节时，`read()` 等到此刻就
+/// 把 open（SYN + 目标地址）单独发出去。
+///
+/// **修的是什么**：`defer_target` 把目标地址挂在「首次写入」上，而
+/// `relay_tcp_client` 对本地连接与隧道流是 `select!` 双向轮询——**服务端先
+/// 说话**的协议（SSH / SMTP / IMAP / MySQL…）里本端根本不会先写，于是目标
+/// 地址永远到不了对端：服务端要么完全不知道这条流存在（首条流，SYN 也还压在
+/// `DeferredUnsent` 里），要么 accept 之后卡在 `read()` 上等目标。两边互等，
+/// 直到 SOCKS 客户端自己超时。实测两条路径都挂（见
+/// `deferred_open_reaches_peer_without_a_local_first_write`）。
+///
+/// **为什么不能「`read()` 一被调用就冲刷」**：那正是 `select!` 的另一半，
+/// 客户端先说话的协议里 `read()` 同样会立刻被调用，于是 gather 优化
+/// （`[SETTINGS][SYN][PSH(target)][PSH(首块)]` 合并成一次提交）会被无条件
+/// 摧毁——而那条合并正是「每条流的开场只占一条 shaper 定尺寸的记录」的前提。
+/// 宽限期让两者共存：客户端先说话时本端在毫秒级内就写了，计时器永远不触发；
+/// 服务端先说话时它是唯一的出路。
+///
+/// **取值**：40ms。下界要显著大于本地应用产出首字节的时延（环回/局域网上是
+/// 亚毫秒到几毫秒），否则会误伤 gather；上界要显著小于服务端先说话的协议
+/// 本来就要付的「代理 RTT + 源站 connect + banner」，40ms 在这两者之间有充足
+/// 余量。命中宽限期与否不改变端到端时延的量级——两条路径都是「open 发出后
+/// 才轮到源站」，宽限期只决定 open 什么时候发出。
+///
+/// **为什么是定值而不是抖动值**：与 `PEER_TURN_MAX_WAIT` /
+/// `H2_PING_IDLE_THRESHOLD_SECS` 同一口径——这是一个**截止期**，不是 IAT
+/// 模型。它可观测的形态是「目标记录之后、下一条上行记录在 X 之后」，而那个
+/// X 由源站 banner 的往返决定，不由本常量决定；本常量只决定目标记录相对
+/// 「开流」这一**对端无法观测的时刻**的偏移。对第 2..N 条流，线上确实存在
+/// 「SYN 记录 → 40ms → 目标记录」这一对，但两条记录都已按数据记录分布定
+/// 尺寸（见 `packet_carries_stream_lifecycle_frame`），观测者无从判定它们
+/// 属于同一条流；而在真实 H2 上「HEADERS → 数十毫秒 → 请求体」本就是常态。
+const DEFERRED_OPEN_GRACE: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// 宽限计时器的「禁用」姿态：分支被 select guard 屏蔽，deadline 只需足够
+/// 遥远（与 `session.rs` 的 `H2_TIMER_DISABLED` 同一手法）。
+const DEFERRED_OPEN_GRACE_DISABLED: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// 测试覆写点：0 表示使用上面的生产常量。
+pub(crate) static DEFERRED_OPEN_GRACE_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn deferred_open_grace() -> std::time::Duration {
+    let override_ms = DEFERRED_OPEN_GRACE_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if override_ms > 0 {
+        return std::time::Duration::from_millis(override_ms);
+    }
+    DEFERRED_OPEN_GRACE
+}
 
 // Distinguish a deferred open that can still be retried from one whose bytes
 // are already committed to the session writer.
@@ -39,6 +108,7 @@ pub(crate) struct StreamInit {
     pub pending_fin: Arc<Mutex<std::collections::HashSet<u32>>>,
     pub closing_streams: Arc<Mutex<std::collections::HashSet<u32>>>,
     pub pending_notify: Arc<Notify>,
+    pub peer_goaway_last_stream_id: Arc<AtomicU64>,
     pub open_state: StreamOpenState,
 }
 
@@ -55,8 +125,16 @@ pub struct Stream {
     pending_fin: Arc<Mutex<std::collections::HashSet<u32>>>,
     closing_streams: Arc<Mutex<std::collections::HashSet<u32>>>,
     pending_notify: Arc<Notify>,
+    /// 对端 GOAWAY 的 `last_stream_id`（见 `Session::peer_never_processed`）：
+    /// 本流 id 高于它 ⇒ 对端从未处理过这条流。
+    peer_goaway_last_stream_id: Arc<AtomicU64>,
     open_state: StreamOpenState,
     deferred_target: Option<Vec<u8>>,
+    /// 开流宽限期的截止时刻，在 `read()` 首次真正挂起时惰性起算（见
+    /// `DEFERRED_OPEN_GRACE`）。存在 `Stream` 上而不是 `read()` 的局部变量里，
+    /// 是因为 `relay_tcp_client` 的 `select!` 会反复取消并重建 `read()` 的
+    /// future——放在局部变量里每次取消都会把计时器归零，计时器永远走不到期。
+    open_flush_deadline: Option<tokio::time::Instant>,
     read_closed: bool,
     write_closed: bool,
     closed: bool,
@@ -77,8 +155,10 @@ impl Stream {
             pending_fin: init.pending_fin,
             closing_streams: init.closing_streams,
             pending_notify: init.pending_notify,
+            peer_goaway_last_stream_id: init.peer_goaway_last_stream_id,
             open_state: init.open_state,
             deferred_target: None,
+            open_flush_deadline: None,
             read_closed: false,
             write_closed: false,
             closed: false,
@@ -86,10 +166,10 @@ impl Stream {
         }
     }
 
-    pub async fn read(&mut self) -> Option<Vec<u8>> {
+    pub async fn read(&mut self) -> Option<Bytes> {
         loop {
             if let Ok(payload) = self.data_rx.try_recv() {
-                return Some(payload.into_vec());
+                return Some(payload.into_bytes());
             }
             if let Some(data) = self.try_drain_pending_data() {
                 return Some(data);
@@ -98,9 +178,32 @@ impl Stream {
                 return None;
             }
 
+            // 开流尚未出网时武装宽限计时器（论证见 `DEFERRED_OPEN_GRACE`）。
+            // 截止时刻只算一次：`get_or_insert_with` 保证 `select!` 反复取消
+            // 重建本 future 时计时器不被归零。
+            let grace_deadline = if self.open_is_unsent() {
+                Some(
+                    *self
+                        .open_flush_deadline
+                        .get_or_insert_with(|| tokio::time::Instant::now() + deferred_open_grace()),
+                )
+            } else {
+                None
+            };
+            let grace_armed = grace_deadline.is_some();
+            let grace = tokio::time::sleep_until(
+                grace_deadline
+                    .unwrap_or_else(|| tokio::time::Instant::now() + DEFERRED_OPEN_GRACE_DISABLED),
+            );
+            tokio::pin!(grace);
+
+            // 宽限期到期后才冲刷：`select!` 的臂里拿不到 `&mut self`
+            // （data_rx/fin_rx 的借用仍在作用域内），故那一臂空着，出了
+            // select 再动手；其余各臂一律 return/continue，因此能落到下面
+            // 那行的只有宽限期分支。
             tokio::select! {
                 payload = self.data_rx.recv() => {
-                    return payload.map(BufferedPayload::into_vec);
+                    return payload.map(BufferedPayload::into_bytes);
                 }
                 _ = self.pending_notify.notified() => {
                     continue;
@@ -113,11 +216,48 @@ impl Stream {
                     self.read_closed = true;
                     continue;
                 }
+                _ = &mut grace, if grace_armed => {}
+            }
+
+            if self.flush_unsent_open().await.is_err() {
+                // 开流失败 ⇒ 这条流已死，读侧给 EOF；`open_failed` 已置位，
+                // 后续 `write()` 会带着原始错误返回。
+                return None;
             }
         }
     }
 
+    /// 对端的 GOAWAY 是否宣告本流从未被处理 ⇒ 重放这条流无副作用。
+    ///
+    /// 没收到 GOAWAY（本端主动关、TCP 被打断、对端是未升级的旧版本）时恒为
+    /// `false`：这个判据只做加法，不改变任何既有失败路径的语义。
+    ///
+    /// 判据的可信度等同于对端本身：`last_stream_id` 由已通过 Noise PSK 认证的
+    /// 对端给出，一个作恶的对端可以谎报 0 把本端全部流标成「可重试」。这在本轮
+    /// 只影响错误文案；**任何**真正的自动重放逻辑都必须自己评估这一点。
+    pub fn peer_never_processed(&self) -> bool {
+        peer_never_processed(&self.peer_goaway_last_stream_id, self.stream_id)
+    }
+
+    /// 本流被 GOAWAY 判定为未处理时的可区分错误。
+    ///
+    /// 优先级高于 `open_failed`：后者多半已经被写路径填成泛型的
+    /// `session writer closed`，而 GOAWAY 携带的是严格更强的信息。
+    fn goaway_retry_error(&self) -> Option<anyhow::Error> {
+        if !self.peer_never_processed() {
+            return None;
+        }
+        Some(anyhow::anyhow!(
+            "{} (stream {}); safe to retry",
+            PEER_NEVER_PROCESSED_ERROR,
+            self.stream_id
+        ))
+    }
+
     async fn wait_synack(&mut self) -> Result<(), anyhow::Error> {
+        if let Some(err) = self.goaway_retry_error() {
+            return Err(err);
+        }
         if let Some(msg) = &self.open_failed {
             anyhow::bail!(msg.clone());
         }
@@ -134,6 +274,9 @@ impl Stream {
     }
 
     pub async fn write_early(&mut self, data: &[u8]) -> Result<(), anyhow::Error> {
+        if let Some(err) = self.goaway_retry_error() {
+            return Err(err);
+        }
         if let Some(msg) = &self.open_failed {
             anyhow::bail!(msg.clone());
         }
@@ -151,6 +294,11 @@ impl Stream {
     }
 
     pub async fn write(&mut self, data: &[u8]) -> Result<(), anyhow::Error> {
+        // GOAWAY 的判定先于 open_failed：TCP CONNECT 中继（`relay_tcp_client`）
+        // 从不 `wait_open()`，本流的失败第一次浮到应用层就是在这里。
+        if let Some(err) = self.goaway_retry_error() {
+            return Err(err);
+        }
         if let Some(msg) = &self.open_failed {
             anyhow::bail!(msg.clone());
         }
@@ -481,7 +629,7 @@ impl Stream {
         self.pending_fin.lock().await.remove(&self.stream_id);
     }
 
-    fn try_drain_pending_data(&mut self) -> Option<Vec<u8>> {
+    fn try_drain_pending_data(&mut self) -> Option<Bytes> {
         let mut pending = self.pending_data.try_lock().ok()?;
         let Some(payload) = pending.pop_front(self.stream_id) else {
             // pending_data 已排空：若 pre-SYNACK 的 FIN 曾因部分投递被退回
@@ -496,7 +644,7 @@ impl Stream {
         if drained {
             self.take_queued_pending_fin();
         }
-        Some(payload.into_vec())
+        Some(payload.into_bytes())
     }
 
     fn take_queued_pending_fin(&mut self) {
@@ -504,6 +652,47 @@ impl Stream {
             if pending_fin.remove(&self.stream_id) {
                 self.read_closed = true;
             }
+        }
+    }
+
+    /// 这条流的「开场」是否还有字节没出网：目标地址仍挂在 `deferred_target`
+    /// 上，或 SYN 仍压在 `DeferredUnsent` 里。
+    ///
+    /// 两种情形都要覆盖：第 1 条流两者皆是（SYN 与目标一起攒着），第 2..N 条
+    /// 流只有后者（`open_stream` 已经把 SYN 单发出去了，服务端 accept 之后
+    /// 卡在等目标）。
+    ///
+    /// 已失败或已关闭的流一律不武装。这是**纵深防御**，不是当前唯一的保护：
+    /// `relay_tcp_client` 在本地 EOF 后会 `close_write()` 然后继续轮询
+    /// `remote.read()`，而 `close_write` 对仍处 `DeferredUnsent` 的流是纯本地
+    /// 拆除（不发 FIN——对端根本不知道这条流），其中的 `unregister_stream`
+    /// 会丢掉 `data_tx`，于是 `read()` 里的 `data_rx.recv()` 立即返回 `None`，
+    /// 计时器根本来不及到期。
+    ///
+    /// 之所以仍然显式挡一道：这条「来不及到期」依赖的是**另一个模块**的清理
+    /// 顺序（`unregister_stream_locked` 恰好丢掉发送端），一旦那边改成延迟
+    /// 清理，宽限计时器就会为一条已经没有本地端的流在对端凭空建流——对端把它
+    /// 挂在 `pending_open_streams` 里直到会话结束，既漏资源又多一条线上记录。
+    /// 判据放在本函数里，这个隐式依赖就不再是正确性的一部分。
+    fn open_is_unsent(&self) -> bool {
+        self.open_failed.is_none()
+            && !self.closed
+            && !self.write_closed
+            && (self.deferred_target.is_some() || self.has_deferred_open())
+    }
+
+    /// 宽限期到期：把开场**不带数据**发出去，此后该流退回普通写路径。
+    ///
+    /// 复用 `write_gather_open` / `flush_pending_open_frames` 这两条既有路径，
+    /// 不新增线上形态：前者以空 data 调用时产出的正是
+    /// `[SYN][PSH(target)]`（第 1 条流）或 `[PSH(target)]`（第 2..N 条流），
+    /// 与「本端恰好只写了目标地址」完全同形。
+    async fn flush_unsent_open(&mut self) -> Result<(), anyhow::Error> {
+        // 先清截止时刻：无论成败都不再重复武装。
+        self.open_flush_deadline = None;
+        match self.deferred_target.take() {
+            Some(target) => self.write_gather_open(&target, &[]).await,
+            None => self.flush_pending_open_frames().await,
         }
     }
 
@@ -560,8 +749,15 @@ impl Stream {
                     remember_closing_stream_sync(self.stream_id, &self.closing_streams);
                     self.unregister_stream().await;
                     self.clear_pending_client_state().await;
-                    return Err(self
-                        .mark_open_failed(anyhow::anyhow!("stream closed before SYNACK"), false));
+                    // 「对端没读到这条 SYN」正是被 GOAWAY 判定为未处理的流所走
+                    // 的路径（水位在 CMD_SYN 一进 handle_frame 就抬起，所以任何
+                    // 收到过 SYNACK 的流必然 ≤ 水位）。读循环先处理完 GOAWAY 帧
+                    // 才清空 streams 映射、丢掉这里的 synack 发送端，所以此刻
+                    // 判据必已就绪。
+                    let err = self.goaway_retry_error().unwrap_or_else(|| {
+                        anyhow::anyhow!("stream closed before SYNACK")
+                    });
+                    return Err(self.mark_open_failed(err, false));
                 }
                 Err(_) => {
                     self.synack_rx = None;
@@ -576,9 +772,11 @@ impl Stream {
 
         self.synack_rx = None;
         if !payload.is_empty() {
+            // 拒绝原因在线上是定长载荷（见 Session::SYNACK_REJECTION_PAYLOAD_LEN），
+            // 右侧补白在此剥掉后才是原始文本。
             let msg = format!(
                 "stream open rejected: {}",
-                String::from_utf8_lossy(&payload)
+                String::from_utf8_lossy(&payload).trim_end()
             );
             self.open_failed = Some(msg.clone());
             remember_closing_stream_sync(self.stream_id, &self.closing_streams);

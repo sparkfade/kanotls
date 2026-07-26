@@ -29,25 +29,64 @@ pub fn validate_session_config(prefix: &str, session: &crate::model::SessionConf
     Ok(())
 }
 
+/// `post_script_shaping` 的取值校验。
+///
+/// 此前只在取值**非法**时告警，合法取值 `"off"` 完全静默。但 `"off"` 不是一个
+/// 中性开关：`packet_seq` 达到 `stop` 之后，后续每条记录按当前积压的**精确**
+/// 长度发出（零延迟、无融合窗口、无 Markov 机），于是明文长度 1:1 映射到线速
+/// 长度——那正是 v1.1 声称已经消除的那条特征，也是论文观测的直接输入
+/// （`Wo = 25` 个包的 TCP 载荷字节序列）。默认脚本只有 6 条规则，观测窗口里
+/// 绝大多数包因此都在 `"off"` 语义下。现补一条安全警告。
 fn validate_post_script_shaping(prefix: &str, mode: &str) {
-    if !matches!(mode, "markov" | "off") {
-        tracing::warn!(
-            "{}: session.post_script_shaping '{}' is invalid (expected \"markov\" or \"off\"); the default \"markov\" behavior will be used instead",
-            prefix,
-            mode
-        );
+    match mode {
+        "markov" => {}
+        "off" => {
+            tracing::warn!(
+                "{}: session.post_script_shaping = \"off\" disables all shaping once the script is \
+                 exhausted: every further record carries the exact pending backlog size, so the \
+                 plaintext length maps 1:1 onto the on-wire record length. That is precisely the \
+                 correlation the shaped-record design removes, and it is the direct input to the \
+                 paper's Wo = 25 packet-size sequence. Only use it for throughput benchmarking, \
+                 never on a censored path.",
+                prefix
+            );
+        }
+        other => {
+            tracing::warn!(
+                "{}: session.post_script_shaping '{}' is invalid (expected \"markov\" or \"off\"); the default \"markov\" behavior will be used instead",
+                prefix,
+                other
+            );
+        }
     }
 }
 
+/// `traffic_script` 的校验分两层：
+///
+/// 1. **语法** —— 与 session 侧共用同一解析实现
+///    （`crate::script::parse_traffic_script`），校验结果即 shaper 的实际行为：
+///    解析失败则回退内嵌默认脚本。
+/// 2. **语义**（本轮新增）—— 解析成功的脚本仍可能主动制造论文的判别特征
+///    （L1 类记录、开场 PING 对、跨 MTU 记录、周期性自相关）。此前这一层完全
+///    不存在：一份语法合法但会把这个部署单独暴露出来的脚本可以静默上线。
+///
+/// 语义问题一律只告警、不改变行为，理由见 `script::lint_traffic_script`：解析
+/// 失败会回退内嵌默认，把这个部署重新推回「全世界跑同一份默认」的群体，而那
+/// 正是自定义脚本存在的唯一理由。
 fn validate_traffic_script(prefix: &str, script: &[String]) {
-    // 与 session 侧共用同一解析实现（crate::script::parse_traffic_script），
-    // 校验结果即 shaper 的实际行为：解析失败则回退内嵌默认脚本。
-    if let Err(e) = crate::script::parse_traffic_script(script) {
-        tracing::warn!(
-            "{}: traffic_script is malformed ({}); the embedded default script will be used instead",
-            prefix,
-            e
-        );
+    match crate::script::parse_traffic_script(script) {
+        Err(e) => {
+            tracing::warn!(
+                "{}: traffic_script is malformed ({}); the embedded default script will be used instead",
+                prefix,
+                e
+            );
+        }
+        Ok(parsed) => {
+            for warning in crate::script::lint_traffic_script(&parsed) {
+                tracing::warn!("{}: traffic_script: {}", prefix, warning);
+            }
+        }
     }
 }
 
@@ -209,6 +248,55 @@ mod tests {
         // Invalid values only trigger a warning and are treated as unset
         // (the default "markov" behavior); validation must not fail.
         let session = session_with_post_script_shaping(Some("bogus"));
+        assert!(validate_session_config("test", &session).is_ok());
+    }
+
+    fn session_with_script(entries: &[&str]) -> crate::model::SessionConfig {
+        crate::model::SessionConfig {
+            traffic_script: Some(entries.iter().map(|s| s.to_string()).collect()),
+            ..Default::default()
+        }
+    }
+
+    /// 语义校验只告警、不改变返回值：一份语法合法但会制造判别特征的脚本仍然
+    /// 启动成功（解析失败才回退内嵌默认，而回退会把部署推回群体默认）。
+    #[test]
+    fn traffic_script_semantic_problems_are_non_fatal() {
+        // L1 类 + 开场 PING 对 + 跨 MTU + 4.3 个周期，四条警告全中。
+        let session = session_with_script(&[
+            "stop=26",
+            "0=L:40-80,D:0,F:1",
+            "1=L:300-4000,D:0,F:0",
+            "2=L:300-400,D:0,F:0",
+            "3=L:300-400,D:0,F:0",
+            "4=L:300-400,D:0,F:0",
+            "5=L:300-400,D:0,F:0",
+        ]);
+        assert!(validate_session_config("test", &session).is_ok());
+
+        let parsed =
+            crate::script::parse_traffic_script(session.traffic_script.as_ref().unwrap()).unwrap();
+        let warnings = crate::script::lint_traffic_script(&parsed);
+        assert!(warnings.iter().any(|w| w.contains("L1 size class")));
+        assert!(warnings.iter().any(|w| w.contains("PING")));
+        assert!(warnings.iter().any(|w| w.contains("single-MTU-segment")));
+        assert!(warnings.iter().any(|w| w.contains("rule cycle")));
+    }
+
+    /// 参考脚本走完整的配置校验路径必须零警告。
+    #[test]
+    fn reference_traffic_script_validates_without_warnings() {
+        let session = session_with_script(crate::script::REFERENCE_TRAFFIC_SCRIPT);
+        assert!(validate_session_config("test", &session).is_ok());
+        let parsed =
+            crate::script::parse_traffic_script(session.traffic_script.as_ref().unwrap()).unwrap();
+        assert!(crate::script::lint_traffic_script(&parsed).is_empty());
+    }
+
+    /// 格式错误的脚本仍然只是警告 + 回退。
+    #[test]
+    fn malformed_traffic_script_is_non_fatal() {
+        let session = session_with_script(&["garbage"]);
         assert!(validate_session_config("test", &session).is_ok());
     }
 
