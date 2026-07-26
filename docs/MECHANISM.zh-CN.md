@@ -125,34 +125,37 @@ shaper 维护三个覆盖连接全生命周期的宏状态（无硬切分"前 N 
 
 ### 3.5 声明式流量脚本引擎
 
-流量脚本引擎为握手完成后的数据包序列提供确定性、可回放的控制，包括记录尺寸、记录间延迟、以及对端交互信号。它由用户提供（或嵌入式默认）的规则列表驱动，每条规则对应一个发出包，通过 `packet_seq % script.len()` 循环应用。这使得操作者可以预编程一条模拟已知目标应用（如 TLS 加密的视频流或 Web 浏览会话）的包尺寸序列，而不将记录尺寸耦合至实际隧道载荷。
+流量脚本引擎为握手完成后的数据包序列提供确定性、可回放的控制，包括记录尺寸、记录间延迟、以及对端交互信号。它由用户提供（或嵌入式默认）的规则列表驱动，规则按 `packet_seq % 规则数` 循环应用，直到 `packet_seq` 达到脚本的 `stop` 计数（默认等于规则数）。这使得操作者可以预编程一条模拟已知目标应用（如 TLS 加密的视频流或 Web 浏览会话）的包尺寸序列，而不将记录尺寸耦合至实际隧道载荷。
 
 **规则结构：**
 ```
-ScriptRule { len_lo, len_hi, delay: DelaySpec, expect_responses: u8 }
+ScriptRule { len_lo, len_hi, delay: DelaySpec, expect_responses: u8, fake_jitter: i32 }
 ```
 
 | 字段 | 含义 |
 |---|---|
 | `len_lo`..`len_hi` | 该记录中嵌入的**应用内容字节数**，从区间内均匀随机采样。Shaper 计算 `target_wire_len = MIN_DATA_WIRE_LEN + (len_lo..len_hi)`，按该精确线速尺寸填充并加密。真实待发送数据最多消耗 `len_lo..len_hi` 字节；若积压少于目标，由噪声池填充补齐；若积压更多，仅切走一块，余量保留供后续迭代。 |
 | `delay` | `DelaySpec::None`（零延迟）或 `DelaySpec::LogNormal{mu_ms, sigma_ms}`（从拟合对数正态分布采样的记录间暂停）。详见 §3.6。 |
-| `expect_responses` | 若 `> 0`，发送方在此数据记录 flush 完成后**立即**在 **Control** 通道上排入一个 `CMD_PADDING` 请求（opcode 0x08）。对端解码请求后，向发送方回吐 `M` 个独立拆分的应答帧（§3.8）。该字段设为 `0` 表示普通单向数据规则。 |
+| `expect_responses` | 若 `> 0`，发送方在 **Control** 通道上排入一个 `CMD_PADDING` 请求（opcode 0x08）。对端解码请求后，向发送方回吐 `M` 个独立拆分的应答帧（§3.8）。该字段设为 `0` 表示普通单向数据规则。 |
+| `fake_jitter` | fake 响应的落点抖动：规则每次触发时，从 `[min(0,k), max(0,k)]` 区间内相对触发记录均匀采样一个偏移。负偏移在触发记录**之前**发出请求（归于前一条记录的槽位）；零固定于触发记录；正偏移延后发出，待目标记录发出时释放（脚本达到 `stop` 时全部剩余强制释放）。该机制将掩护帧簇与其触发记录解相关。 |
 
 **脚本生命周期与融合窗口：**
 
-脚本运行 `script.len()` 个数据包。最后一条规则用尽后，引擎进入长度为 `SCRIPT_BLEND_WINDOW = 6` 包的**平滑融合窗口**。在此窗口内，切入 Markov 状态机（§3.4）的概率从 0% 线性渐变至 100%，消除 "前 N 包后突变" 的硬切分断崖，产生在线速尺寸分布上不可指纹的平滑切换。
+脚本运行 `stop` 个数据包（`stop` 默认等于规则数；更大的 `stop` 会重复循环规则）。最后一个脚本包发出后，引擎进入长度为 `SCRIPT_BLEND_WINDOW = 6` 包的**平滑融合窗口**。在此窗口内，切入 Markov 状态机（§3.4）的概率从 0% 线性渐变至 100%，消除 "前 N 包后突变" 的硬切分断崖，产生在线速尺寸分布上不可指纹的平滑切换。
 
 融合窗口结束后，TrafficShaper 的 Markov 状态机接管连接剩余生命周期。Markov 转换参数无配置暴露——它完全由待发送缓冲区压力通过概率 `p_bulk` 渐变推导（§3.4）。
 
-**脚本后整形开关（`post_script_shaping`）：** 可选配置字段 `session.post_script_shaping` 选择脚本用尽后的行为。默认 `"markov"` 如上所述（融合窗口 → Markov 机）。`"off"` 关闭脚本后的全部整形：`packet_seq` 达到 `script.len()` 后，后续每条记录精确承载当前积压载荷（线速尺寸 = 积压 + 固定 record 开销），零延迟、无 Fake 帧、无融合窗口——从此刻起明文尺寸直接映射至线速尺寸。两种模式下 bulk fast path 与 bulk 迟滞（§3.4）均保持优先。除 `"markov"`/`"off"` 外的取值在启动时触发非致命警告并按未设置处理。
+**脚本后整形开关（`post_script_shaping`）：** 可选配置字段 `session.post_script_shaping` 选择脚本用尽后的行为。默认 `"markov"` 如上所述（融合窗口 → Markov 机）。`"off"` 关闭脚本后的全部整形：`packet_seq` 达到 `stop` 后，后续每条记录精确承载当前积压载荷（线速尺寸 = 积压 + 固定 record 开销），零延迟、无 Fake 帧、无融合窗口——从此刻起明文尺寸直接映射至线速尺寸。两种模式下 bulk fast path 与 bulk 迟滞（§3.4）均保持优先。除 `"markov"`/`"off"` 外的取值在启动时触发非致命警告并按未设置处理。
 
 **数据包收发示例——客户端→服务端，3 规则脚本：**
 
 假设 `traffic_script` 内容：
-```
-Length: 200~250, Delay: 0, FakeResponse: 0
-Length: 300~400, Delay: 2.0~0.5, FakeResponse: 1
-Length: 180~220, Delay: 1.5~0.6, FakeResponse: 0
+```json
+"traffic_script": [
+  "0=L:200-250,D:0,F:0",
+  "1=L:300-400,D:2.0-0.5,F:1",
+  "2=L:180-220,D:1.5-0.6,F:0"
+]
 ```
 
 实际应用数据积压：6000 字节。
@@ -172,14 +175,17 @@ Length: 180~220, Delay: 1.5~0.6, FakeResponse: 0
 3. 服务端帧处理器立即向客户端回吐 1 条 `CMD_PADDING` 应答帧（`cmd=0x08, flag=1`，噪声池填充垃圾字节），通过 Control 通道发出。该应答帧为独立的 0x17 record，尺寸从 Control 类传输态池中采样（33–82 或 124–824 字节，§3.2）。
 4. 应答帧永不递交至任何 stream——在 session 帧处理层解码后静默丢弃，仅作为掩护流量打破一问一答对称性。
 
-脚本源为嵌入式默认值（6 条规则，见 §8），可通过 `traffic_script` 配置字段覆盖。脚本解析器支持 `#` 注释和空行。配置验证在启动时对每行执行 parse-check；格式错误行触发非致命警告并回退至嵌入式默认脚本。
+脚本源为嵌入式默认值（6 条规则，见 §8），可通过 `traffic_script` 配置字段覆盖。配置值为 JSON 字符串数组：一个可选的 `stop=N` 控制条目，后跟带索引的规则 `i=L:...,D:...,F:...`（索引必须与规则的 0 基位置一致）。配置验证在启动时解析该数组；任一格式错误的条目触发非致命警告并回退至嵌入式默认脚本。
 
-`Length` 字段除 `lo~hi` 外还接受 `base?range` 语法：在 shaper 构建时每连接采样一次 `base + U[0, range]`，该值在此连接的生命周期内固定。解析完成后，每个连接在 `TrafficShaper::new` 中对脚本做随机化：规则顺序按随机偏移轮转，且每条规则的长度区间乘以独立的 U[0.85, 1.20] 采样（钳制至 ≥ 1 且 ≤ 数据 record 容量），因此「位置 → 尺寸」映射跨连接不恒定。
+`L` 字段除 `lo-hi` 外还接受 `base?range` 语法：在 shaper 构建时每连接采样一次 `base + U[0, range]`，该值在此连接的生命周期内固定。解析完成后，每个连接在 `TrafficShaper::new` 中对脚本做随机化：规则顺序按随机偏移轮转，且每条规则的长度区间乘以独立的 U[0.85, 1.20] 采样（钳制至 ≥ 1 且 ≤ 数据 record 容量），因此「位置 → 尺寸」映射跨连接不恒定。
 
 格式示例：
-```
-Length: 200~250, Delay: 0, FakeResponse: 0
-Length: 300~400, Delay: 1.5~0.5, FakeResponse: 2
+```json
+"traffic_script": [
+  "stop=4",
+  "0=L:200-250,D:0,F:0",
+  "1=L:300-400,D:1.5-0.5,F:2?-1"
+]
 ```
 
 ### 3.6 IAT 延迟建模
@@ -365,17 +371,18 @@ Firefox 和 Python-OpenSSL 预设精确保留捕获的记录形态（扩展顺�
 |---|---|---|---|
 | `max_streams_per_session` | usize　　　 | 256　　　　　　　| 每个隧道 Session 最大并发多路复用流数。 |
 | `idle_timeout_secs`　　　| u64　　　　 | 45　　　　　　　 | Session 空闲拆除超时（含 ±10% 抖动）。 |
-| `traffic_script`　　　　　| optional string |（嵌入式默认）　 | 声明式流量脚本，控制握手完成后数据包的行为（§3.5）。规则通过 `packet_seq % N` 循环应用，并以 6 包平滑融合窗口过渡至 Markov 机。示例：`"Length: 200~250, Delay: 0, FakeResponse: 0\nLength: 300~400, Delay: 2.0~0.5, FakeResponse: 1"`。格式错误的规则在启动时触发非致命警告，并回退至嵌入式默认脚本。 |
+| `traffic_script`　　　　　| optional string array |（嵌入式默认）　 | 声明式流量脚本，控制握手完成后数据包的行为（§3.5）：一个可选的 `stop=N` 条目加带索引的规则 `i=L:lo-hi,D:d,F:f`。规则按 `packet_seq % N` 循环应用直到 `stop`，随后以 6 包平滑融合窗口过渡至 Markov 机。示例：`["stop=4", "0=L:200-250,D:0,F:0", "1=L:300-400,D:2.0-0.5,F:1"]`。格式错误的脚本在启动时触发非致命警告，并回退至嵌入式默认脚本。 |
 | `post_script_shaping` | optional string | `"markov"` | 脚本后整形模式（§3.5）。`"markov"`（默认）：融合窗口 → Markov 机。`"off"`：脚本用尽后按积压精确尺寸发出，零延迟、无 Fake 帧。非法取值在启动时触发非致命警告并按未设置处理。 |
 
-嵌入式默认脚本：
+嵌入式默认脚本（以 `traffic_script` 配置语法展示）：
 ```
-Length: 200~250, Delay: 0, FakeResponse: 0
-Length: 180~220, Delay: 1.5~0.6, FakeResponse: 0
-Length: 250~350, Delay: 0, FakeResponse: 1
-Length: 300~400, Delay: 2.0~0.5, FakeResponse: 0
-Length: 200~300, Delay: 0, FakeResponse: 1
-Length: 400~600, Delay: 3.0~0.7, FakeResponse: 0
+stop=6
+0=L:200-250,D:0,F:0
+1=L:180-220,D:1.5-0.6,F:0
+2=L:250-350,D:0,F:1
+3=L:300-400,D:2.0-0.5,F:0
+4=L:200-300,D:0,F:1
+5=L:400-600,D:3.0-0.7,F:0
 ```
 
 脚本规则用尽后（通过平滑融合窗口衔接进入 Markov 机），TrafficShaper 的 Markov 状态机（§3.4）在连接剩余生命周期中掌管尺寸与延迟策略。Markov 转换参数无配置暴露——它们源自待发送缓冲区压力通过概率 `p_bulk` 渐变且方向对称。

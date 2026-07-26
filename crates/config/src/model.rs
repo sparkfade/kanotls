@@ -105,7 +105,7 @@ pub struct SessionConfig {
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
     #[serde(default)]
-    pub traffic_script: Option<String>,
+    pub traffic_script: Option<Vec<String>>,
     #[serde(default)]
     pub post_script_shaping: Option<String>,
 }

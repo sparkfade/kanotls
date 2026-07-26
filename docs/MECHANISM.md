@@ -125,34 +125,37 @@ The shaper maintains three macro-states that govern sizing policy over the conne
 
 ### 3.5 Declarative Traffic Script Engine
 
-The traffic script engine provides deterministic, replayable control over the sequence of post-handshake data record sizes, inter-record delays, and peer-interaction signals. It is driven by a user-supplied (or embedded default) list of rules, one per emitted packet, cycled via `packet_seq % script.len()`. This allows the operator to pre-program a specific packet-size trace that mimics a known target application (e.g. a TLS-encrypted video stream or web-browsing session) without coupling the record size to the actual tunneled payload.
+The traffic script engine provides deterministic, replayable control over the sequence of post-handshake data record sizes, inter-record delays, and peer-interaction signals. It is driven by a user-supplied (or embedded default) list of rules cycled via `packet_seq % rule_count` until `packet_seq` reaches the script's `stop` count (default: the rule count). This allows the operator to pre-program a specific packet-size trace that mimics a known target application (e.g. a TLS-encrypted video stream or web-browsing session) without coupling the record size to the actual tunneled payload.
 
 **Rule structure:**
 ```
-ScriptRule { len_lo, len_hi, delay: DelaySpec, expect_responses: u8 }
+ScriptRule { len_lo, len_hi, delay: DelaySpec, expect_responses: u8, fake_jitter: i32 }
 ```
 
 | Field | Meaning |
 |---|---|
 | `len_lo`..`len_hi` | The **application‑content byte count** to embed in this record. Sampled uniformly from the interval. The shaper computes `target_wire_len = MIN_DATA_WIRE_LEN + (len_lo..len_hi)`, pads to that exact wire size, and encrypts. Any real pending data up to `len_lo..len_hi` bytes is consumed; if the pending backlog is smaller, noise-pool padding fills the gap. If the backlog is larger, only a chunk is taken — the remainder stays in `pending` for the next iteration. |
 | `delay` | `DelaySpec::None` (zero delay) or `DelaySpec::LogNormal{mu_ms, sigma_ms}` (inter-record pause sampled from a fitted log‑normal distribution). See §3.6. |
-| `expect_responses` | If `> 0`, the sender queues a `CMD_PADDING` request (opcode 0x08) on the **Control** channel *immediately after* this data record is flushed. The peer, upon decoding the request, responds with `M` independently-split reply frames (§3.8). The field is set to `0` for normal unilateral-data rules. |
+| `expect_responses` | If `> 0`, the sender queues a `CMD_PADDING` request (opcode 0x08) on the **Control** channel. The peer, upon decoding the request, responds with `M` independently-split reply frames (§3.8). The field is set to `0` for normal unilateral-data rules. |
+| `fake_jitter` | Position jitter for the fake response: each time the rule fires, an offset is sampled uniformly from `[min(0,k), max(0,k)]` records relative to the triggering record. A negative offset emits the request *before* the triggering record (the previous record's slot); zero pins it to the triggering record; a positive offset defers it, released when the target record is emitted (any remainder is flushed once the script reaches `stop`). This decorrelates the cover-frame cluster from its triggering record. |
 
 **Script lifecycle and blend window:**
 
-The script runs for `script.len()` packets. After the last rule is consumed, the engine enters a **smooth blend window** of `SCRIPT_BLEND_WINDOW = 6` packets. Within this window the probability of falling through to the Markov state machine (§3.4) ramps linearly from 0% to 100%. This eliminates the abrupt "first‑N‑packets‑then‑Markov" cliff, producing a gradual handover that is not fingerprintable via inter‑record size discontinuities.
+The script runs for `stop` packets (`stop` defaults to the rule count; a larger `stop` re-cycles the rules). After the last scripted packet, the engine enters a **smooth blend window** of `SCRIPT_BLEND_WINDOW = 6` packets. Within this window the probability of falling through to the Markov state machine (§3.4) ramps linearly from 0% to 100%. This eliminates the abrupt "first‑N‑packets‑then‑Markov" cliff, producing a gradual handover that is not fingerprintable via inter‑record size discontinuities.
 
 After the blend window, the TrafficShaper's Markov machine takes over for the remainder of the connection lifetime. No configuration surface exists for the Markov parameters — they are derived solely from the pending-backlog pressure via the probabilistic `p_bulk` ramp (§3.4).
 
-**Post-script shaping switch (`post_script_shaping`):** the optional `session.post_script_shaping` config field selects what happens once the script is exhausted. The default `"markov"` behaves as described above (blend window → Markov machine). `"off"` disables all post-script shaping: once `packet_seq` reaches `script.len()`, every subsequent record carries exactly the pending payload (wire size = pending + fixed record overhead), with zero delay, no fake frames, and no blend window — plaintext size maps directly to wire size from that point on. The bulk fast path and bulk hysteresis (§3.4) still take priority in both modes. Any value other than `"markov"`/`"off"` triggers a non-fatal startup warning and is treated as unset.
+**Post-script shaping switch (`post_script_shaping`):** the optional `session.post_script_shaping` config field selects what happens once the script is exhausted. The default `"markov"` behaves as described above (blend window → Markov machine). `"off"` disables all post-script shaping: once `packet_seq` reaches `stop`, every subsequent record carries exactly the pending payload (wire size = pending + fixed record overhead), with zero delay, no fake frames, and no blend window — plaintext size maps directly to wire size from that point on. The bulk fast path and bulk hysteresis (§3.4) still take priority in both modes. Any value other than `"markov"`/`"off"` triggers a non-fatal startup warning and is treated as unset.
 
 **Packet flow example — client → server, 3‑rule script:**
 
 Assume the following `traffic_script`:
-```
-Length: 200~250, Delay: 0, FakeResponse: 0
-Length: 300~400, Delay: 2.0~0.5, FakeResponse: 1
-Length: 180~220, Delay: 1.5~0.6, FakeResponse: 0
+```json
+"traffic_script": [
+  "0=L:200-250,D:0,F:0",
+  "1=L:300-400,D:2.0-0.5,F:1",
+  "2=L:180-220,D:1.5-0.6,F:0"
+]
 ```
 
 Real application data queued: 6000 bytes.
@@ -172,14 +175,17 @@ After packet 3 the script has exhausted its 3 rules. Packets 4–9 are emitted w
 3. Server's frame handler immediately emits 1 `CMD_PADDING` reply frame (`cmd=0x08, flag=1`, junk from noise pool) back to the client on the Control channel. This reply frame is a separate 0x17 record with a size sampled from the Control class transport pool (33–82 or 124–824 bytes, §3.2).
 4. The reply frame is never delivered to any stream — it is decoded and discarded at the session frame‑handler level, acting purely as cover traffic to break one‑request/one‑response symmetry.
 
-Scripts are sourced from an embedded default (6 rules, listed in §8), overridable via the `traffic_script` config field. The script parser supports `#` comments and blank lines. Config validation parse‑checks each line at startup; malformed lines trigger a non‑fatal warning and the embedded default is used as fallback.
+Scripts are sourced from an embedded default (6 rules, listed in §8), overridable via the `traffic_script` config field. The config value is a JSON string array: an optional `stop=N` control entry followed by indexed rules `i=L:...,D:...,F:...` whose index must match the rule's 0-based position. Config validation parses the array at startup; any malformed entry triggers a non‑fatal warning and the embedded default is used as fallback.
 
-Besides `lo~hi`, the `Length` field also accepts `base?range`: the value is sampled once per connection at shaper construction as `base + U[0, range]` and then stays fixed for that connection's lifetime. After parsing, every connection randomizes its script in `TrafficShaper::new`: the rule order is rotated by a random offset and each rule's length window is scaled by an independent sample from U[0.85, 1.20] (clamped to ≥ 1 and ≤ data-record capacity), so the position→size mapping is not constant across connections.
+Besides `lo-hi`, the `L` field also accepts `base?range`: the value is sampled once per connection at shaper construction as `base + U[0, range]` and then stays fixed for that connection's lifetime. After parsing, every connection randomizes its script in `TrafficShaper::new`: the rule order is rotated by a random offset and each rule's length window is scaled by an independent sample from U[0.85, 1.20] (clamped to ≥ 1 and ≤ data-record capacity), so the position→size mapping is not constant across connections.
 
 Format example:
-```
-Length: 200~250, Delay: 0, FakeResponse: 0
-Length: 300~400, Delay: 1.5~0.5, FakeResponse: 2
+```json
+"traffic_script": [
+  "stop=4",
+  "0=L:200-250,D:0,F:0",
+  "1=L:300-400,D:1.5-0.5,F:2?-1"
+]
 ```
 
 ### 3.6 IAT Delay Modeling
@@ -365,17 +371,18 @@ The `session` block (optional, under `settings` in both client outbounds and ser
 |---|---|---|---|
 | `max_streams_per_session` | usize | 256 | Maximum concurrent multiplexed streams per tunnel session. |
 | `idle_timeout_secs` | u64 | 45 | Session idle teardown timeout (with ±10% jitter). |
-| `traffic_script` | optional string | (embedded default) | Declarative script controlling post-handshake data packets (§3.5). Rules are cycled with `packet_seq % N` and transition to the Markov machine via a 6-packet smooth blend window. Example: `"Length: 200~250, Delay: 0, FakeResponse: 0\nLength: 300~400, Delay: 2.0~0.5, FakeResponse: 1"`. Malformed rules trigger a non-fatal startup warning; the embedded default is used as fallback. |
+| `traffic_script` | optional string array | (embedded default) | Declarative script controlling post-handshake data packets (§3.5): an optional `stop=N` entry plus indexed rules `i=L:lo-hi,D:d,F:f`. Rules are cycled with `packet_seq % N` until `stop`, then transition to the Markov machine via a 6-packet smooth blend window. Example: `["stop=4", "0=L:200-250,D:0,F:0", "1=L:300-400,D:2.0-0.5,F:1"]`. Malformed scripts trigger a non-fatal startup warning; the embedded default is used as fallback. |
 | `post_script_shaping` | optional string | `"markov"` | Post-script shaping mode (§3.5). `"markov"` (default): blend window → Markov machine. `"off"`: once the script is exhausted, records are emitted at their exact pending size with zero delay and no fake frames. Invalid values trigger a non-fatal startup warning and are treated as unset. |
 
-The embedded default script:
+The embedded default script (shown in `traffic_script` config syntax):
 ```
-Length: 200~250, Delay: 0, FakeResponse: 0
-Length: 180~220, Delay: 1.5~0.6, FakeResponse: 0
-Length: 250~350, Delay: 0, FakeResponse: 1
-Length: 300~400, Delay: 2.0~0.5, FakeResponse: 0
-Length: 200~300, Delay: 0, FakeResponse: 1
-Length: 400~600, Delay: 3.0~0.7, FakeResponse: 0
+stop=6
+0=L:200-250,D:0,F:0
+1=L:180-220,D:1.5-0.6,F:0
+2=L:250-350,D:0,F:1
+3=L:300-400,D:2.0-0.5,F:0
+4=L:200-300,D:0,F:1
+5=L:400-600,D:3.0-0.7,F:0
 ```
 
 After the script rules are exhausted (with the smooth blend window bridging into the Markov machine), the TrafficShaper's Markov state machine (§3.4) governs sizing and delay for the remainder of the connection lifecycle. No configuration surface exists for the Markov transition parameters — they are derived from the pending backlog pressure via a probabilistic `p_bulk` ramp and are directionally symmetric.

@@ -72,7 +72,15 @@ cargo build --release
         "session": {
           "max_streams_per_session": 256,
           "idle_timeout_secs": 45,
-          "traffic_script": "Length: 200~250, Delay: 0, FakeResponse: 0\nLength: 180~220, Delay: 1.5~0.6, FakeResponse: 0\nLength: 250~350, Delay: 0, FakeResponse: 1\nLength: 300~400, Delay: 2.0~0.5, FakeResponse: 0\nLength: 200~300, Delay: 0, FakeResponse: 1\nLength: 400~600, Delay: 3.0~0.7, FakeResponse: 0",
+          "traffic_script": [
+            "stop=6",
+            "0=L:200-250,D:0,F:0",
+            "1=L:180-220,D:1.5-0.6,F:0",
+            "2=L:250-350,D:0,F:1",
+            "3=L:300-400,D:2.0-0.5,F:0",
+            "4=L:200-300,D:0,F:1",
+            "5=L:400-600,D:3.0-0.7,F:0"
+          ],
           "post_script_shaping": "markov" // 可选
         }
       }
@@ -143,7 +151,15 @@ cargo build --release
         "session": {
           "max_streams_per_session": 256,
           "idle_timeout_secs": 45,
-          "traffic_script": "Length: 200~250, Delay: 0, FakeResponse: 0\nLength: 180~220, Delay: 1.5~0.6, FakeResponse: 0\nLength: 250~350, Delay: 0, FakeResponse: 1\nLength: 300~400, Delay: 2.0~0.5, FakeResponse: 0\nLength: 200~300, Delay: 0, FakeResponse: 1\nLength: 400~600, Delay: 3.0~0.7, FakeResponse: 0",
+          "traffic_script": [
+            "stop=6",
+            "0=L:200-250,D:0,F:0",
+            "1=L:180-220,D:1.5-0.6,F:0",
+            "2=L:250-350,D:0,F:1",
+            "3=L:300-400,D:2.0-0.5,F:0",
+            "4=L:200-300,D:0,F:1",
+            "5=L:400-600,D:3.0-0.7,F:0"
+          ],
           "post_script_shaping": "markov" // 可选
         }
       }
@@ -221,22 +237,29 @@ sing-box 风格规则，按顺序评估，首个匹配生效。规则的 `inboun
 
 `traffic_script` 是一个**可选**的声明式程序，用于控制握手完成后应用数据记录的尺寸、时序和对端交互行为。省略时使用嵌入式默认脚本（6 条规则，即上文配置示例所示）。`session.max_streams_per_session`、`session.idle_timeout_secs` 和 `session.traffic_script` 均为可选字段——各字段适用于哪一侧请参见[字段参考](#字段参考)。`session.post_script_shaping` 选择脚本用尽后的行为：默认 `"markov"` 经融合窗口过渡到 Markov 机；`"off"` 完全关闭脚本后整形（记录按积压载荷的精确尺寸发出，零延迟、无 FakeResponse）。
 
-脚本每行一条规则；`#` 注释和空行会被忽略。规则通过 `packet_seq % 规则数` 循环应用，用尽后在 6 包窗口内平滑过渡至 Markov 整形机（参见 docs/MECHANISM.zh-CN.md §3.5）。每条规则包含三个字段：
+脚本是一个 JSON 字符串数组：一个可选的 `stop=N` 控制条目（至多一个；省略时等于规则数）后跟带编号的规则 `i=L:...,D:...,F:...`，索引 `i` 必须与规则的 0 基位置一致（0、1、2……）。token 周围的空白会被容忍；每个条目都必须非空且格式正确。规则按 `packet_seq % 规则数` 循环应用，直到 `packet_seq` 达到 `stop`（`stop` 大于规则数即重复规则），随后在 6 包窗口内平滑过渡至 Markov 整形机（参见 docs/MECHANISM.zh-CN.md §3.5）。每条规则包含三个字段：
 
 | 字段 | 格式 | 含义 |
 |-------|--------|---------|
-| `Length` | `lo~hi` | 本条记录的应用内容字节数，从 `[lo, hi]` 区间均匀采样。整形器填充（或切分）至对应线速尺寸，使线速尺寸与真实载荷尺寸解耦。要求 `lo` ≤ `hi`。**必填。** |
-| `Delay` | `0` \| `mu~sigma` \| `n` | 记录间停顿。`0` = 无延迟；`mu~sigma` = 对数正态分布，参数单位毫秒；单个整数 `n` = `ln(n)~0.5` 的简写。 |
-| `FakeResponse` | 整数 | 若 `> 0`，本条记录 flush 后发送方排队一个 `CMD_PADDING` 请求，对端回复相应数量的非对称掩护帧（打破请求/响应对称性）。`0` 表示禁用。 |
+| `L` | `lo-hi` \| `n` \| `base?range` | 本条记录的应用内容字节数，从 `[lo, hi]` 区间均匀采样。整形器填充（或切分）至对应线速尺寸，使线速尺寸与真实载荷尺寸解耦。要求 `lo` ≤ `hi`。单个 `n` 为固定尺寸；`base?range` 在每条连接建立时采样一次 `base + U[0, range]` 并在该连接生命周期内固定。**必填。** |
+| `D` | `0` \| `mu-sigma` \| `n` | 记录间停顿。`0` = 无延迟；`mu-sigma` = 对数正态分布，参数单位毫秒；单个数字 `n` = `ln(n)-0.5` 的简写。 |
+| `F` | `0` \| `n` \| `n?k` | 若 `n > 0`，发送方排队一个 `CMD_PADDING` 请求，对端回复相应数量的非对称掩护帧（打破请求/响应对称性）。`0` 表示禁用。可选的 `?k` 为 fake 的落点加抖动：从 `[min(0,k), max(0,k)]` 区间内相对触发记录均匀采样一个偏移——负值在本条记录**之前**发出（归于前一条记录的槽位），零固定于本条记录，正值延后到之后的某条记录。 |
 
-示例（JSON 字符串中每个 `\n` 为字面换行符）：
+示例：
 
+```json
+"traffic_script": [
+  "stop=7",
+  "0=L:80-140,D:0,F:0",
+  "1=L:200-350,D:0,F:1",
+  "2=L:1200-4000,D:0,F:0",
+  "3=L:80-120,D:0,F:1?2"
+]
 ```
-Length: 200~250, Delay: 0, FakeResponse: 0
-Length: 300~400, Delay: 2.0~0.5, FakeResponse: 1
-```
 
-格式错误的规则为非致命错误：启动时记录警告并整体回退至嵌入式默认脚本。
+解读：握手后的前 7 条数据记录循环应用规则 0–3（`packet_seq % 4`）。记录尺寸从各规则的 `L` 窗口采样；规则 1 和规则 3 各触发一次掩护帧交换，其中规则 3 的 fake 可落在触发记录到其后第二条记录之间的任意位置。第 8 条记录起整形器平滑过渡至 Markov 机。
+
+格式错误的脚本为非致命错误：启动时记录警告并整体回退至嵌入式默认脚本。
 
 ### TLS 配置
 
