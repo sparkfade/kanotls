@@ -356,7 +356,7 @@ pub struct SessionConfig {
     pub is_client: bool,
     pub max_streams_per_session: usize,
     pub idle_timeout_secs: u64,
-    pub traffic_script: Option<String>,
+    pub traffic_script: Option<Vec<String>>,
     pub post_script_off: bool,
 }
 
@@ -379,7 +379,7 @@ impl SessionConfig {
         is_client: bool,
         max_streams_per_session: usize,
         idle_timeout_secs: u64,
-        traffic_script: Option<String>,
+        traffic_script: Option<Vec<String>>,
         post_script_off: bool,
     ) -> Self {
         Self {
@@ -1482,7 +1482,7 @@ impl SessionWriter {
         close_requested: Arc<AtomicBool>,
         close_notify: Arc<Notify>,
         is_client: bool,
-        traffic_script: Option<&str>,
+        traffic_script: Option<&[String]>,
         post_script_off: bool,
         pending_client_settings: Arc<Mutex<Option<Vec<u8>>>>,
     ) -> Self {
@@ -1496,7 +1496,7 @@ impl SessionWriter {
         let run_close_requested = close_requested.clone();
         let run_close_notify = close_notify.clone();
         let run_direction = direction;
-        let script_owned = traffic_script.map(|s| s.to_string());
+        let script_owned = traffic_script.map(|s| s.to_vec());
         tokio::spawn(async move {
             Self::run(
                 write_half,
@@ -1594,7 +1594,7 @@ impl SessionWriter {
         close_requested: Arc<AtomicBool>,
         close_notify: Arc<Notify>,
         direction: FlowDirection,
-        traffic_script: Option<String>,
+        traffic_script: Option<Vec<String>>,
         post_script_off: bool,
         pending_client_settings: Arc<Mutex<Option<Vec<u8>>>>,
     ) {
@@ -1917,6 +1917,7 @@ impl SessionWriter {
                         },
                         delay: Duration::ZERO,
                         fake: None,
+                        pre_fake: None,
                         allow_full_block: true,
                     }
                 }
@@ -1930,6 +1931,18 @@ impl SessionWriter {
             let take = payload_cap.min(remaining);
 
             {
+                // 负抖动 fake（F:n?k 采样到负偏移）：CMD_PADDING 控制记录
+                // 在本条数据记录之前上链，随本次 flush 一同发出，线上序为
+                // control → data，归于前一条记录的槽位。
+                if let Some(pre) = &policy.pre_fake {
+                    let mut encoded = Vec::new();
+                    encode_padding_request_into(&mut encoded, pre.responses);
+                    write_half.with_stream(|stream| {
+                        let state = stream.control_state();
+                        let size = stream.next_control_size(state, direction);
+                        stream.prepare_control_record(&encoded, size)
+                    })?;
+                }
                 let slice = &pending[consumed..consumed + take];
                 write_half.with_stream(|stream| {
                     stream.prepare_data_record(slice, policy.target_wire_len)

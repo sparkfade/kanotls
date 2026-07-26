@@ -72,7 +72,15 @@ Start with `kanotls --config config.json`. Role auto-detection: `"protocol": "ka
         "session": {
           "max_streams_per_session": 256,
           "idle_timeout_secs": 45,
-          "traffic_script": "Length: 200~250, Delay: 0, FakeResponse: 0\nLength: 180~220, Delay: 1.5~0.6, FakeResponse: 0\nLength: 250~350, Delay: 0, FakeResponse: 1\nLength: 300~400, Delay: 2.0~0.5, FakeResponse: 0\nLength: 200~300, Delay: 0, FakeResponse: 1\nLength: 400~600, Delay: 3.0~0.7, FakeResponse: 0",
+          "traffic_script": [
+            "stop=6",
+            "0=L:200-250,D:0,F:0",
+            "1=L:180-220,D:1.5-0.6,F:0",
+            "2=L:250-350,D:0,F:1",
+            "3=L:300-400,D:2.0-0.5,F:0",
+            "4=L:200-300,D:0,F:1",
+            "5=L:400-600,D:3.0-0.7,F:0"
+          ],
           "post_script_shaping": "markov" // optional
         }
       }
@@ -143,7 +151,15 @@ Start with `kanotls --config config.json`. Role auto-detection: `"protocol": "ka
         "session": {
           "max_streams_per_session": 256,
           "idle_timeout_secs": 45,
-          "traffic_script": "Length: 200~250, Delay: 0, FakeResponse: 0\nLength: 180~220, Delay: 1.5~0.6, FakeResponse: 0\nLength: 250~350, Delay: 0, FakeResponse: 1\nLength: 300~400, Delay: 2.0~0.5, FakeResponse: 0\nLength: 200~300, Delay: 0, FakeResponse: 1\nLength: 400~600, Delay: 3.0~0.7, FakeResponse: 0",
+          "traffic_script": [
+            "stop=6",
+            "0=L:200-250,D:0,F:0",
+            "1=L:180-220,D:1.5-0.6,F:0",
+            "2=L:250-350,D:0,F:1",
+            "3=L:300-400,D:2.0-0.5,F:0",
+            "4=L:200-300,D:0,F:1",
+            "5=L:400-600,D:3.0-0.7,F:0"
+          ],
           "post_script_shaping": "markov" // optional
         }
       }
@@ -221,22 +237,29 @@ Both server and client pre-allocate an 8 MiB entropy pool at startup, used for a
 
 `traffic_script` is an **optional** declarative program that controls the size, timing, and peer-interaction behavior of post-handshake application-data records. When omitted, an embedded default script (6 rules, shown in the config examples above) is used. `session.max_streams_per_session`, `session.idle_timeout_secs`, and `session.traffic_script` are all optional — see the [Config Reference](#config-reference) for which side each field applies to. `session.post_script_shaping` selects what happens once the script is exhausted: the default `"markov"` blends into the Markov machine, while `"off"` disables post-script shaping entirely (records are emitted at their exact pending size with zero delay and no fake responses).
 
-The script is one rule per line; `#` comments and blank lines are ignored. Rules are applied cyclically via `packet_seq % rule_count` and, once exhausted, blend into the Markov shaping machine over a 6-packet window (see docs/MECHANISM.md §3.5). Each rule has three fields:
+The script is a JSON array of entries: an optional `stop=N` control entry (at most one; defaults to the rule count) followed by numbered rules `i=L:...,D:...,F:...` whose index `i` must match the rule's 0-based position (0, 1, 2, ...). Whitespace around tokens is tolerated; every entry must be non-empty and well-formed. Rules are applied cyclically via `packet_seq % rule_count` until `packet_seq` reaches `stop` (so `stop` larger than the rule count repeats the rules), then blend into the Markov shaping machine over a 6-packet window (see docs/MECHANISM.md §3.5). Each rule has three fields:
 
 | Field | Format | Meaning |
 |-------|--------|---------|
-| `Length` | `lo~hi` | Application-content byte count for this record, sampled uniformly from `[lo, hi]`. The shaper pads (or splits) to the resulting wire size, decoupling wire size from real payload size. `lo` must be ≤ `hi`. **Required.** |
-| `Delay` | `0` \| `mu~sigma` \| `n` | Inter-record pause. `0` = no delay; `mu~sigma` = log-normal distribution with parameters in milliseconds; a bare integer `n` = shorthand for `ln(n)~0.5`. |
-| `FakeResponse` | integer | If `> 0`, after flushing this record the sender queues a `CMD_PADDING` request and the peer replies with that many asymmetric cover frames (breaks request/response symmetry). `0` disables it. |
+| `L` | `lo-hi` \| `n` \| `base?range` | Application-content byte count for this record, sampled uniformly from `[lo, hi]`. The shaper pads (or splits) to the resulting wire size, decoupling wire size from real payload size. `lo` must be ≤ `hi`. A bare `n` is a fixed size; `base?range` samples `base + U[0, range]` once per connection and keeps it fixed for that connection's lifetime. **Required.** |
+| `D` | `0` \| `mu-sigma` \| `n` | Inter-record pause. `0` = no delay; `mu-sigma` = log-normal distribution with parameters in milliseconds; a bare number `n` = shorthand for `ln(n)-0.5`. |
+| `F` | `0` \| `n` \| `n?k` | If `n > 0`, the sender queues a `CMD_PADDING` request and the peer replies with that many asymmetric cover frames (breaks request/response symmetry). `0` disables it. The optional `?k` jitters where the fake is emitted: an offset is sampled uniformly from `[min(0,k), max(0,k)]` records relative to the triggering record — negative emits *before* this record (the previous record's slot), zero pins it to this record, positive defers it to a later record. |
 
-Example (each `\n` is a literal newline inside the JSON string):
+Example:
 
+```json
+"traffic_script": [
+  "stop=7",
+  "0=L:80-140,D:0,F:0",
+  "1=L:200-350,D:0,F:1",
+  "2=L:1200-4000,D:0,F:0",
+  "3=L:80-120,D:0,F:1?2"
+]
 ```
-Length: 200~250, Delay: 0, FakeResponse: 0
-Length: 300~400, Delay: 2.0~0.5, FakeResponse: 1
-```
 
-Malformed rules are non-fatal: a warning is logged at startup and the entire embedded default script is used as fallback.
+Reading it: the first 7 post-handshake data records cycle rules 0–3 (`packet_seq % 4`). Record sizes are drawn from each rule's `L` window; rule 1 and rule 3 additionally trigger one cover-frame exchange, rule 3's landing anywhere from the triggering record up to two records later. From the 8th record onward the shaper blends into the Markov machine.
+
+Malformed scripts are non-fatal: a warning is logged at startup and the entire embedded default script is used as fallback.
 
 ### TLS Configuration
 

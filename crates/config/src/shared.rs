@@ -39,7 +39,7 @@ fn validate_post_script_shaping(prefix: &str, mode: &str) {
     }
 }
 
-fn validate_traffic_script(prefix: &str, script: &str) {
+fn validate_traffic_script(prefix: &str, script: &[String]) {
     // 与 session 侧共用同一解析实现（crate::script::parse_traffic_script），
     // 校验结果即 shaper 的实际行为：解析失败则回退内嵌默认脚本。
     if let Err(e) = crate::script::parse_traffic_script(script) {

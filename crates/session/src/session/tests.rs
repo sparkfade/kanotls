@@ -2162,7 +2162,7 @@ async fn delay_window_passes_through_syn_before_delay_expires() {
     // 帧边界（policy 切分不越过帧尾），其后的 delay 窗口允许控制帧插队。
     let mut shaper = TrafficShaper::new(
         FlowDirection::C2S,
-        Some("Length: 1500, Delay: 200, FakeResponse: 0"),
+        Some(&["0=L:1500,D:200,F:0".to_string()][..]),
         false,
     );
 
@@ -2244,7 +2244,7 @@ async fn delay_window_defers_syn_off_frame_boundary() {
     // delay 窗口都落在帧载荷中间（非边界），SYN 不得插队。
     let mut shaper = TrafficShaper::new(
         FlowDirection::C2S,
-        Some("Length: 300, Delay: 100, FakeResponse: 0"),
+        Some(&["0=L:300,D:100,F:0".to_string()][..]),
         false,
     );
 
@@ -2331,7 +2331,7 @@ async fn delay_window_defers_padding_until_after_drain() {
 
     let mut shaper = TrafficShaper::new(
         FlowDirection::C2S,
-        Some("Length: 300, Delay: 200, FakeResponse: 0"),
+        Some(&["0=L:300,D:200,F:0".to_string()][..]),
         false,
     );
 
@@ -2427,7 +2427,7 @@ async fn delay_window_blocks_pass_through_once_deferred() {
     // ∈ [571,816]（非边界），record2 吞掉剩余（边界）。
     let mut shaper = TrafficShaper::new(
         FlowDirection::C2S,
-        Some("Length: 700, Delay: 200, FakeResponse: 0"),
+        Some(&["0=L:700,D:200,F:0".to_string()][..]),
         false,
     );
 
