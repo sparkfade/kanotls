@@ -273,10 +273,10 @@ fn encode_h2_wire_sized_padding(flag: u8, m: u8, target_wire_len: usize) -> Vec<
     let junk_len = target_wire_len
         .saturating_sub(CONTROL_RECORD_MIN_OVERHEAD)
         .saturating_sub(crate::frame::FRAME_HEADER_SIZE + 2);
+    // junk 保持零字节：整帧随后由 ChaChaPoly 加密，填充内容在线上不可见。
     let mut payload = vec![0u8; 2 + junk_len];
     payload[0] = flag;
     payload[1] = m;
-    kanotls_tunnel::fill_from_pool(&mut payload[2..]);
     Frame::new(CMD_PADDING, 0, payload)
         .encode()
         .expect("h2 skeleton padding frame encodes")

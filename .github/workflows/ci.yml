@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --release
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # 包含线上不可区分性回归测试套件
+      # （crates/tunnel/src/server/wire_tests.rs 与 template.rs 的比特均匀性
+      # 检验）。这些测试断言的是「审查者无法判别」而非功能正确性：常量字节、
+      # 跨连接重复、key_share 复用、比特偏置、时序点质量都会让 CI 失败。
+      - name: Test
+        run: cargo test --workspace --release

@@ -125,7 +125,12 @@ impl ClientHelloTemplate {
         let mac = derive_counter_mac(derived_psk, random, &masked_counter, random_prefix);
         session_id[16..24].copy_from_slice(&masked_counter);
         session_id[24..32].copy_from_slice(&mac);
-        session_id[31] &= !0x03;
+        // 低 2 位不参与 MAC 校验（服务端 `mask_mac_flags` 比较前会清零），
+        // 因此这里必须填随机位而不是清零：真实 session_id 是 32 字节均匀
+        // 随机，任何被钉死的比特都是被动观察者可统计的富集特征
+        // （单样本 4×，同一客户端 k 条连接即 4^-k）。填随机后线上恢复均匀，
+        // 且旧版服务端同样先 mask 再比较，故向后兼容。
+        session_id[31] = (session_id[31] & !0x03) | (rand::random::<u8>() & 0x03);
         apply_client_hello_randomization(
             &mut out,
             &self.cipher_suites_range,
@@ -135,9 +140,6 @@ impl ClientHelloTemplate {
     }
 }
 
-/// Generate a real ephemeral P-256 public key into `share_data` (65-byte
-/// uncompressed SEC1 point, 0x04 prefix — the exact shape ring emits).
-/// Returns false on any failure so the caller can fall back to random fill.
 /// Fill a 1216-byte X25519MLKEM768 hybrid key_share with structurally valid
 /// material. Layout: 768 ML-KEM.768 coefficients packed two-per-three-bytes
 /// as 12-bit values (1152 bytes), a 32-byte rho seed, then a 32-byte X25519
@@ -161,7 +163,10 @@ fn fill_mlkem768_hybrid_share(share_data: &mut [u8]) {
     rng.fill_bytes(&mut share_data[1152..]);
 }
 
-fn fill_p256_public_key(share_data: &mut [u8]) -> bool {
+/// Generate a real ephemeral P-256 public key into `share_data` (65-byte
+/// uncompressed SEC1 point, 0x04 prefix — the exact shape ring emits).
+/// Returns false on any failure so the caller can fall back to random fill.
+pub(crate) fn fill_p256_public_key(share_data: &mut [u8]) -> bool {
     let rng = ring::rand::SystemRandom::new();
     let Ok(private_key) =
         ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::ECDH_P256, &rng)
@@ -173,6 +178,34 @@ fn fill_p256_public_key(share_data: &mut [u8]) -> bool {
     };
     let public_bytes = public_key.as_ref();
     if public_bytes.len() != share_data.len() {
+        return false;
+    }
+    share_data.copy_from_slice(public_bytes);
+    true
+}
+
+/// Generate a real ephemeral X25519 public key into `share_data` (32 bytes).
+///
+/// A real X25519 public key is a u-coordinate reduced mod 2^255-19, so its most
+/// significant bit is always clear; 32 uniformly random bytes would set it half
+/// the time. Filling this with `fill_bytes` would therefore *introduce* a
+/// distinguisher rather than remove one — always derive a genuine key.
+/// Returns false on any failure so the caller can fail closed.
+pub(crate) fn fill_x25519_public_key(share_data: &mut [u8]) -> bool {
+    if share_data.len() != 32 {
+        return false;
+    }
+    let rng = ring::rand::SystemRandom::new();
+    let Ok(private_key) =
+        ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::X25519, &rng)
+    else {
+        return false;
+    };
+    let Ok(public_key) = private_key.compute_public_key() else {
+        return false;
+    };
+    let public_bytes = public_key.as_ref();
+    if public_bytes.len() != 32 {
         return false;
     }
     share_data.copy_from_slice(public_bytes);
@@ -1023,6 +1056,79 @@ mod tests {
         let recovered_counter =
             u64::from_be_bytes(crate::utils::xor_u64_bytes(masked_counter, mask));
         assert_eq!(recovered_counter, counter_val);
+    }
+
+    /// ClientHello 的 `random` 与 `session_id` 在真实 TLS 里是 32 字节均匀
+    /// 随机；任何被钉死的比特都是被动观察者可直接统计的富集特征。
+    ///
+    /// 具体来说，`session_id[24..32]` 承载 counter MAC，而其低 2 位不参与
+    /// 校验（服务端 `mask_mac_flags` 比较前会清零）。此前生成侧写的是
+    /// `session_id[31] &= !0x03`，于是每个 ClientHello 的该字节低 2 位恒为
+    /// 0：单个样本即带来 4× 富集，同一客户端 k 条连接则是 4^-k——而客户端
+    /// 连接池常驻 4–16 条连接并周期性轮换，几分钟内就能被确定性识别。
+    ///
+    /// 本测试对这两个区域做逐位平衡检验，任何常量位都会被抓出。
+    #[test]
+    fn client_hello_random_and_session_id_are_bitwise_uniform() {
+        const SAMPLES: usize = 512;
+        let derived_psk = crate::common::derive_psk(b"uniformity");
+        let template =
+            get_or_build_client_hello_template("example.com", Some("firefox"), None, true).unwrap();
+
+        // 每个采样用独立的 Noise ephemeral 与 counter，模拟不同连接。
+        let mut random_ones = [0usize; 32 * 8];
+        let mut session_ones = [0usize; 32 * 8];
+        for sample in 0..SAMPLES {
+            let mut initiator = snow::Builder::new(crate::common::NOISE_PARAMS.clone())
+                .psk(0, &derived_psk)
+                .unwrap()
+                .build_initiator()
+                .unwrap();
+            let mut noise_init = [0u8; 48];
+            initiator.write_message(&[], &mut noise_init).unwrap();
+            let ch = template
+                .instantiate(&derived_psk, &noise_init, sample as u64 + 1)
+                .unwrap();
+
+            let (random_range, session_range) =
+                client_hello_random_and_session_id_ranges(&ch).unwrap();
+            for (byte_idx, &byte) in ch[random_range].iter().enumerate() {
+                for bit in 0..8 {
+                    if byte >> bit & 1 == 1 {
+                        random_ones[byte_idx * 8 + bit] += 1;
+                    }
+                }
+            }
+            for (byte_idx, &byte) in ch[session_range].iter().enumerate() {
+                for bit in 0..8 {
+                    if byte >> bit & 1 == 1 {
+                        session_ones[byte_idx * 8 + bit] += 1;
+                    }
+                }
+            }
+        }
+
+        // 512 次伯努利(0.5)：|ones - 256| > 96 的概率远低于 1e-12，
+        // 而任何常量位会给出 0 或 512，必然越界。
+        let tolerance = 96usize;
+        let expected = SAMPLES / 2;
+        for (label, counts) in [("random", &random_ones), ("session_id", &session_ones)] {
+            for (idx, &ones) in counts.iter().enumerate() {
+                let deviation = ones.abs_diff(expected);
+                assert!(
+                    deviation <= tolerance,
+                    "{} bit {} (byte {}, bit {}) was 1 in {}/{} samples — a pinned or \
+                     biased bit in a field that must be uniformly random is directly \
+                     testable by a passive observer",
+                    label,
+                    idx,
+                    idx / 8,
+                    idx % 8,
+                    ones,
+                    SAMPLES
+                );
+            }
+        }
     }
 
     #[test]

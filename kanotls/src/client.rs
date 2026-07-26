@@ -27,10 +27,6 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
 
     validate_client_routing_runtime(&config)?;
 
-    // Eagerly materialize the shared high-entropy noise pool so the first
-    // shaped record does not pay the 8 MiB CSPRNG fill on the hot path.
-    kanotls_tunnel::init_entropy_pool();
-
     let outbound = &config.outbounds[0];
     let server_addr = format!("{}:{}", outbound.settings.server, outbound.settings.port);
     let sni = outbound.settings.tls.sni.clone();

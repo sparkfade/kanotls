@@ -7,7 +7,7 @@ use kanotls_session::{
     server::{ServerSessionHandler, ServerStream},
     SessionConfig,
 };
-use kanotls_tunnel::{init_entropy_pool, server_accept, validate_camouflage_endpoint};
+use kanotls_tunnel::{server_accept, validate_camouflage_endpoint};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,8 +43,6 @@ pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
         "validated camouflage endpoint {}:{}",
         camouflage_host, camouflage_port
     );
-
-    init_entropy_pool();
 
     let listen_addr = format!("{}:{}", inbound.listen, inbound.port);
     let listener = TcpListener::bind(&listen_addr).await?;

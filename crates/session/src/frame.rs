@@ -136,7 +136,8 @@ fn encode_padding_frame_into(dst: &mut Vec<u8>, flag: u8, m: u8, junk_len: usize
     dst[start + 5..start + 7].copy_from_slice(&(payload_len as u16).to_be_bytes());
     dst[start + 7] = flag;
     dst[start + 8] = m;
-    kanotls_tunnel::fill_from_pool(&mut dst[start + FRAME_HEADER_SIZE + 2..]);
+    // junk 保持 resize 写入的零字节：整帧随后由 ChaChaPoly 加密，填充内容
+    // 在线上不可见（见 common.rs 的 encrypt_variable_block）。
 }
 
 /// Encode `data` into a sequence of CMD_PSH frames for `stream_id`, chunked
