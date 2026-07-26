@@ -10,7 +10,7 @@ English docs: [README.md](README.md) | 机制: [docs/MECHANISM.zh-CN.md](docs/ME
 应用层:        SOCKS5 / HTTP CONNECT 代理
 会话层:        多路复用 stream + 单次 flush 流打开 + 主动流量整形 TLS record 分发
 传输层:        Noise_NNpsk0 (X25519 + ChaChaPoly + BLAKE2s) 封装在 TLS 1.3 record 内
-外层 TLS:      ClientHello 预设 (firefox / rustls / python-openssl)
+外层 TLS:      ClientHello 预设 (firefox)
                + 缓存参考站点 record 形态镜像
 UDP:           SOCKS5 UDP ASSOCIATE 通过 UDP-over-TCP stream data 承载
 ```
@@ -32,7 +32,7 @@ kanotls 使用独立 Noise 通道完成端点认证和载荷加密。Noise 临�
 - **HTTP CONNECT only**：HTTP inbound 仅接受 authority-form `CONNECT host:port`。
 - **目的地址保护**：服务端拒绝 loopback / private / link-local / multicast / broadcast / unspecified / CGNAT / reserved（`240.0.0.0/4`）/ port-0。
 - **单二进制部署**：`cargo build --release`。角色从入站协议类型自动识别。
-- **TLS 指纹预设**：`firefox`、`rustls`、`python-openssl`（别名 `baseline`）。默认 `firefox`。支持通过 `template_path` 注入自定义 ClientHello hex。
+- **TLS 指纹**：`firefox`（捕获的 bootstrap，唯一预设）。支持通过 `template_path` 注入自定义 ClientHello hex。所有模板在加载时统一规范化：剔除 ECH（`0xFE0D`/`0x014A`）、`early_data`（`0x0119`）、`use_srtp`（`0x001C`）和 `0x0022` 扩展，并逐连接重新生成系数合法的 X25519MLKEM768 混合密钥份额（支持 ML-KEM 的服务器会校验系数范围）。
 - **空闲拆除**：服务端 Session 使用 pin-reset 空闲定时器，每次成功读取时重置。空闲超时（默认 45 秒，可配置，含 ±10% 抖动）触发优雅 session 拆除（Noise 加密的 `close_notify` + TCP FIN）。客户端侧连接空闲生命周期由连接池全权管理（30s 空闲排干 + 种子化 soft TTL 轮换），`idle_timeout_secs` 仅服务端生效。无应用层心跳——内核 TCP keepalive（空闲 60 秒，间隔 30 秒，Linux 上 3 次重试）处理死端检测。
 - **主动流量整形**：全生命周期 Markov 状态机（TrafficShaper）主动对每条应用数据（0x17）记录进行切分、填充和节拍控制，记录线速尺寸由 shaper 策略决定——明文长度不再映射至线速尺寸。支持可选的声明式流量脚本（`traffic_script`）对握手后包序列进行确定性控制，包括记录间 Delay 时序（对数正态或预录制 IAT 回放）与非对称 FakeResponse 交互（CMD_PADDING）。所有填充字节源自统一的 8 MiB CSPRNG 预种子噪声池，与真实 AEAD 密文密码学同构。
 - **模板热重载**：`template_path` hex 文件每 30 秒轮询 mtime 变更。更新时文件被重新解析，模板缓存失效，新连接立即使用新 ClientHello 而无需重启。解析失败记录警告但保留旧模板。
@@ -263,17 +263,15 @@ sing-box 风格规则，按顺序评估，首个匹配生效。规则的 `inboun
 
 ### TLS 配置
 
-外层 TLS ClientHello 按 `fingerprint` 预设生成。`insecure`（默认 `false`）在原生 rustls ClientHello 生成路径中跳过 TLS 证书验证——端点认证和载荷加密完全由 `Noise_NNpsk0` 与配置的 `password` 提供，外层 TLS 仅提供伪装。服务端使用缓存的参考端点 profile 完成可见 record 回放；`template_path` 可用捕获的 hex 文件覆盖 Firefox/Python-OpenSSL 模板（`rustls` 忽略此字段）。
+外层 TLS ClientHello 由捕获的 Firefox 模板生成（`fingerprint` 唯一取值，亦为默认值）。端点认证和载荷加密完全由 `Noise_NNpsk0` 与配置的 `password` 提供，外层 TLS 仅提供伪装。服务端使用缓存的参考端点 profile 完成可见 record 回放；`template_path` 可用捕获的 hex 文件覆盖内嵌 Firefox 模板。所有模板（内嵌或自定义）在加载时统一规范化：剔除 ECH/early_data/use_srtp/0x0022 扩展，并将 X25519MLKEM768 份额重新随机化为系数合法的结构。
 
 ### TLS 指纹预设
 
 | 值 | 来源 | 加密套件顺序 | Key Share 组 |
 |---|------|-------------|-------------|
-| `firefox` | 捕获的 bootstrap | AES-128-GCM, ChaCha20-Poly1305, AES-256-GCM | X25519, SECP256R1 |
-| `rustls` | 原生 rustls TLS 1.3 | AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 | X25519, SECP256R1, SECP384R1 |
-| `python-openssl` | 捕获的 bootstrap | AES-256-GCM, ChaCha20-Poly1305, AES-128-GCM | X25519, SECP256R1 |
+| `firefox` | 捕获的 bootstrap | AES-128-GCM, ChaCha20-Poly1305, AES-256-GCM | X25519MLKEM768, X25519, SECP256R1 |
 
-`baseline` 是 `python-openssl` 的别名。默认：`firefox`。
+`firefox` 是唯一受支持的取值，亦为默认值。其他取值在配置校验时直接报错。
 
 ### 自定义 ClientHello：`template_path`
 
@@ -473,9 +471,9 @@ SOCKS5 出站示例：
 | `settings.port` | 服务端端口 |
 | `settings.password` | 服务端某个用户的预共享密钥（最少 32 字节） |
 | `settings.tls.sni` | 外层 ClientHello SNI（DNS 名称；不接受 IP 字面量） |
-| `settings.tls.insecure` | 可选。跳过 rustls 路径 TLS 证书验证（默认 `false`）。仅影响原生 rustls ClientHello 生成；Noise 提供端点认证。 |
-| `settings.tls.fingerprint` | 可选。预设：`firefox`（默认）、`rustls`、`python-openssl`、`baseline` |
-| `settings.tls.template_path` | 可选。捕获的 ClientHello hex 文件路径；覆盖 Firefox/Python-OpenSSL 模板（`rustls` 忽略）。每 30 秒 mtime 轮询热重载。 |
+| `settings.tls.insecure` | 可选，当前忽略（默认 `false`）。外层 TLS 握手为回放式伪装，不发生证书验证；Noise 提供端点认证。 |
+| `settings.tls.fingerprint` | 可选。仅 `firefox`（默认）；其他取值直接报配置错误 |
+| `settings.tls.template_path` | 可选。捕获的 ClientHello hex 文件路径；覆盖内嵌 Firefox 模板（同样经过规范化）。每 30 秒 mtime 轮询热重载。 |
 | `settings.session.idle_timeout_secs` | 可选。session 空闲超时（默认 45，服务端生效；客户端侧由连接池管理） |
 | `settings.session.max_streams_per_session` | 可选。单 session 最大并发 stream 数（默认 256，验证至 [1, 4096]） |
 | `settings.session.traffic_script` | 可选。声明式流量脚本（参见 docs/MECHANISM.zh-CN.md §3.5 及上文「流量脚本」章节） |

@@ -10,7 +10,7 @@ Experimental TLS + Noise tunnel for transport protocol research.
 Application:   SOCKS5 / HTTP CONNECT proxy
 Session:       Multiplexed streams + single-flush stream open + active traffic-shaped TLS record dispatch
 Transport:     Noise_NNpsk0 (X25519 + ChaChaPoly + BLAKE2s) inside TLS 1.3 records
-Outer TLS:     ClientHello presets (firefox / rustls / python-openssl)
+Outer TLS:     ClientHello preset (firefox)
                + cached reference endpoint record mirroring
 UDP:           SOCKS5 UDP ASSOCIATE carried as UDP-over-TCP stream data
 ```
@@ -32,7 +32,7 @@ Detailed mechanism reference: [docs/MECHANISM.md](docs/MECHANISM.md)
 - **HTTP CONNECT only**: HTTP inbound accepts only authority-form `CONNECT host:port`.
 - **Destination guardrails**: Server rejects loopback, private, link-local, multicast, broadcast, unspecified, CGNAT, reserved (`240.0.0.0/4`), and port-0 destinations.
 - **Single binary**: `cargo build --release`. Mode auto-detected from inbound protocol types.
-- **TLS fingerprint presets**: `firefox`, `rustls`, `python-openssl` (alias `baseline`). Default `firefox`. Custom ClientHello hex via `template_path`.
+- **TLS fingerprint**: `firefox` (captured bootstrap; the only preset). Custom ClientHello hex via `template_path`. At load time every template is normalized: the ECH (`0xFE0D`/`0x014A`), `early_data` (`0x0119`), `use_srtp` (`0x001C`) and `0x0022` extensions are stripped, and the X25519MLKEM768 hybrid key share is regenerated with structurally valid ML-KEM coefficients per connection (servers with ML-KEM support validate them).
 - **Idle teardown**: Pin-reset idle timer per server session; resets on each successful read. Idle timeout (default 45 s, configurable with ±10% jitter) triggers graceful session teardown with Noise-encrypted `close_notify` and TCP FIN. Client-side connection idle lifecycle is fully managed by the connection pool (30s idle drain + seeded soft TTL rotation); `idle_timeout_secs` applies to the server side only. No application-layer heartbeat — kernel TCP keepalive (60 s idle, 30 s interval, 3 retries on Linux) handles dead-peer detection.
 - **Active traffic shaping**: A full-lifecycle Markov state machine (TrafficShaper) actively slices, pads, and paces every application-data (0x17) record to shaper-dictated wire lengths — plaintext size never maps to wire size. Supports an optional declarative script (`traffic_script`) for deterministic control over post-handshake packet sequences, including inter-record Delay timing (log-normal or pre-recorded IAT replay) and asymmetric FakeResponse interactions (CMD_PADDING). All padding bytes are sourced from a shared 8 MiB CSPRNG-seeded noise pool, cryptographically isomorphic to genuine AEAD ciphertext.
 - **Template hot-reload**: `template_path` hex files are polled every 30 s for mtime changes. On update, the file is re-parsed, the template cache invalidated, and new connections pick up the fresh ClientHello without restart. Failed parses are logged but preserve the previous template.
@@ -263,17 +263,15 @@ Malformed scripts are non-fatal: a warning is logged at startup and the entire e
 
 ### TLS Configuration
 
-The outer TLS ClientHello is generated per the `fingerprint` preset. `insecure` (default `false`) disables TLS certificate verification in the native-rustls ClientHello generation path. Endpoint authentication and payload confidentiality come entirely from `Noise_NNpsk0` with the configured `password` — the outer TLS layer provides camouflage only. The server uses cached reference-endpoint profiles for visible record replay; `template_path` overrides the Firefox/Python-OpenSSL templates with a captured hex file (ignored by `rustls`).
+The outer TLS ClientHello is generated from the captured Firefox template (the only `fingerprint` value, and the default). Endpoint authentication and payload confidentiality come entirely from `Noise_NNpsk0` with the configured `password` — the outer TLS layer provides camouflage only. The server uses cached reference-endpoint profiles for visible record replay; `template_path` overrides the embedded Firefox template with a captured hex file. Every template (embedded or custom) is normalized at load time: ECH/early_data/use_srtp/0x0022 extensions are stripped and the X25519MLKEM768 share is re-randomized with valid coefficients.
 
 ### TLS Fingerprint Presets
 
 | Value | Source | Cipher Suite Order | Key Share Groups |
 |-------|--------|--------------------|------------------|
-| `firefox` | Captured bootstrap | AES-128-GCM, ChaCha20-Poly1305, AES-256-GCM | X25519, SECP256R1 |
-| `rustls` | Native rustls TLS 1.3 | AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 | X25519, SECP256R1, SECP384R1 |
-| `python-openssl` | Captured bootstrap | AES-256-GCM, ChaCha20-Poly1305, AES-128-GCM | X25519, SECP256R1 |
+| `firefox` | Captured bootstrap | AES-128-GCM, ChaCha20-Poly1305, AES-256-GCM | X25519MLKEM768, X25519, SECP256R1 |
 
-`baseline` is an alias for `python-openssl`. Default: `firefox`.
+`firefox` is the only supported value and the default. Any other value fails config validation.
 
 ### Custom ClientHello via `template_path`
 
@@ -473,9 +471,9 @@ Each routing rule:
 | `settings.port` | Server port |
 | `settings.password` | Pre-shared key of one server user (min 32 bytes) |
 | `settings.tls.sni` | ClientHello SNI (DNS name; IP literals rejected) |
-| `settings.tls.insecure` | Optional. Skip TLS cert verification in rustls path (default `false`). Only affects the native-rustls ClientHello generation; Noise provides endpoint auth. |
-| `settings.tls.fingerprint` | Optional. Preset: `firefox` (default), `rustls`, `python-openssl`, `baseline` |
-| `settings.tls.template_path` | Optional. Path to captured ClientHello hex file; overrides Firefox/Python-OpenSSL templates (ignored for `rustls`). Hot-reloaded via 30 s mtime polling. |
+| `settings.tls.insecure` | Optional, currently ignored (default `false`). The outer TLS handshake is a replayed facade — no certificate verification occurs; Noise provides endpoint auth. |
+| `settings.tls.fingerprint` | Optional. Only `firefox` (default); any other value is a config error |
+| `settings.tls.template_path` | Optional. Path to captured ClientHello hex file; overrides the embedded Firefox template (same normalization applies). Hot-reloaded via 30 s mtime polling. |
 | `settings.session.idle_timeout_secs` | Optional. Session idle timeout (default 45, server-side; client-side managed by connection pool) |
 | `settings.session.max_streams_per_session` | Optional. Max streams per tunnel (default 256, validated to [1,4096]) |
 | `settings.session.traffic_script` | Optional. Declarative traffic script (see docs/MECHANISM.md §3.5 and the Traffic Script section above) |

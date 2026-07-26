@@ -20,7 +20,6 @@ kanotls-config = { path = "../config" }
 lazy_static.workspace = true
 futures.workspace = true
 subtle.workspace = true
-hex-literal = "0.4"
 socket2.workspace = true
 bytes.workspace = true
 

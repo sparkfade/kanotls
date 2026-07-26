@@ -60,7 +60,7 @@ A `CamouflageProfile` records the visible TLS 1.3 handshake shape of the referen
 
 ### 2.2 Startup Health Check
 
-On server boot, `validate_camouflage_endpoint()` sends a fresh rustls-generated ClientHello to the reference endpoint 4 times. Each flight is fingerprinted (random/session_id/key_share zeroed, padding extension normalized) and cached under both a per-fingerprint key and a fingerprint-family baseline key (first 8 hex chars of the fingerprint hash).
+On server boot, `validate_camouflage_endpoint()` sends a fresh template-instantiated ClientHello (same Firefox template the clients use) to the reference endpoint 4 times. Each flight is fingerprinted (random/session_id/key_share zeroed, padding extension normalized) and cached under both a per-fingerprint key and a fingerprint-family baseline key (first 8 hex chars of the fingerprint hash).
 
 ### 2.3 Per-Connection Replay
 
@@ -300,13 +300,14 @@ The `fingerprint` config field selects the ClientHello generation strategy:
 
 | Preset | Source | Cipher Suite Order | Key Share Groups |
 |---|---|---|---|
-| `firefox` | Captured bootstrap hex blob | AES-128-GCM, ChaCha20-Poly1305, AES-256-GCM | X25519, SECP256R1 |
-| `rustls` | Native rustls TLS 1.3 | AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 | X25519, SECP256R1, SECP384R1 |
-| `python-openssl` / `baseline` | Captured bootstrap hex blob | AES-256-GCM, ChaCha20-Poly1305, AES-128-GCM | X25519, SECP256R1 |
+| `firefox` | Captured bootstrap hex blob | AES-128-GCM, ChaCha20-Poly1305, AES-256-GCM | X25519MLKEM768, X25519, SECP256R1 |
 
-Firefox and Python-OpenSSL presets preserve the captured record shape (extension order, padding, record length) exactly. The rustls preset uses live rustls generation with GREASE rotation.
+`firefox` is the only supported value (and the default); any other `fingerprint` value fails config validation. The preset preserves the captured record shape (extension order, padding, record length) exactly, with two load-time normalizations applied to every template (embedded or `template_path` custom hex alike):
 
-A custom ClientHello hex file can override the Firefox/Python-OpenSSL templates via `template_path`. The rustls preset ignores `template_path`.
+1. **Extension stripping**: ECH (`0xFE0D`/`0x014A`), `early_data` (`0x0119`), `use_srtp` (`0x001C`) and `0x0022` are removed — they either break interoperability with ordinary TLS 1.3 endpoints or carry no camouflage value.
+2. **Structurally valid X25519MLKEM768 share**: per connection, the 1216-byte hybrid share is regenerated with 768 coefficients sampled uniformly from [0, 3329) (the genuine ML-KEM.768 ek distribution) plus random rho/X25519 bytes. ML-KEM-capable servers (OpenSSL 3.5+) validate coefficients on decode and alert `illegal_parameter` on random garbage; valid shares are also statistically indistinguishable from a real Firefox key.
+
+A custom ClientHello hex file can override the embedded Firefox template via `template_path`; the same normalization applies.
 
 ---
 
