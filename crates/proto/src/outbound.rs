@@ -32,15 +32,43 @@ impl DirectOutbound {
     }
 
     async fn connect(&self, target: &Target) -> Result<TcpStream, anyhow::Error> {
-        let remote_addr = resolve_remote_target(target).await?;
-        let remote = tokio::time::timeout(
-            self.connect_timeout,
-            TcpStream::connect(remote_addr),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("direct connect to {} timed out", remote_addr))??;
-        remote.set_nodelay(true)?;
-        Ok(remote)
+        let addrs = resolve_remote_target(target).await?;
+
+        // 依次尝试所有放行地址。每个地址分到总预算的等份（下限 2 秒），因此
+        // 一个挂死的地址不会吃掉全部预算——connection refused / unreachable
+        // 这类快速失败则会立刻落到下一个地址。
+        let per_attempt = self
+            .connect_timeout
+            .checked_div(addrs.len() as u32)
+            .unwrap_or(self.connect_timeout)
+            .max(Duration::from_secs(2))
+            .min(self.connect_timeout);
+        let deadline = tokio::time::Instant::now() + self.connect_timeout;
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for addr in &addrs {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(per_attempt.min(remaining), TcpStream::connect(*addr)).await
+            {
+                Ok(Ok(remote)) => {
+                    remote.set_nodelay(true)?;
+                    return Ok(remote);
+                }
+                Ok(Err(e)) => {
+                    last_err = Some(anyhow::anyhow!("direct connect to {} failed: {}", addr, e));
+                }
+                Err(_) => {
+                    last_err = Some(anyhow::anyhow!("direct connect to {} timed out", addr));
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            anyhow::anyhow!("direct connect to {} found no usable address", target.authority())
+        }))
     }
 
     async fn udp_associate(&self) -> Result<UdpRelay, anyhow::Error> {
@@ -291,26 +319,32 @@ impl UdpRelay {
     }
 }
 
-async fn resolve_remote_target(target: &Target) -> Result<SocketAddr, anyhow::Error> {
-    let check = |addr: SocketAddr| -> Result<SocketAddr, anyhow::Error> {
+/// 解析目标并返回**全部**放行地址（保持解析器给出的顺序）。
+///
+/// 此前只返回首个放行地址，于是一个不可达的首地址（典型：配置了 IPv6 但
+/// 路由黑洞）会把整个连接拖满 connect_timeout 然后失败，尽管后面还有可用
+/// 的 IPv4 地址。
+async fn resolve_remote_target(target: &Target) -> Result<Vec<SocketAddr>, anyhow::Error> {
+    let check = |addr: SocketAddr| -> Result<Vec<SocketAddr>, anyhow::Error> {
         if is_blocked_destination(&addr) {
             anyhow::bail!("blocked destination: {}", addr);
         }
-        Ok(addr)
+        Ok(vec![addr])
     };
     match &target.host {
         Host::Ipv4(ip) => check(SocketAddr::new((*ip).into(), target.port)),
         Host::Ipv6(ip) => check(SocketAddr::new((*ip).into(), target.port)),
         Host::Domain(domain) => {
-            let resolved = tokio::net::lookup_host((domain.as_str(), target.port)).await?;
-            let mut first_allowed = None;
-            for addr in resolved {
-                if is_blocked_destination(&addr) {
-                    continue;
-                }
-                first_allowed.get_or_insert(addr);
+            let resolved = crate::dns::resolve(domain.as_str(), target.port).await?;
+            let allowed: Vec<SocketAddr> = resolved
+                .iter()
+                .copied()
+                .filter(|addr| !is_blocked_destination(addr))
+                .collect();
+            if allowed.is_empty() {
+                anyhow::bail!("unable to resolve target host");
             }
-            first_allowed.ok_or_else(|| anyhow::anyhow!("unable to resolve target host"))
+            Ok(allowed)
         }
     }
 }

@@ -1,4 +1,8 @@
-use super::{coalesce_encoded_frames, Session, SessionConfig, STREAM_CHANNEL_CAPACITY};
+use super::{
+    coalesce_encoded_frames, BufferedPayload, PendingData, Session, SessionConfig,
+    STREAM_CHANNEL_CAPACITY,
+};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::server::ServerSessionHandler;
 use futures::poll;
 use kanotls_tunnel::common::{derive_psk, NOISE_PARAMS};
@@ -6,6 +10,72 @@ use kanotls_tunnel::SnowyStream;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
+
+/// `PendingData` 的总字节与每流字节改为运行计数（此前是每次入队全量求和）。
+/// 计数一旦与真实内容脱节，背压限额就会失效或误伤，因此在一串混合操作后
+/// 逐项校验计数与实际内容一致。
+#[test]
+fn pending_data_counters_track_contents_exactly() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let mut pending = PendingData::default();
+
+    let payload = |len: usize| BufferedPayload::new(vec![0u8; len], &counter);
+
+    // 交错入队三条流。
+    for (sid, len) in [(1u32, 10usize), (2, 20), (1, 30), (3, 40), (2, 50)] {
+        pending.push_back(sid, payload(len));
+    }
+    assert_eq!(pending.total_bytes(), 150);
+    assert_eq!(pending.stream_bytes(1), 40);
+    assert_eq!(pending.stream_bytes(2), 70);
+    assert_eq!(pending.stream_bytes(3), 40);
+    assert_eq!(pending.stream_frames(1), 2);
+    assert_eq!(pending.len(), 3);
+
+    // 出队按 FIFO，并同步扣减两级计数。
+    assert_eq!(pending.pop_front(1).unwrap().len(), 10);
+    assert_eq!(pending.total_bytes(), 140);
+    assert_eq!(pending.stream_bytes(1), 30);
+
+    // 队列排空即移除条目，使 contains()/len() 恒等于「有积压的流」。
+    assert_eq!(pending.pop_front(1).unwrap().len(), 30);
+    assert!(!pending.contains(1));
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending.stream_bytes(1), 0);
+    assert_eq!(pending.stream_frames(1), 0);
+    assert!(pending.pop_front(1).is_none());
+    assert_eq!(pending.total_bytes(), 110);
+
+    // 整流移除要扣掉该流的全部字节。
+    let removed = pending.remove(2).unwrap();
+    assert_eq!(removed.len(), 2);
+    assert_eq!(pending.total_bytes(), 40);
+    assert!(pending.remove(2).is_none());
+    assert_eq!(pending.total_bytes(), 40);
+
+    pending.clear();
+    assert_eq!(pending.total_bytes(), 0);
+    assert_eq!(pending.len(), 0);
+}
+
+/// 计数口径与 `buffered_stream_bytes` 的 RAII 记账保持一致：载荷被
+/// `into_vec` 取走或被丢弃时恰好回账一次。
+#[test]
+fn pending_data_release_matches_buffered_byte_accounting() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let mut pending = PendingData::default();
+    pending.push_back(7, BufferedPayload::new(vec![0u8; 100], &counter));
+    pending.push_back(7, BufferedPayload::new(vec![0u8; 200], &counter));
+    assert_eq!(counter.load(Ordering::Relaxed), 300);
+
+    let taken = pending.pop_front(7).unwrap();
+    assert_eq!(taken.into_vec().len(), 100);
+    assert_eq!(counter.load(Ordering::Relaxed), 200);
+
+    // 丢弃整条流的积压，剩余载荷由 Drop 回账。
+    pending.clear();
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+}
 
 #[test]
 fn coalesce_encoded_frames_packs_adjacent_small_frames() {

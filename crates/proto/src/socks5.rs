@@ -284,9 +284,10 @@ pub async fn socks5_send_udp_associate(
     let relay_addr = match read_socks5_reply_addr(stream).await? {
         Socks5ReplyAddr::Ip(addr) => addr,
         Socks5ReplyAddr::Domain(host, port) => {
-            let mut resolved = tokio::net::lookup_host((host.as_str(), port)).await?;
+            let resolved = crate::dns::resolve(host.as_str(), port).await?;
             resolved
-                .next()
+                .first()
+                .copied()
                 .ok_or_else(|| anyhow::anyhow!("unable to resolve socks5 UDP relay host"))?
         }
     };

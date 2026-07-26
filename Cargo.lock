@@ -556,6 +556,7 @@ name = "kanotls-proto"
 version = "1.2.0"
 dependencies = [
  "anyhow",
+ "lru",
  "tokio",
  "tracing",
 ]
@@ -586,6 +587,7 @@ dependencies = [
  "futures",
  "hex",
  "kanotls-config",
+ "kanotls-proto",
  "lazy_static",
  "lru",
  "rand",

@@ -483,18 +483,15 @@ impl Stream {
 
     fn try_drain_pending_data(&mut self) -> Option<Vec<u8>> {
         let mut pending = self.pending_data.try_lock().ok()?;
-        let Some(queue) = pending.get_mut(self.stream_id) else {
+        let Some(payload) = pending.pop_front(self.stream_id) else {
             // pending_data 已排空：若 pre-SYNACK 的 FIN 曾因部分投递被退回
             // 重挂（flush_client_pending_stream），此刻即应补投为 EOF。
             drop(pending);
             self.take_queued_pending_fin();
             return None;
         };
-        let payload = queue.pop_front()?;
-        let drained = queue.is_empty();
-        if drained {
-            pending.remove(self.stream_id);
-        }
+        // pop_front 排空时会移除条目，因此 contains 即「是否仍有积压」。
+        let drained = !pending.contains(self.stream_id);
         drop(pending);
         if drained {
             self.take_queued_pending_fin();

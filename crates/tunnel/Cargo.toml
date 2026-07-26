@@ -16,6 +16,7 @@ hex.workspace = true
 blake2.workspace = true
 lru.workspace = true
 kanotls-config = { path = "../config" }
+kanotls-proto = { path = "../proto" }
 
 lazy_static.workspace = true
 futures.workspace = true

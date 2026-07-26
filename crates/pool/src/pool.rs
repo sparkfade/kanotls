@@ -126,7 +126,7 @@ impl<C: TunnelConnector> PoolInner<C> {
                     }
                 }
 
-                self.schedule_replenishment_if_needed().await;
+                self.try_schedule_replenishment().await;
 
                 let now = Instant::now();
                 if now >= deadline {
@@ -158,7 +158,22 @@ impl<C: TunnelConnector> PoolInner<C> {
             );
         }
 
-        self.schedule_replenishment_if_needed().await;
+        self.try_schedule_replenishment().await;
+    }
+
+    /// 热路径（`open_stream`）用的补充调度：抢不到 `spawn_lock` 就直接返回。
+    ///
+    /// 已有任务正在补充时，它扫描的是同一份状态，结论对本次调用同样成立，
+    /// 因此排队等锁没有意义——而排队会让所有并发的 open_stream 在这把全局
+    /// 锁上串行。monitor tick 仍走阻塞版本，保证补充最终一定会发生。
+    async fn try_schedule_replenishment(self: &Arc<Self>) {
+        if !self.bootstrap_started.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(spawn_guard) = self.spawn_lock.try_lock() else {
+            return;
+        };
+        self.replenish_locked(spawn_guard).await;
     }
 
     async fn schedule_replenishment_if_needed(self: &Arc<Self>) {
@@ -166,35 +181,43 @@ impl<C: TunnelConnector> PoolInner<C> {
             return;
         }
 
-        let _spawn_guard = self.spawn_lock.lock().await;
-        let entries = self.connection_entries().await;
-        let mut active = 0usize;
-        let mut live = 0usize;
-        let mut busy = 0usize;
-        let mut total_active_streams = 0usize;
+        let spawn_guard = self.spawn_lock.lock().await;
+        self.replenish_locked(spawn_guard).await;
+    }
 
-        for entry in entries {
-            if entry.state() == ConnectionState::Closed || !entry.handle.is_alive() {
-                continue;
+    async fn replenish_locked(self: &Arc<Self>, _spawn_guard: tokio::sync::MutexGuard<'_, ()>) {
+        // 统计在 read guard 下就地完成，不再把整张表克隆进 Vec。
+        let (active, live, busy, total_active_streams) = {
+            let connections = self.connections.read().await;
+            let mut active = 0usize;
+            let mut live = 0usize;
+            let mut busy = 0usize;
+            let mut total_active_streams = 0usize;
+
+            for entry in connections.values() {
+                if entry.state() == ConnectionState::Closed || !entry.handle.is_alive() {
+                    continue;
+                }
+
+                live += 1;
+
+                if entry.handle.is_closing() {
+                    continue;
+                }
+
+                let active_streams = entry.handle.active_streams();
+                total_active_streams = total_active_streams.saturating_add(active_streams);
+
+                if active_streams > 0 {
+                    busy += 1;
+                }
+
+                if entry.state() == ConnectionState::Active {
+                    active += 1;
+                }
             }
-
-            live += 1;
-
-            if entry.handle.is_closing() {
-                continue;
-            }
-
-            let active_streams = entry.handle.active_streams();
-            total_active_streams = total_active_streams.saturating_add(active_streams);
-
-            if active_streams > 0 {
-                busy += 1;
-            }
-
-            if entry.state() == ConnectionState::Active {
-                active += 1;
-            }
-        }
+            (active, live, busy, total_active_streams)
+        };
 
         let pending = self.pending_spawns.load(Ordering::Relaxed);
         let waiters = self.acquire_waiters.load(Ordering::Relaxed);
@@ -420,35 +443,44 @@ impl<C: TunnelConnector> PoolInner<C> {
         }
     }
 
+    /// 选出当前最优连接。
+    ///
+    /// 在 read guard 下直接遍历并只克隆胜出者。此前先经 `connection_entries()`
+    /// 把整张表克隆进一个新 Vec（一次分配 + 每条连接一对原子增减），而
+    /// 本函数在 `open_stream` 的热路径上每条流至少调用一次。评分用到的
+    /// 访问器全是同步的，guard 内不跨 await。
     async fn select_active_connection(&self) -> Option<Arc<PooledConnection<C::Session>>> {
-        let entries = self.connection_entries().await;
-        let mut best: Option<(Arc<PooledConnection<C::Session>>, _)> = None;
+        let selected = {
+            let connections = self.connections.read().await;
+            let mut best: Option<(&Arc<PooledConnection<C::Session>>, _)> = None;
 
-        for entry in entries {
-            if entry.state() != ConnectionState::Active
-                || !entry.handle.is_alive()
-                || entry.handle.is_closing()
-            {
-                continue;
+            for entry in connections.values() {
+                if entry.state() != ConnectionState::Active
+                    || !entry.handle.is_alive()
+                    || entry.handle.is_closing()
+                {
+                    continue;
+                }
+
+                let active_streams = entry.handle.active_streams();
+                if active_streams >= self.session_config.max_streams_per_session {
+                    continue;
+                }
+
+                let score = entry.score(active_streams, entry.handle.buffered_stream_bytes());
+
+                match &best {
+                    Some((_, best_score)) if score >= *best_score => {}
+                    _ => best = Some((entry, score)),
+                }
             }
 
-            let active_streams = entry.handle.active_streams();
-            if active_streams >= self.session_config.max_streams_per_session {
-                continue;
-            }
+            best.map(|(entry, _)| entry.clone())
+        };
 
-            let score = entry.score(active_streams, entry.handle.buffered_stream_bytes());
-
-            match &best {
-                Some((_, best_score)) if score >= *best_score => {}
-                _ => best = Some((entry, score)),
-            }
-        }
-
-        best.map(|(entry, _)| {
+        selected.inspect(|entry| {
             let tick = self.selection_tick.fetch_add(1, Ordering::Relaxed) + 1;
             entry.mark_selected(tick);
-            entry
         })
     }
 
@@ -890,6 +922,47 @@ mod tests {
 
         assert_eq!(first.seq, 1);
         assert_eq!(second.seq, 2);
+    }
+
+    /// 热路径的补充调度用 `try_lock`：已有任务在补充时直接跳过，不排队。
+    /// 这消除了 open_stream 在全局 spawn_lock 上的串行化，但必须保证
+    /// 「跳过」只是延后到下一轮，而不是永久丢失需求。
+    #[tokio::test]
+    async fn hot_path_replenishment_skips_when_contended_then_recovers() {
+        let connector = Arc::new(FakeConnector::new(|_| FakeSession::new(0)));
+        let pool = TestPool::new_with_behavior_for_test(
+            test_session_config(),
+            test_behavior(),
+            connector.clone(),
+        );
+        pool.inner.bootstrap_started.store(true, Ordering::Relaxed);
+        pool.inner.acquire_waiters.store(1, Ordering::Relaxed);
+
+        // 持锁期间热路径必须直接返回，不得阻塞、不得生成连接。
+        let held = pool.inner.spawn_lock.lock().await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            pool.inner.try_schedule_replenishment(),
+        )
+        .await
+        .expect("contended hot path must return immediately, not queue on the lock");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            connector.sessions().await.len(),
+            0,
+            "no connection should be spawned while another task holds the spawn lock"
+        );
+
+        // 释放后同一调用点必须照常补充。
+        drop(held);
+        pool.inner.try_schedule_replenishment().await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            connector.sessions().await.len(),
+            1,
+            "demand must be picked up once the lock is free"
+        );
+        pool.inner.acquire_waiters.store(0, Ordering::Relaxed);
     }
 
     #[tokio::test]
