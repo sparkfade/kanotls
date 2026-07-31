@@ -1,16 +1,17 @@
 use crate::frame::{
-    coalesce_encoded_frames, decode_padding_goaway, encode_padding_goaway_sized,
-    encode_padding_reply_sized, encode_padding_request_sized, encode_psh_frames,
-    self_sized_padding_wire_len, Frame, CMD_FIN, CMD_PADDING, CMD_PSH, CMD_SETTINGS, CMD_SYN,
-    CMD_SYNACK, CONTROL_RECORD_MIN_OVERHEAD, FRAME_HEADER_SIZE, MAX_PAYLOAD_LEN,
-    MIN_GOAWAY_RECORD_WIRE_LEN, PADDING_FLAG_GOAWAY, PADDING_FLAG_REQUEST,
+    coalesce_encoded_frames, decode_padding_goaway, decode_padding_window_update,
+    encode_padding_goaway_sized, encode_padding_reply_sized, encode_padding_request_sized,
+    encode_padding_window_update_sized, encode_psh_frames, self_sized_padding_wire_len, Frame,
+    CMD_FIN, CMD_PADDING, CMD_PSH, CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CONTROL_RECORD_MIN_OVERHEAD,
+    FRAME_HEADER_SIZE, MAX_PAYLOAD_LEN, MIN_GOAWAY_RECORD_WIRE_LEN, PADDING_FLAG_GOAWAY,
+    PADDING_FLAG_REQUEST, PADDING_FLAG_WINDOW_UPDATE,
 };
 use crate::shaper::{ShapePolicy, TrafficShaper};
 use crate::stream::{Stream, StreamInit, StreamOpenState, StreamParts};
 use bytes::{Bytes, BytesMut};
 use kanotls_tunnel::{ConnectionState, FlowDirection, SnowyStream};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -310,13 +311,29 @@ fn request_carries_stream_data(request: &WriteRequest) -> bool {
     carries
 }
 
-const MAX_PENDING_STREAM_FRAMES: usize = 1024;
+const MAX_PENDING_STREAM_FRAMES: usize = 4096;
 const MAX_PENDING_STREAM_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PENDING_STREAMS: usize = 1024;
 const STREAM_CHANNEL_CAPACITY: usize = 128;
 const MAX_SESSION_REASSEMBLY_BYTES: usize = 1024 * 1024;
 const WRITE_CHANNEL_CAPACITY: usize = 64;
 const MAX_STREAM_OVERFLOW_BYTES: usize = 2 * 1024 * 1024;
+
+/// 每流发送窗口（H2 的 `SETTINGS_INITIAL_WINDOW_SIZE` 语义）：发送方在同一条
+/// 流的在途字节超过此值前可自由发送，之后挂起等对端回补 WINDOW_UPDATE。
+///
+/// **取值与 `MAX_STREAM_OVERFLOW_BYTES` 同值（2 MiB）**：接收方为 fc 对端
+/// 保留的缓冲上限 = 窗口 + 首 RTT 越界余量（见 `store_pending_data`），于是
+/// 「窗口耗尽 ⇒ 发送方停发」让接收缓冲**结构性**无法触限——此前的
+/// 「超限丢数据 + 杀流」对 fc 对端彻底不可达。
+///
+/// 2 MiB 同时覆盖典型高 BDP 路径（200 Mbps × 150 ms ≈ 3.75 MB 的在途需求由
+/// 连接级 12 MiB 窗口承接，每流窗口只管单流停滞不拖死其他流）。
+const STREAM_WINDOW_BYTES: usize = 2 * 1024 * 1024;
+
+/// 测试覆写点：0 表示使用上面的生产常量。窗口只影响**本端发送**的门控与
+/// 回补节奏，不改任何线上字节形态（WINDOW_UPDATE 记录本身尺寸恒定）。
+pub(crate) static STREAM_WINDOW_OVERRIDE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// sticky bulk 批量 flush 双上限（先到先 flush）：连续 prepare 最多 K 条
 /// record 且 write_buffer 累计不超过 ~128KB 后统一冲刷一次。仅合并内部
@@ -655,6 +672,184 @@ fn sample_h2_exchange_request_wire() -> usize {
     )
 }
 
+/// H2 流控状态：发送侧窗口（连接级 + 每流）与接收侧回补记账（消费 → WU）。
+///
+/// **为什么这是修复而不是新机制**：真实 H2 接收方按消费字节数回补窗口、发送
+/// 方在窗口耗尽后停发，接收缓冲由窗口自身界定——此前 KanoTLS 的「缓冲超限 →
+/// 丢数据 + 杀流」正是没有窗口语义的产物。现在把已有的两条 Firefox 常量
+/// （连接窗口 12 MiB、半窗口回补）从「假填充」变成真信贷：
+///
+/// * 发送侧：`acquire_credit` 在提交前检查（连接信贷 && 每流信贷），不足则
+///   挂起；WINDOW_UPDATE 帧到达（读循环帧层处理，纯记账）后放行。挂起即
+///   背压：中继不再读源站，源站 TCP 窗口自然填满——与真实 H2 逐字节同构。
+/// * 接收侧：`note_consumed` 由中继在字节真正交付本地/远端后调用，按
+///   「消费过半窗口」的 nghttp2 规则回吐 WINDOW_UPDATE（每流 1 MiB、
+///   连接 6 MiB，尺寸恒为 37 字节的 `WINDOW_UPDATE_WIRE`）。
+///
+/// **旧对端兼容**：本端只在收到对端 SETTINGS 携带 `fc=1` 后才启用发送侧
+/// 门控（SETTINGS 本就是 H2 协商窗口语义的载体）；对未声明 fc 的对端，门控
+/// 完全旁路，行为与旧版逐字节一致。回补帧（flag=3）对旧对端是静默吸收的
+/// 填充，无害。
+///
+/// **无死锁**：门控挂起等的是**读循环**（非阻塞）收到的 WU 通知，不再依赖
+/// 写端任何 await；写端只可能在 TCP 发送缓冲真满时阻塞（正确背压）。
+pub(crate) struct WindowState {
+    writer: SharedTunnelWriter,
+    /// 对端是否在 SETTINGS 中声明了流控支持（`fc=1`）。为 false 时发送侧
+    /// 门控整体旁路，保持旧行为。
+    peer_flow_control: AtomicBool,
+    conn_credit: AtomicI64,
+    conn_wu_threshold: u64,
+    /// 连接级已消费、尚未回补的字节（CAS 记账，多流并发消费安全）。
+    conn_consumed_since_wu: AtomicU64,
+    stream_window: i64,
+    stream_wu_threshold: u64,
+    /// 连接级信贷到达信号。用 `notify_one`（留 permit）而不是
+    /// `notify_waiters`：信贷在「检查 → 挂起」的间隙到达时，permit 会留给
+    /// 下一个挂起者，杜绝丢唤醒。
+    credit_notify: Notify,
+}
+
+impl WindowState {
+    pub(crate) fn new(writer: SharedTunnelWriter) -> Self {
+        // 连接窗口 = 2 × 半窗口回补阈值（Firefox 12 MiB 连接窗口，/2 即
+        // nghttp2 的「消费达本地窗口一半即回补」规则）。测试覆写点
+        // `H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES` 沿用在阈值上，窗口
+        // 随之缩放。
+        let conn_wu_threshold = h2_window_update_threshold() as u64;
+        let conn_window = (conn_wu_threshold as i64).saturating_mul(2);
+        let stream_window = STREAM_WINDOW_OVERRIDE_BYTES
+            .load(Ordering::Relaxed)
+            .max(STREAM_WINDOW_BYTES) as i64;
+        Self {
+            writer,
+            peer_flow_control: AtomicBool::new(false),
+            conn_credit: AtomicI64::new(conn_window),
+            conn_wu_threshold,
+            conn_consumed_since_wu: AtomicU64::new(0),
+            stream_window,
+            stream_wu_threshold: (stream_window as u64).saturating_div(2).max(1),
+            credit_notify: Notify::new(),
+        }
+    }
+
+    pub(crate) fn stream_window(&self) -> i64 {
+        self.stream_window
+    }
+
+    pub(crate) fn set_peer_flow_control(&self) {
+        self.peer_flow_control.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn peer_supports_flow_control(&self) -> bool {
+        self.peer_flow_control.load(Ordering::Relaxed)
+    }
+
+    /// 发送侧门控：信贷（连接级 + 每流）充足则扣减并放行，否则挂起。
+    ///
+    /// 对端未声明 fc 时直接放行（旧行为）。`stream_notify` 是本流的
+    /// `pending_notify`：每流 WU 到达时由帧层单独唤醒，连接级 WU 唤醒
+    /// `credit_notify`——两者都只做「再查一次」的提示，误唤醒无害。
+    /// 会话关闭时立即放行，让后续提交在 writer 的既有失败路径上报错。
+    pub(crate) async fn acquire_credit(
+        &self,
+        stream_credit: &AtomicI64,
+        stream_notify: &Arc<Notify>,
+        len: usize,
+    ) {
+        if !self.peer_flow_control.load(Ordering::Relaxed) {
+            return;
+        }
+        let len = len as i64;
+        loop {
+            if self.writer.is_closed() {
+                return;
+            }
+            if self.conn_credit.load(Ordering::Relaxed) >= len
+                && stream_credit.load(Ordering::Relaxed) >= len
+            {
+                self.conn_credit.fetch_sub(len, Ordering::Relaxed);
+                stream_credit.fetch_sub(len, Ordering::Relaxed);
+                return;
+            }
+            tokio::select! {
+                _ = self.credit_notify.notified() => {}
+                _ = stream_notify.notified() => {}
+            }
+        }
+    }
+
+    fn add_conn_credit(&self, increment: u32) {
+        self.conn_credit
+            .fetch_add(i64::from(increment), Ordering::Relaxed);
+        self.credit_notify.notify_one();
+    }
+
+    fn add_stream_credit(&self, credit: &AtomicI64, notify: &Arc<Notify>, increment: u32) {
+        credit.fetch_add(i64::from(increment), Ordering::Relaxed);
+        notify.notify_one();
+    }
+
+    /// 连接级消费记账：跨流并发安全（CAS），越过阈值的那一方独占回补，
+    /// 杜绝两流同时把同一段消费重复计入。
+    fn bump_conn_consumed(&self, len: u64) -> Option<u32> {
+        let threshold = self.conn_wu_threshold;
+        let mut prev = self.conn_consumed_since_wu.load(Ordering::Relaxed);
+        loop {
+            let total = prev.saturating_add(len);
+            let next = if total >= threshold { 0 } else { total };
+            match self
+                .conn_consumed_since_wu
+                .compare_exchange(prev, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    return (total >= threshold).then(|| total.min(u32::MAX as u64) as u32)
+                }
+                Err(actual) => prev = actual,
+            }
+        }
+    }
+
+    /// 接收侧回补入账：中继在字节真正交付应用层后调用。每流与连接级各自
+    /// 累计，越过半窗口阈值即回吐一条真实 WINDOW_UPDATE（flag=3）。
+    ///
+    /// `stream_consumed_since_wu` 在流对象上（单消费者，fetch_add/fetch_sub
+    /// 安全）；连接级计数器在这里（多流并发，CAS）。
+    ///
+    /// 回补帧走 `try_write_packets`（fire-and-forget）：控制队列满时丢弃是
+    /// **保守且自愈**的——发送方少拿一次信贷只会更早停发，而接收缓冲
+    /// （≥ 窗口 ≥ 阈值）仍在被中继排空，下一次越过阈值必会再发一条。
+    pub(crate) fn note_consumed(
+        &self,
+        sid: u32,
+        stream_consumed_since_wu: &AtomicU64,
+        len: usize,
+    ) {
+        let len_u64 = len as u64;
+        let stream_total =
+            stream_consumed_since_wu.fetch_add(len_u64, Ordering::Relaxed) + len_u64;
+        if stream_total >= self.stream_wu_threshold {
+            stream_consumed_since_wu.fetch_sub(stream_total, Ordering::Relaxed);
+            self.send_window_update(sid, stream_total.min(u32::MAX as u64) as u32);
+        }
+        if let Some(conn_total) = self.bump_conn_consumed(len_u64) {
+            self.send_window_update(0, conn_total);
+        }
+    }
+
+    fn send_window_update(&self, sid: u32, increment: u32) {
+        let packet =
+            encode_padding_window_update_sized(sid, increment, PADDING_WINDOW_UPDATE_WIRE);
+        if let Err(e) = self.writer.try_write_packets(
+            vec![packet],
+            FlushBehavior::Auto,
+            TrafficClass::Control,
+        ) {
+            debug!("window update dropped (control queue full): {}", e);
+        }
+    }
+}
+
 pub struct Session {
     read_half: Mutex<Option<SplitReadHalf>>,
     pub(crate) writer: SharedTunnelWriter,
@@ -692,6 +887,8 @@ pub struct Session {
     peer_stream_high_water: Arc<AtomicU32>,
     /// 对端 GOAWAY 里的 last_stream_id（`GOAWAY_NOT_RECEIVED` 表示还没收到）。
     peer_goaway_last_stream_id: Arc<AtomicU64>,
+    /// H2 流控状态：发送侧窗口与接收侧回补记账（见 `WindowState`）。
+    pub(crate) windows: Arc<WindowState>,
 }
 
 #[derive(Debug, Default)]
@@ -819,6 +1016,10 @@ pub(crate) struct StreamHandle {
     pub synack_tx: Option<oneshot::Sender<Vec<u8>>>,
     pub read_closed: bool,
     pub pending_notify: Arc<Notify>,
+    /// 本流**发送**方向的剩余信贷（H2 每流窗口语义）。句柄存续期即窗口
+    /// 存续期：注册 +1、句柄随映射移除即释放，无独立生命周期管理。
+    /// 由本端写路径扣减、对端 WINDOW_UPDATE 帧入账。
+    pub send_credit: Arc<AtomicI64>,
 }
 
 enum PshDispatch {
@@ -1044,6 +1245,7 @@ impl Session {
             inbound.clone(),
             peer_stream_high_water.clone(),
         ));
+        let windows = Arc::new(WindowState::new(writer.clone()));
         // 空闲拆除取配置值本身，**不加抖动**（论证见 `Session::idle_timeout_secs`）。
         let idle_timeout_secs = config.idle_timeout_secs.max(1);
 
@@ -1072,6 +1274,7 @@ impl Session {
             inbound,
             peer_stream_high_water,
             peer_goaway_last_stream_id: Arc::new(AtomicU64::new(GOAWAY_NOT_RECEIVED)),
+            windows,
         }
     }
 
@@ -1235,6 +1438,7 @@ impl Session {
         let (fin_tx, fin_rx) = mpsc::channel(1);
         let (synack_tx, synack_rx) = oneshot::channel();
         let pending_notify = Arc::new(Notify::new());
+        let send_credit = Arc::new(AtomicI64::new(self.windows.stream_window()));
 
         let handle = StreamHandle {
             data_tx,
@@ -1242,6 +1446,7 @@ impl Session {
             synack_tx: Some(synack_tx),
             read_closed: false,
             pending_notify: pending_notify.clone(),
+            send_credit: send_credit.clone(),
         };
         let mut handle_guard = PendingStreamHandleGuard {
             stream_id: sid,
@@ -1310,6 +1515,8 @@ impl Session {
             pending_fin: self.pending_fin.clone(),
             closing_streams: self.closing_streams.clone(),
             pending_notify,
+            send_credit,
+            windows: self.windows.clone(),
             peer_goaway_last_stream_id: self.peer_goaway_last_stream_id.clone(),
             open_state: if has_deferred_open {
                 StreamOpenState::DeferredUnsent(vec![syn])
@@ -1333,6 +1540,21 @@ impl Session {
     }
 
     pub async fn write_data(&self, sid: u32, data: &[u8]) -> Result<(), anyhow::Error> {
+        // 发送侧流控门：连接级 + 每流信贷都覆盖本次写入才放行，否则挂起
+        // 等对端 WINDOW_UPDATE（H2 语义，见 WindowState）。窗口不足即停发
+        // ⇒ 接收缓冲被窗口界定，此前的「超限丢数据 + 杀流」结构性不可达。
+        // 对未声明 fc 的对端，门控整体旁路（旧行为逐字节不变）。
+        let credit = self
+            .streams
+            .read()
+            .await
+            .get(&sid)
+            .map(|handle| (handle.send_credit.clone(), handle.pending_notify.clone()));
+        if let Some((send_credit, stream_notify)) = credit {
+            self.windows
+                .acquire_credit(&send_credit, &stream_notify, data.len())
+                .await;
+        }
         if data.is_empty() {
             let frame = Frame::psh(sid, Vec::new());
             return self.write_frame(&frame, TrafficClass::Bulk).await;
@@ -1353,6 +1575,25 @@ impl Session {
     pub async fn close_stream(&self, sid: u32) -> Result<(), anyhow::Error> {
         self.finish_closing_stream(sid).await;
         self.shutdown_stream(sid).await
+    }
+
+    /// 读循环内的防御性关闭：只做锁内清理 + try 发 FIN，**绝不等 flush**。
+    ///
+    /// `close_stream` 要等到 FIN 真正出网（`write_frame` 等 flush），写端若
+    /// 卡在 TCP 发送缓冲上，读循环会连带冻结整个会话（此前的四任务死锁环）。
+    /// 本路径供「接收缓冲超限」这类防御性拆除使用——对声明 fc 的对端结构性
+    /// 不可达（窗口界定缓冲，见 `store_pending_data`），只可能在旧对端或
+    /// 协议错误下触发。FIN 偶发丢失时，对端流由其自身的空闲拆除 / 会话拆除
+    /// 回收。
+    async fn close_stream_fire_and_forget(&self, sid: u32) {
+        self.finish_closing_stream(sid).await;
+        if let Ok(packet) = Frame::fin(sid).encode() {
+            let _ = self.writer.try_write_packets(
+                vec![packet],
+                FlushBehavior::Immediate,
+                TrafficClass::Control,
+            );
+        }
     }
 
     async fn write_encoded_payload(
@@ -1386,7 +1627,11 @@ impl Session {
             .ok_or_else(|| anyhow::anyhow!("session read loop already running"))?;
         let mut buf = BytesMut::with_capacity(TUNNEL_REASSEMBLY_CAPACITY);
 
-        let mut settings_received = self.is_client;
+        // 两侧都从「未收到对端 SETTINGS」起步：客户端凭首条服务端 SETTINGS
+        // 回复 SETTINGS-ACK（真实 H2 语义，此前由服务端开场 flight 的
+        // SETTINGS 尺寸填充请求触发，现在 flight 首条就是真 SETTINGS）；
+        // 服务端凭客户端 SETTINGS 放行 SYN 并解析 fc 声明。
+        let mut settings_received = false;
 
         // 空闲拆除仅服务端生效：池化客户端的空闲连接由连接池的 idle drain
         // 统一管理（drain 后 force_close 本 session），session 层不再重复
@@ -1397,9 +1642,10 @@ impl Session {
         tokio::pin!(idle_timeout);
 
         // 稳态 H2 骨架状态：post_script_off 时整体关闭（定时器取禁用姿态，
-        // 分支被 guard 屏蔽）。
+        // 分支被 guard 屏蔽）。消费驱动的 WINDOW_UPDATE 不再由读循环注入
+        // 假填充——真实信贷帧由中继的 `note_consumed` 路径回吐（见
+        // WindowState），与骨架开关无关（流控是正确性机制，不是伪装帧）。
         let h2_skeleton_enabled = !self.post_script_off;
-        let mut bytes_since_window_update = 0usize;
 
         // 合成共存流：仅客户端方向（真实 H2 的请求由客户端发起）。
         let h2_exchange_enabled = h2_skeleton_enabled && self.is_client;
@@ -1499,30 +1745,6 @@ impl Session {
 
             let mut protocol_error = false;
             while let Some(frame) = Frame::decode(&mut buf) {
-                // WINDOW_UPDATE 节奏：消费字节每越过一次**逐进程常量**阈值
-                // （= Firefox 连接窗口的一半，见 H2_WINDOW_UPDATE_THRESHOLD）
-                // 即向对端注入一条 flag=1 padding（wire ≈ H2 WINDOW_UPDATE），
-                // 方向天然是收 bulk 的一方发 WU。
-                if h2_skeleton_enabled && frame.cmd == CMD_PSH {
-                    bytes_since_window_update += frame.payload.len();
-                    let window_update_threshold = h2_window_update_threshold();
-                    while bytes_since_window_update >= window_update_threshold {
-                        bytes_since_window_update -= window_update_threshold;
-                        let packet = encode_padding_reply_sized(PADDING_WINDOW_UPDATE_WIRE);
-                        if let Err(e) = self
-                            .writer
-                            .submit_write_packets(
-                                vec![packet],
-                                FlushBehavior::Auto,
-                                TrafficClass::Control,
-                            )
-                            .await
-                        {
-                            warn!("failed to queue h2 window update padding: {}", e);
-                            break;
-                        }
-                    }
-                }
                 if let Err(e) = self.handle_frame(frame, &mut settings_received).await {
                     warn!("frame handler error: {}", e);
                     protocol_error = true;
@@ -1566,7 +1788,16 @@ impl Session {
         let take = reason.len().min(Self::SYNACK_REJECTION_PAYLOAD_LEN);
         payload[..take].copy_from_slice(&reason.as_bytes()[..take]);
         let frame = Frame::new(CMD_SYNACK, stream_id, payload);
-        self.write_frame(&frame, TrafficClass::Control).await
+        // fire-and-forget：拒绝帧是建议性的，客户端 wait_synack 自带 10s
+        // 超时兜底；读循环绝不因写端排队阻塞（死锁环见 WindowState）。
+        let packet = frame.encode()?;
+        self.writer
+            .try_write_packets(
+                vec![packet],
+                FlushBehavior::Immediate,
+                TrafficClass::Control,
+            )
+            .map_err(|e| anyhow::anyhow!("failed to queue synack rejection: {}", e))
     }
 
     /// 服务端在收到客户端 `CMD_SETTINGS` 后立即发出的 H2 开场 flight。
@@ -1581,11 +1812,15 @@ impl Session {
     /// 不消费开场序列的 index 0）。
     ///
     /// 现在两侧都对齐真实 H2：
-    /// * 服务端收到客户端 SETTINGS ⇒ 回 `SETTINGS`（换一条 ACK）+
-    ///   `WINDOW_UPDATE`（不换应答）+ `SETTINGS-ACK`（不换应答），三条记录一次
-    ///   flush，正是 nginx 的开场写；
-    /// * 客户端收到那条 SETTINGS ⇒ 由 `padding_reply_wire_len` 的角色表回一条
-    ///   33 字节 `SETTINGS-ACK`，即 `h2_opening_size(C2S, 0)`。
+    /// * 服务端收到客户端 SETTINGS ⇒ 回**真 SETTINGS**（换一条 ACK，同时向
+    ///   对端声明 `fc=1` 流控支持）+ `WINDOW_UPDATE`（不换应答）+
+    ///   `SETTINGS-ACK`（不换应答），三条记录一次 flush，正是 nginx 的开场写；
+    ///   首条记录由填充请求改为真 SETTINGS 后**线速尺寸不变**：它由
+    ///   `h2_opening_size(S2C, 0)` 的确定性表格决定，写循环对非 padding 的
+    ///   control packet 走同一条采样路径，恰好命中同一尺寸（内层内容在 Noise
+    ///   加密内，观测者无从分辨）。
+    /// * 客户端收到那条 SETTINGS ⇒ 按真实 H2 语义回一条 33 字节
+    ///   `SETTINGS-ACK`（`h2_opening_size(C2S, 0)`，见 handle_frame）。
     ///
     /// 这同时取代了旧的「首条数据记录同批注入一条 41 字节 PING 请求」来让出
     /// 方向：PING 是保活帧，把它放在最受关注的位置（论文 `Wo = 25` 窗口的第 0
@@ -1597,8 +1832,13 @@ impl Session {
     /// 决定，逐连接抖动本身就是判别特征（同 `H2_OPENING_MAX_LEN` 的论证）。
     /// 三条记录共用一次 flush，因此线上是**一个** ~121/139 字节的下行分段，与
     /// nginx 把开场帧一次写出的形态一致。
+    ///
+    /// `post_script_off` 只关掉骨架的 WINDOW_UPDATE / SETTINGS-ACK 两条
+    /// 伪装记录；SETTINGS 本身（含 fc 声明）恒发——流控是正确性机制不是
+    /// 伪装帧，关闭整形不得连带关闭它（否则客户端永远收不到 fc 声明，
+    /// C2S 门控整体旁路，旧版「超限丢数据」会回归）。
     async fn emit_h2_server_opening(&self) {
-        if self.is_client || self.post_script_off {
+        if self.is_client {
             return;
         }
         use kanotls_tunnel::control_size::h2_opening_size;
@@ -1606,11 +1846,17 @@ impl Session {
         let mut index = 0u64;
         while let Some(size) = h2_opening_size(FlowDirection::S2C, index) {
             // index 0 是服务端自己的 SETTINGS：按 H2 语义必须换来一条
-            // SETTINGS-ACK ⇒ flag=0, m=1。其余两条（WINDOW_UPDATE、
-            // 对客户端 SETTINGS 的 ACK）不换应答 ⇒ flag=1。
+            // SETTINGS-ACK，因此用真 CMD_SETTINGS（载荷携带 fc 声明，尺寸仍
+            // 由 h2_opening_size(S2C, 0) 命中）。其余两条（WINDOW_UPDATE、
+            // 对客户端 SETTINGS 的 ACK）不换应答 ⇒ flag=1 padding。
             let packet = if index == 0 {
-                encode_padding_request_sized(1, size)
+                Frame::cmd_settings()
+                    .encode()
+                    .expect("settings frame encodes")
             } else {
+                if self.post_script_off {
+                    break;
+                }
                 encode_padding_reply_sized(size)
             };
             packets.push(packet);
@@ -1700,7 +1946,7 @@ impl Session {
                                             stream_id = frame.stream_id,
                                             "closing stream: pending overflow limit exceeded"
                                         );
-                                        let _ = self.close_stream(frame.stream_id).await;
+                                        self.close_stream_fire_and_forget(frame.stream_id).await;
                                     }
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -1718,7 +1964,7 @@ impl Session {
                                     stream_id = frame.stream_id,
                                     "closing stream: pending overflow limit exceeded"
                                 );
-                                let _ = self.close_stream(frame.stream_id).await;
+                                self.close_stream_fire_and_forget(frame.stream_id).await;
                             }
                         }
                     }
@@ -1872,11 +2118,31 @@ impl Session {
             CMD_SETTINGS => {
                 let first = !*settings_received;
                 *settings_received = true;
+                // `fc=1` ⇒ 对端支持 H2 流控：此后本端发送侧门控启用
+                // （见 WindowState::acquire_credit）。旧对端的 SETTINGS 没有
+                // 该声明，门控保持旁路，行为与旧版逐字节一致。
+                if frame.payload.windows(4).any(|w| w == b"fc=1") {
+                    self.windows.set_peer_flow_control();
+                }
                 trace!(
                     "client settings: {}",
                     String::from_utf8_lossy(&frame.payload)
                 );
                 if first {
+                    if self.is_client {
+                        // 真实 H2 语义：首条对端 SETTINGS 必须换一条
+                        // SETTINGS-ACK（33 字节，`h2_opening_size(C2S, 0)`）。
+                        // 走 fire-and-forget：读循环绝不因写端排队而阻塞；
+                        // 丢失时对端（本端）无从感知也不受影响。
+                        let packet = encode_padding_reply_sized(PADDING_SETTINGS_ACK_WIRE);
+                        if let Err(e) = self.writer.try_write_packets(
+                            vec![packet],
+                            FlushBehavior::Auto,
+                            TrafficClass::Control,
+                        ) {
+                            debug!("failed to queue settings-ack: {}", e);
+                        }
+                    }
                     self.emit_h2_server_opening().await;
                 }
             }
@@ -1884,6 +2150,23 @@ impl Session {
                 let flag = frame.payload.first().copied().unwrap_or(PADDING_FLAG_REQUEST);
                 if flag == PADDING_FLAG_GOAWAY {
                     self.note_peer_goaway(&frame.payload);
+                } else if flag == PADDING_FLAG_WINDOW_UPDATE {
+                    // 真实 H2 流控信贷：连接级（stream_id=0）或每流级
+                    // 入账并唤醒门控等待者。纯记账、零 await——读循环
+                    // 绝不因信贷路径阻塞。每流信贷挂在句柄上，句柄随流
+                    // 拆除即释放；对已关闭流的 WU 静默忽略。
+                    if let Some(increment) = decode_padding_window_update(&frame.payload) {
+                        if frame.stream_id == 0 {
+                            self.windows.add_conn_credit(increment);
+                        } else if let Some(handle) = self.streams.read().await.get(&frame.stream_id)
+                        {
+                            self.windows.add_stream_credit(
+                                &handle.send_credit,
+                                &handle.pending_notify,
+                                increment,
+                            );
+                        }
+                    }
                 } else if flag == PADDING_FLAG_REQUEST {
                     // 请求记录的线速尺寸由帧长唯一复原（junk 已按目标反解），
                     // 应答的 H2 角色据此决定——见 padding_reply_wire_len。
@@ -1926,12 +2209,17 @@ impl Session {
                     // 成功，不等 socket 冲刷，读循环不被 reply 拖住。m 条记录
                     // 共用一次 flush——真实 H2 端点同样把同一 flight 的
                     // PING-ACK 与 WINDOW_UPDATE 合并写出。
-                    if let Err(e) = self
-                        .writer
-                        .submit_write_packets(replies, FlushBehavior::Auto, TrafficClass::Control)
-                        .await
-                    {
-                        warn!("failed to queue CMD_PADDING replies: {}", e);
+                    //
+                    // 用 try 路径而不是 submit_write_packets().await：读循环
+                    // 不得阻塞在写端排队上（死锁环见 WindowState 的论证）。
+                    // 队列满时丢弃应答——它们是合成/骨架帧，丢失只影响
+                    // 伪装节奏，不损坏任何数据；后续请求还会再来。
+                    if let Err(e) = self.writer.try_write_packets(
+                        replies,
+                        FlushBehavior::Auto,
+                        TrafficClass::Control,
+                    ) {
+                        debug!("failed to queue CMD_PADDING replies: {}", e);
                     }
                 }
             }
@@ -1965,10 +2253,19 @@ impl Session {
             return false;
         }
 
+        // fc 对端的每流缓冲上限 = 窗口 + 首 RTT 越界余量（对端 SETTINGS
+        // 确认前本端可能已超发一个 RTT 的字节，见 WindowState）。窗口本身
+        // 界定在途字节，故此限对正常 fc 对端结构性不可达；旧对端沿用
+        // 2 MiB 原值，行为与旧版一致。
+        let overflow_limit = if self.windows.peer_supports_flow_control() {
+            MAX_STREAM_OVERFLOW_BYTES.saturating_mul(2)
+        } else {
+            MAX_STREAM_OVERFLOW_BYTES
+        };
         if pending
             .stream_bytes(sid)
             .saturating_add(payload.len())
-            > MAX_STREAM_OVERFLOW_BYTES
+            > overflow_limit
         {
             warn!(
                 stream_id = sid,
@@ -2126,19 +2423,36 @@ impl Session {
 
             // buffered_data 在 store_pending_open_data 时已入账，投递进
             // data channel 只是转移所有权；投递失败被丢弃时由 Drop 自动回账。
+            // channel 满时余量转投 pending_data（与正常投递路径同一缓冲），
+            // 而不是杀流：pre-accept 缓冲已被每流窗口界定，对 fc 对端
+            // 结构性装得下。
             let mut payloads = pending_data.into_iter();
+            let mut overflow_to_pending = Vec::new();
             while let Some(payload) = payloads.next() {
-                if data_tx.try_send(payload).is_err() {
-                    warn!(
-                        stream_id = sid,
-                        "closing stream: receiver queue full while flushing pending accept data"
-                    );
-                    drop(payloads);
-                    let _ = self.close_stream(sid).await;
-                    self.pending_open_streams.lock().await.remove(sid);
-                    return PendingAcceptFlushResult::ClosedLocally;
+                match data_tx.try_send(payload) {
+                    Ok(()) => {
+                        delivered_data = true;
+                    }
+                    Err(mpsc::error::TrySendError::Full(payload)) => {
+                        overflow_to_pending.push(payload);
+                        delivered_data = true;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(payload)) => {
+                        warn!(
+                            stream_id = sid,
+                            "closing stream: receiver closed while flushing pending accept data"
+                        );
+                        drop(payload);
+                        drop(payloads);
+                        drop(overflow_to_pending);
+                        let _ = self.close_stream(sid).await;
+                        self.pending_open_streams.lock().await.remove(sid);
+                        return PendingAcceptFlushResult::ClosedLocally;
+                    }
                 }
-                delivered_data = true;
+            }
+            for payload in overflow_to_pending {
+                self.store_pending_data(sid, payload).await;
             }
 
             if pending_fin {
@@ -2202,7 +2516,8 @@ impl Session {
                         drop(payload);
                         drop(remaining);
                         drop(pending_data);
-                        let _ = self.close_stream(sid).await;
+                        // 读循环内（CMD_SYNACK 分支）：防御性关闭不得等 flush。
+                        self.close_stream_fire_and_forget(sid).await;
                         return;
                     }
                 }
@@ -2290,6 +2605,10 @@ impl SessionWriter {
     pub(crate) fn close(&self) {
         self.close_requested.store(true, Ordering::Relaxed);
         self.close_notify.notify_waiters();
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.close_requested.load(Ordering::Relaxed)
     }
 
     pub(crate) async fn write_packets(

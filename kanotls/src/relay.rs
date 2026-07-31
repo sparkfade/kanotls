@@ -51,6 +51,8 @@ pub async fn relay_tcp_client(
                     Some(d) => {
                         local_writer.write_all(&d).await?;
                         rx_total += d.len() as u64;
+                        // 字节已交付本地应用：回补对端窗口（H2 流控语义）。
+                        remote.note_consumed(d.len());
                     }
                     None => {
                         local_writer.shutdown().await?;
@@ -79,6 +81,8 @@ pub async fn relay_tcp_server(
                 match data {
                     Some(d) => {
                         remote.write_all(&d).await?;
+                        // 字节已交付远端：回补对端窗口（H2 流控语义）。
+                        stream.note_consumed(d.len());
                     }
                     None => {
                         let _ = remote.shutdown().await;
@@ -148,6 +152,7 @@ pub async fn relay_udp_server(
                                 continue;
                             }
                             let _ = relay.send_to(&payload, &addr).await;
+                            stream.note_consumed(payload.len());
                         }
                     }
                     None => break,
@@ -236,6 +241,7 @@ pub async fn relay_udp_client_mode(
                             if let Some(peer_addr) = *peer.lock().await {
                                 let packet = kanotls_proto::uot::encode_socks5_udp(&payload, &addr);
                                 let _ = local.send_to(&packet, peer_addr).await;
+                                stream.note_consumed(payload.len());
                             }
                         }
                     }

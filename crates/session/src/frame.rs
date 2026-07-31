@@ -42,7 +42,14 @@ impl Frame {
     }
 
     pub fn cmd_settings() -> Self {
-        Self::new(CMD_SETTINGS, 0, b"v=2;name=kanotls".to_vec())
+        // `fc=1`：向对端声明本端支持 H2 流控（WINDOW_UPDATE 信贷帧）。
+        // 对旧对端只是内容多几个字节的未知设置项，静默忽略；对新对端是
+        // 发送侧门控的启用条件（见 session::WindowState）。
+        //
+        // 载荷刻意保持紧凑：SETTINGS 会随服务端开场 flight 的首条记录
+        // 上链，而该记录的目标尺寸由 `h2_opening_size(S2C, 0)` 定死
+        // （51 字节 ⇒ 27 字节容量），帧体必须装得下。
+        Self::new(CMD_SETTINGS, 0, b"v=2;fc=1".to_vec())
     }
 
     pub fn syn(stream_id: u32) -> Self {
@@ -149,9 +156,24 @@ pub(crate) const PADDING_FLAG_REQUEST: u8 = 0;
 pub(crate) const PADDING_FLAG_REPLY: u8 = 1;
 /// 优雅拆除前的 H2 GOAWAY：载荷在 `[flag, m]` 之后携带 4 字节 last_stream_id。
 pub(crate) const PADDING_FLAG_GOAWAY: u8 = 2;
+/// 真实的 H2 WINDOW_UPDATE 信贷帧：帧头 stream_id 指明是连接级（0）还是
+/// 每流级，载荷在 `[flag, m]` 之后携带 4 字节增量（u32 大端，与 H2
+/// WINDOW_UPDATE 帧同宽）。
+///
+/// **为什么需要它**：此前「WINDOW_UPDATE」只是消费 6 MiB 后注入一条 flag=1
+/// 填充，对端静默吸收，不带任何信贷语义——于是接收缓冲只能靠「超限丢数据 +
+/// 杀流」兜底（数据损坏 / 传输被掐断）。真实 H2 的接收方按消费量回补窗口，
+/// 发送方在窗口耗尽后**停发**，接收缓冲由窗口本身界定。本 flag 把那条填充
+/// 变成真正的信贷帧：接收方消费过半窗口即回吐一条，发送方据此放行或挂起。
+///
+/// 对未升级的旧对端完全无害（同 GOAWAY 的论证）：旧读循环只对 flag=0 作答，
+/// 其余 flag 走完 match 直接 `Ok(())` 静默丢弃。
+pub(crate) const PADDING_FLAG_WINDOW_UPDATE: u8 = 3;
 
 /// GOAWAY 载荷里 last_stream_id 的字节数（u32 大端，与 H2 GOAWAY 帧同宽）。
 const GOAWAY_LAST_STREAM_ID_LEN: usize = 4;
+/// WINDOW_UPDATE 载荷里增量的字节数（u32 大端，与 H2 WINDOW_UPDATE 帧同宽）。
+const WINDOW_UPDATE_INCREMENT_LEN: usize = 4;
 
 /// 一条能装下 last_stream_id 的 GOAWAY 记录的结构下限（37 字节）。
 ///
@@ -248,6 +270,40 @@ pub(crate) fn decode_padding_goaway(payload: &[u8]) -> Option<u32> {
         return None;
     }
     let raw = payload.get(PADDING_HEADER_LEN..PADDING_HEADER_LEN + GOAWAY_LAST_STREAM_ID_LEN)?;
+    Some(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+/// 构造一条线速尺寸恰为 `target_wire_len` 的 WINDOW_UPDATE 信贷帧
+/// （flag=3）：`stream_id` 写进帧头（0 = 连接级，与 H2 同语义），增量写进
+/// `[flag, m]` 之后的 4 字节区，余量零填充。目标取 `WINDOW_UPDATE_WIRE`
+/// （37）时 `37 − 24 = 13 = 7 帧头 + 2 + 4`，恰好零 junk。
+pub(crate) fn encode_padding_window_update_sized(
+    stream_id: u32,
+    increment: u32,
+    target_wire_len: usize,
+) -> Vec<u8> {
+    let mut dst = encode_padding_frame_sized(PADDING_FLAG_WINDOW_UPDATE, 0, target_wire_len);
+    dst[1..5].copy_from_slice(&stream_id.to_be_bytes());
+    let start = FRAME_HEADER_SIZE + PADDING_HEADER_LEN;
+    // 用 get_mut 而不是直接切片索引：目标尺寸低于结构下限时退化为一条
+    // 不带增量的 WINDOW_UPDATE（接收侧据 flag 判定，见
+    // decode_padding_window_update），而不是 panic。
+    if let Some(slot) = dst.get_mut(start..start + WINDOW_UPDATE_INCREMENT_LEN) {
+        slot.copy_from_slice(&increment.to_be_bytes());
+    }
+    dst
+}
+
+/// 若 `payload` 是一条携带增量的 WINDOW_UPDATE 载荷，返回该增量。
+///
+/// flag 不对或长度不足（理论上只有对端实现有误时才会出现）返回 `None`，
+/// 语义等同「没收到信贷」——绝不能当成 `increment = 0` 以外的任何值，
+/// 更不得把坏帧当作合法信贷入账。
+pub(crate) fn decode_padding_window_update(payload: &[u8]) -> Option<u32> {
+    if payload.first().copied()? != PADDING_FLAG_WINDOW_UPDATE {
+        return None;
+    }
+    let raw = payload.get(PADDING_HEADER_LEN..PADDING_HEADER_LEN + WINDOW_UPDATE_INCREMENT_LEN)?;
     Some(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
 }
 
@@ -445,6 +501,90 @@ mod tests {
             decode_padding_goaway(&[PADDING_FLAG_GOAWAY, 0, 0, 0, 1, 2]),
             Some(258)
         );
+    }
+
+    /// WINDOW_UPDATE 信贷帧：帧头 stream_id、载荷增量、线速尺寸三者必须
+    /// 同时精确落位，且 37 字节目标（`WINDOW_UPDATE_WIRE`）下零 junk。
+    ///
+    /// 结构下限 33 装不下 `[flag, m] + 4 字节增量`（载荷下限 6 > 33 − 24 −
+    /// 7 = 2），增量随帧静默退化——生产路径恒取 37，此处只钉住边界不 panic。
+    #[test]
+    fn window_update_frame_round_trip() {
+        for target in [37usize, 41, 82] {
+            for stream_id in [0u32, 1, 3, 65535, u32::MAX] {
+                for increment in [0u32, 1, 65535, u32::MAX] {
+                    let packet =
+                        encode_padding_window_update_sized(stream_id, increment, target);
+                    assert_eq!(packet[0], CMD_PADDING);
+                    assert_eq!(packet[1..5], stream_id.to_be_bytes());
+                    assert_eq!(packet.len() + CONTROL_RECORD_MIN_OVERHEAD, target);
+                    assert_eq!(self_sized_padding_wire_len(&packet), Some(target));
+                    let mut buf = bytes::BytesMut::from(packet.as_slice());
+                    let frame = Frame::decode(&mut buf).expect("frame decodes");
+                    assert_eq!(frame.stream_id, stream_id);
+                    assert_eq!(
+                        decode_padding_window_update(&frame.payload),
+                        Some(increment)
+                    );
+                }
+            }
+        }
+        // 结构下限：增量装不下 ⇒ 解码返回 None（绝不入账成 0）。
+        let packet = encode_padding_window_update_sized(1, 4096, MIN_PADDING_RECORD_WIRE_LEN);
+        assert_eq!(
+            decode_padding_window_update(&packet[FRAME_HEADER_SIZE..]),
+            None
+        );
+    }
+
+    /// 37 字节目标恰好等于结构下限 + 4 字节增量：`37 − 24 = 13 = 7 帧头 +
+    /// 2 `[flag, m]` + 4 增量`，junk 区为零。
+    #[test]
+    fn window_update_target_37_carries_increment_without_junk() {
+        let packet = encode_padding_window_update_sized(9, 0xDEAD_BEEF, 37);
+        assert_eq!(packet.len(), FRAME_HEADER_SIZE + PADDING_HEADER_LEN + 4);
+        let payload = &packet[FRAME_HEADER_SIZE..];
+        assert_eq!(&payload[..2], &[PADDING_FLAG_WINDOW_UPDATE, 0]);
+        assert_eq!(&payload[2..6], &0xDEAD_BEEFu32.to_be_bytes());
+    }
+
+    /// 解析必须在「拿不准」时返回 `None`：坏 flag 或长度不足的帧绝不入账，
+    /// 更不能当成 `increment = 0` 的合法信贷（那等于让发送方凭空失去一次
+    /// 恢复机会之外还多一次无效入账）。
+    #[test]
+    fn window_update_decode_never_defaults_to_zero() {
+        assert_eq!(
+            decode_padding_window_update(&encode_padding_reply_sized(41)[FRAME_HEADER_SIZE..]),
+            None
+        );
+        assert_eq!(
+            decode_padding_window_update(&encode_padding_request_sized(1, 41)[FRAME_HEADER_SIZE..]),
+            None
+        );
+        assert_eq!(decode_padding_window_update(&[]), None);
+        assert_eq!(decode_padding_window_update(&[PADDING_FLAG_WINDOW_UPDATE]), None);
+        assert_eq!(
+            decode_padding_window_update(&[PADDING_FLAG_WINDOW_UPDATE, 0, 1, 2, 3]),
+            None
+        );
+        assert_eq!(
+            decode_padding_window_update(&[PADDING_FLAG_WINDOW_UPDATE, 0, 0, 0, 1, 2]),
+            Some(258)
+        );
+    }
+
+    /// WINDOW_UPDATE 帧必须被 `self_sized_padding_wire_len` 识别：它由接收方
+    /// 在消费路径上生成，写循环按反解目标 prepare，记录才能精确落在
+    /// `WINDOW_UPDATE_WIRE`。
+    #[test]
+    fn self_sized_detection_accepts_window_update_frames() {
+        for target in [33usize, 37, 41, 82] {
+            let packet = encode_padding_window_update_sized(7, 4096, target);
+            assert_eq!(self_sized_padding_wire_len(&packet), Some(target));
+        }
+        let mut merged = encode_padding_window_update_sized(7, 1, 37);
+        merged.extend_from_slice(&encode_padding_reply_sized(37));
+        assert_eq!(self_sized_padding_wire_len(&merged), None);
     }
 
     /// 只有「恰好一条完整 CMD_PADDING 帧」的 packet 才自带尺寸；其余
