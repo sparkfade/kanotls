@@ -163,11 +163,11 @@ fn coalesce_encoded_frames_respects_packet_limit() {
 
 /// 线上观测类测试的互斥锁。
 ///
-/// `H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES` / `H2_PING_IDLE_THRESHOLD_OVERRIDE_MS` /
-/// `H2_EXCHANGE_INTERVAL_OVERRIDE_MS` 是**进程级**覆写点，而 cargo 默认并行跑
-/// 测试：把 PING 间隔压到 50ms 的测试会让**同时**在跑的抓包测试看到一对
-/// `41 / −41`（PING / PING-ACK）记录，那正好凑成 `(−L4, L1, −L1)`。凡是
-/// 「设置覆写点」或「对线上记录序列做断言」的测试都必须先拿这把锁。
+/// `H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES` / `H2_EXCHANGE_INTERVAL_OVERRIDE_MS`
+/// 是**进程级**覆写点，而 cargo 默认并行跑测试：把交换间隔压到几十毫秒的
+/// 测试会让**同时**在跑的抓包测试看到合成 H2 交换的 `HEADERS → 响应` 记录对，
+/// 干扰对线上记录序列的断言。凡是「设置覆写点」或「对线上记录序列做断言」
+/// 的测试都必须先拿这把锁。
 static WIRE_OBSERVATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn test_session_config(is_client: bool) -> SessionConfig {
@@ -1368,7 +1368,7 @@ async fn cmd_padding_request_with_large_m_is_capped_at_two_replies() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (client_tunnel, server_tunnel) = snowy_stream_pair().await;
-    // 关闭稳态 H2 骨架：并行的 H2 测试会临时覆写全局 PING 间隔，
+    // 关闭稳态 H2 骨架：并行的 H2 测试会临时覆写全局 WU/交换阈值，
     // 骨架关闭后本测试的 padding 计数不受跨测试干扰。
     let mut config = test_session_config(true);
     config.post_script_off = true;
@@ -2010,25 +2010,13 @@ async fn inject_absorbed_record(write_half: &mut super::SplitWriteHalf) {
     write_half.flush().await.expect("absorbed record flushes");
 }
 
-// W3(b) 回归：PING 必须是**空闲触发 + 仅客户端发起 + 常量阈值**，并且在连接
-// 仍处于论文 `Wo = 25` 观测窗口内时被抑制。
-//
-// 三段分别对应任务 2b 的三处修正：
-//  (a) 窗口内抑制——arrivals < Wo 时无论空闲多久都不发。窗口之外的 PING 完全
-//      不被采样，所以窗口内抑制是零代价的：一对 `(+41, −41)` 若紧跟在此前
-//      下行 burst 的尾段之后，在包序列上就是 `(−L4, L1, −L1)`（Distinc 2.879）。
-//  (b) 有活动不探活——arrivals ≥ Wo 但对端持续说话（间隔 < 阈值）时不发。
-//      此前是固定周期定时器，会在正在传输大流量的连接上插 PING。
-//  (c) 空闲即探活——对端安静超过阈值后必发一条 **PING 尺寸**的 flag=0 请求。
+// W3(b) 回归（用户要求移除客户端空闲探活 PING）：客户端连接无论空闲多久都
+// 不得发出 PING 尺寸的 flag=0 请求。flag=0 m=1 路径只剩脚本 fake 交互与
+// 合成 H2 交换两类成因，而它们的请求记录都是 HEADERS 量级（274–824），
+// 不是 PING（41），故断言「跨长空闲期零 PING 请求」不受它们干扰。
 #[tokio::test]
-async fn h2_ping_is_idle_triggered_and_suppressed_inside_the_observation_window() {
-    use super::H2_PING_IDLE_THRESHOLD_OVERRIDE_MS;
-    use std::sync::atomic::Ordering;
+async fn client_never_emits_idle_h2_ping() {
     let _wire_lock = WIRE_OBSERVATION_LOCK.lock().await;
-
-    const THRESHOLD_MS: u64 = 60;
-    H2_PING_IDLE_THRESHOLD_OVERRIDE_MS.store(THRESHOLD_MS, Ordering::Relaxed);
-    let threshold = Duration::from_millis(THRESHOLD_MS);
 
     let (client_tunnel, server_tunnel) = snowy_stream_pair().await;
     let client = Arc::new(Session::new(client_tunnel, test_session_config(true), None));
@@ -2039,23 +2027,7 @@ async fn h2_ping_is_idle_triggered_and_suppressed_inside_the_observation_window(
     let (mut server_read, mut server_write) = server_tunnel.into_split();
     let mut buf = bytes::BytesMut::with_capacity(65536);
 
-    // (a) 窗口内：只喂几个到达事件，然后彻底安静 4 个阈值周期。
-    for _ in 0..3 {
-        inject_absorbed_record(&mut server_write).await;
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-    assert!(
-        client.inbound.arrivals() < super::PAPER_OBSERVATION_WINDOW_PACKETS,
-        "前置条件：此时必须仍在观测窗口内"
-    );
-    let pings = count_ping_requests(&mut server_read, &mut buf, threshold * 3).await;
-    assert_eq!(
-        pings, 0,
-        "连接仍在论文的 Wo=25 观测窗口内时不得发 PING"
-    );
-
-    // 把连接推出观测窗口：一次一条记录，每条对应读循环的一次 read()。
-    // TCP 可能合并，故以 arrivals 计数为准循环补喂。
+    // 推出观测窗口，确保「不发 PING」不是被窗口内抑制掩盖的。
     let push_out = async {
         while client.inbound.arrivals() < super::PAPER_OBSERVATION_WINDOW_PACKETS {
             inject_absorbed_record(&mut server_write).await;
@@ -2066,66 +2038,11 @@ async fn h2_ping_is_idle_triggered_and_suppressed_inside_the_observation_window(
         .await
         .expect("connection leaves the observation window before timeout");
 
-    // (b) 窗口之外但**有活动**：每 threshold/4 喂一条，持续 4 个阈值周期。
-    let busy_until = tokio::time::Instant::now() + threshold * 3;
-    let mut busy_pings = 0usize;
-    while tokio::time::Instant::now() < busy_until {
-        inject_absorbed_record(&mut server_write).await;
-        busy_pings += count_ping_requests(&mut server_read, &mut buf, threshold / 4).await;
-    }
-    assert_eq!(
-        busy_pings, 0,
-        "对端持续说话（间隔 < 阈值）的连接上不得插 PING"
-    );
+    // 长时间空闲（远超此前空闲阈值的测试量级）：不得出现任何 PING 请求。
+    let pings = count_ping_requests(&mut server_read, &mut buf, Duration::from_millis(600)).await;
+    assert_eq!(pings, 0, "客户端不得发起空闲探活 H2 PING");
 
-    // (c) 窗口之外且**空闲**：安静超过阈值后必有 PING。
-    let pings = count_ping_requests(&mut server_read, &mut buf, threshold * 4).await;
-    assert!(
-        pings >= 1,
-        "空闲超过阈值后必须发出至少一条 PING 尺寸的 flag=0 请求"
-    );
-
-    H2_PING_IDLE_THRESHOLD_OVERRIDE_MS.store(0, Ordering::Relaxed);
     client.force_close();
-}
-
-// W3(b) 回归：**服务端方向从不主动发 PING**——真实 nginx 只回 PING-ACK。
-// 此前两端共用同一个周期定时器，服务端也会自发探活。
-#[tokio::test]
-async fn server_never_initiates_h2_ping() {
-    use super::H2_PING_IDLE_THRESHOLD_OVERRIDE_MS;
-    use std::sync::atomic::Ordering;
-    let _wire_lock = WIRE_OBSERVATION_LOCK.lock().await;
-
-    const THRESHOLD_MS: u64 = 40;
-    H2_PING_IDLE_THRESHOLD_OVERRIDE_MS.store(THRESHOLD_MS, Ordering::Relaxed);
-    let threshold = Duration::from_millis(THRESHOLD_MS);
-
-    let (server_tunnel, client_tunnel) = snowy_stream_pair().await;
-    let server = Arc::new(Session::new(server_tunnel, test_session_config(false), None));
-    let server_read_loop = server.clone();
-    tokio::spawn(async move {
-        let _ = server_read_loop.run_read_loop().await;
-    });
-    let (mut client_read, mut client_write) = client_tunnel.into_split();
-    let mut buf = bytes::BytesMut::with_capacity(65536);
-
-    // 推出观测窗口，确保「不发 PING」不是被窗口抑制掩盖的。
-    let push_out = async {
-        while server.inbound.arrivals() < super::PAPER_OBSERVATION_WINDOW_PACKETS {
-            inject_absorbed_record(&mut client_write).await;
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), push_out)
-        .await
-        .expect("connection leaves the observation window before timeout");
-
-    let pings = count_ping_requests(&mut client_read, &mut buf, threshold * 5).await;
-    assert_eq!(pings, 0, "服务端方向不得主动发起 H2 PING");
-
-    H2_PING_IDLE_THRESHOLD_OVERRIDE_MS.store(0, Ordering::Relaxed);
-    server.force_close();
 }
 
 // M12 回归：read_closed=true 且三个 channel 全关的句柄必须能被 prune

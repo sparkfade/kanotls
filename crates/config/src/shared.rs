@@ -3,6 +3,11 @@ use anyhow::{bail, Result};
 const MAX_STREAMS_PER_SESSION_LIMIT: usize = 4096;
 const MAX_IDLE_TIMEOUT_SECS: u64 = 3600;
 
+/// 客户端连接池的空闲拆除上限（Firefox `network.http.keep-alive.timeout`，
+/// `crates/pool/src/behavior.rs` 的 `IDLE_DRAIN_SECS`）。服务端空闲拆除与之
+/// 比较决定「谁先关」。
+const CLIENT_POOL_IDLE_DRAIN_SECS: u64 = 115;
+
 pub fn validate_session_config(prefix: &str, session: &crate::model::SessionConfig) -> Result<()> {
     if session.max_streams_per_session == 0
         || session.max_streams_per_session > MAX_STREAMS_PER_SESSION_LIMIT
@@ -18,6 +23,22 @@ pub fn validate_session_config(prefix: &str, session: &crate::model::SessionConf
             "{}: session.idle_timeout_secs must be in 1..={}",
             prefix,
             MAX_IDLE_TIMEOUT_SECS
+        );
+    }
+    // 服务端空闲拆除（仅服务端生效，`!is_client` 门控）与客户端连接池的
+    // 115s drain 一起决定空闲连接的「先关方」。默认 75s < 115s 保证先关方是
+    // 服务端（与真实 H2 一致）；≥115s 时客户端先关——真实 Firefox 自己的
+    // keep-alive 上限也是这么做的，因此这不是检测面，只是内部一致性偏好，
+    // 只提示、不拒绝。
+    if session.idle_timeout_secs >= CLIENT_POOL_IDLE_DRAIN_SECS {
+        tracing::warn!(
+            "{}: session.idle_timeout_secs = {} is not less than the client pool's {}s idle drain: \
+             on an idle connection the **client** will close first instead of the server. Real \
+             Firefox does the same (its own keep-alive timeout fires first), so this is not a \
+             detection surface — but the 'server closes first' invariant is deliberately broken.",
+            prefix,
+            session.idle_timeout_secs,
+            CLIENT_POOL_IDLE_DRAIN_SECS
         );
     }
     if let Some(ref script) = session.traffic_script {
@@ -76,8 +97,10 @@ fn validate_post_script_shaping(prefix: &str, mode: &str) {
 fn validate_traffic_script(prefix: &str, script: &[String]) {
     match crate::script::parse_traffic_script(script) {
         Err(e) => {
-            tracing::warn!(
-                "{}: traffic_script is malformed ({}); the embedded default script will be used instead",
+            tracing::error!(
+                "{}: traffic_script is malformed ({}); this deployment is now running the \
+                 embedded default script — your custom de-clustering script was discarded and \
+                 every connection shares the global default profile",
                 prefix,
                 e
             );

@@ -57,7 +57,7 @@ pub const PEER_NEVER_PROCESSED_ERROR: &str = "stream was never processed by the 
 /// 才轮到源站」，宽限期只决定 open 什么时候发出。
 ///
 /// **为什么是定值而不是抖动值**：与 `PEER_TURN_MAX_WAIT` /
-/// `H2_PING_IDLE_THRESHOLD_SECS` 同一口径——这是一个**截止期**，不是 IAT
+/// `H2_EXCHANGE_MAX_INTERVAL_SECS` 同一口径——这是一个**截止期**，不是 IAT
 /// 模型。它可观测的形态是「目标记录之后、下一条上行记录在 X 之后」，而那个
 /// X 由源站 banner 的往返决定，不由本常量决定；本常量只决定目标记录相对
 /// 「开流」这一**对端无法观测的时刻**的偏移。对第 2..N 条流，线上确实存在
@@ -285,10 +285,9 @@ impl Stream {
         }
 
         self.finish_pending_open_submission().await?;
-        if self.early_data_already_submitted() {
-            return Ok(());
-        }
-
+        // 此前 `early_data_already_submitted()` 时直接 `return Ok(())`，把本次
+        // 载荷静默丢弃；开场数据已经随 SYN 出网只说明「早前的那一份」发了，
+        // 这一次的字节仍必须按普通数据帧写出去。
         self.write_data_frame_with_flush(data, FlushBehavior::Immediate)
             .await
     }
@@ -705,16 +704,6 @@ impl Stream {
 
     fn has_deferred_open(&self) -> bool {
         matches!(self.open_state, StreamOpenState::DeferredUnsent(_))
-    }
-
-    fn early_data_already_submitted(&self) -> bool {
-        matches!(
-            self.open_state,
-            StreamOpenState::Submitted {
-                early_data_submitted: true,
-                ..
-            }
-        )
     }
 
     fn take_pending_open_write_for_drop(&mut self) -> Option<PendingWrite> {

@@ -10,9 +10,6 @@ use tracing::{debug, warn};
 
 use super::{resolve_allowed_camouflage, FailureClass};
 
-/// `emit_indistinguishable_close` 关闭前的接收队列排空上限（见该函数注释）。
-const CLOSE_DRAIN_MAX_BYTES: usize = 64 * 1024;
-
 /// 排空窗口。删掉此前那段 200–3000 ms 的随机关闭延迟之后，它就是这条路径上
 /// **唯一**的自有时延，也因此直接等于对端观察到的关闭时刻。
 ///
@@ -132,15 +129,14 @@ impl Drop for PreAuthFallbackPermit {
 pub(super) async fn emit_indistinguishable_close(mut client_stream: TcpStream) {
     let drain_deadline = Instant::now() + CLOSE_DRAIN_TIMEOUT;
     let mut scratch = [0u8; 4096];
-    let mut drained = 0usize;
-    while drained < CLOSE_DRAIN_MAX_BYTES {
+    loop {
         let remaining = drain_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
         match tokio::time::timeout(remaining, client_stream.read(&mut scratch)).await {
             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-            Ok(Ok(n)) => drained += n,
+            Ok(Ok(_)) => {}
         }
     }
 

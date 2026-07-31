@@ -63,7 +63,7 @@ impl TunnelConnector for KanotlsConnector {
                 Ok(tunnel) => tunnel,
                 Err(err) => {
                     report_auth_misconfiguration(&err, &options.sni);
-                    return Err(err);
+                    return Err(err.into());
                 }
             };
 
@@ -81,13 +81,13 @@ impl TunnelConnector for KanotlsConnector {
 
 /// 按失败形态分类建连错误，替代此前那条一次性的启动预检连接。
 ///
-/// 客户端收到了完整的真实 flight 却在其中找不到 Noise 响应，说明服务端
-/// 拒绝认证后把这条连接交给了 fallback 透明中继——只可能是 PSK 不匹配，
-/// 或 `tls.sni` 与服务端 `camouflage.host` 不一致（两者在客户端侧不可
-/// 区分，一并提示）。其余错误（连接被拒、超时、DNS 失败）由池自己的
-/// `pooled tunnel connection failed` 告警承载，不在此重复。
-fn report_auth_misconfiguration(err: &anyhow::Error, sni: &str) {
-    if !err.to_string().contains("failed to locate Noise response") {
+/// [`TunnelConnectError::AuthRejected`] 说明服务端拒绝认证后把这条连接交给了
+/// fallback 透明中继——只可能是 PSK 不匹配，或 `tls.sni` 与服务端
+/// `camouflage.host` 不一致（两者在客户端侧不可区分，一并提示）。其余错误
+/// （连接被拒、超时、DNS 失败）由池自己的 `pooled tunnel connection failed`
+/// 告警承载，不在此重复。
+fn report_auth_misconfiguration(err: &kanotls_tunnel::client::TunnelConnectError, sni: &str) {
+    if !matches!(err, kanotls_tunnel::client::TunnelConnectError::AuthRejected(_)) {
         return;
     }
     if AUTH_MISCONFIG_REPORTED.swap(true, Ordering::Relaxed) {

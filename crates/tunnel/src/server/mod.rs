@@ -1133,7 +1133,8 @@ mod tests {
     #[tokio::test]
     async fn sample_camouflage_profile_selection_matches_legacy_candidate_set() {
         let pools = vec![
-            // 混合 rank：rank3 ×2 / rank2 / rank1 ⇒ 候选只能是那两个 rank3。
+            // 混合 rank：rank3 ×1 / rank2 ×2（单条记录 [53] 与无尺寸 [0x16,0x02]
+            // 都按 rank 2 计） / rank1 ⇒ 候选只能是那一个 rank3。
             vec![
                 test_camouflage_profile(vec![0x16, 0x01], vec![53]),
                 test_camouflage_profile(vec![0x16, 0x02], vec![]),
@@ -1562,6 +1563,31 @@ mod tests {
     fn sanitize_waste_record_sizes_drops_out_of_range_values() {
         let sizes = sanitize_waste_record_sizes(&[8, 23, 120, 8192, 16401, 20000]);
         assert_eq!(sizes, vec![23, 120, 8192, 16401]);
+    }
+
+    /// 兜底尺寸必须永远是一个固定点：最大采样尺寸（够大时）或最小可用尺寸，
+    /// 绝不产生 [54, 512] 的均匀抽样——平直直方图不是真实 TLS 端点会发出的
+    /// 记录尺寸分布。
+    #[test]
+    fn fallback_noise_response_len_reuses_largest_sample_or_minimum() {
+        use crate::common::MIN_NOISE_RESPONSE_RECORD_LEN;
+        use super::camouflage::fallback_noise_response_record_len;
+
+        // 有可承载 Noise 响应的采样：复用最大尺寸（主分支，含上限钳制）。
+        assert_eq!(fallback_noise_response_record_len(&[23, 200]), 200);
+        assert_eq!(fallback_noise_response_record_len(&[23, 20_000]), 16_401);
+
+        // 采样存在但都太小：钳到最小可用值，而不是随机。
+        assert_eq!(fallback_noise_response_record_len(&[23, 31]), MIN_NOISE_RESPONSE_RECORD_LEN);
+
+        // 完全没有采样：最小可用值。
+        assert_eq!(fallback_noise_response_record_len(&[]), MIN_NOISE_RESPONSE_RECORD_LEN);
+
+        // 固定点：多轮调用结果必须完全一致。
+        let results: std::collections::HashSet<usize> = (0..64)
+            .map(|_| fallback_noise_response_record_len(&[17, 23]))
+            .collect();
+        assert_eq!(results.len(), 1);
     }
 
     /// 输入驱动的 pre-auth 失败必须**全部**具备回落转发资格，彼此不可区分。

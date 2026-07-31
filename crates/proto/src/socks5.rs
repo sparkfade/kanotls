@@ -284,11 +284,15 @@ pub async fn socks5_send_udp_associate(
     let relay_addr = match read_socks5_reply_addr(stream).await? {
         Socks5ReplyAddr::Ip(addr) => addr,
         Socks5ReplyAddr::Domain(host, port) => {
-            let resolved = crate::dns::resolve(host.as_str(), port).await?;
-            resolved
-                .first()
-                .copied()
-                .ok_or_else(|| anyhow::anyhow!("unable to resolve socks5 UDP relay host"))?
+            // 与出站路径共用 resolve_remote_target：过滤被阻断地址后取第一个
+            // 放行地址。此前只取解析结果的第一项——一个被阻断的首地址
+            // （典型：IPv6 黑洞）会把 UDP 中继直接引向不可达的 relay。
+            let target = crate::target::Target::udp(crate::target::Host::from(host), port);
+            let allowed = crate::outbound::resolve_remote_target(&target).await?;
+            allowed
+                .into_iter()
+                .next()
+                .expect("resolve_remote_target returns a non-empty allowed list")
         }
     };
 
@@ -376,4 +380,45 @@ fn socks_udp_reply(addr: std::net::SocketAddr) -> Result<Vec<u8>, anyhow::Error>
         }
     }
     Ok(reply)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // UDP ASSOCIATE 的 Domain 回复必须与出站路径同一口径：解析结果中的
+    // 被阻断地址（如 IPv6 黑洞）整体跳过，落到第一个放行地址上。此前只取
+    // `resolved.first()`——一个被阻断的首地址会把 UDP 中继引向不可达的
+    // relay。解析结果通过 `crate::dns::seed_for_test` 固定为
+    // [blocked, allowed]，不依赖真实 DNS。
+    #[tokio::test]
+    async fn udp_associate_skips_blocked_first_address() {
+        const HOST: &str = "udp-relay.test";
+        const PORT: u16 = 28432;
+        let blocked = "10.0.0.1:28432".parse::<std::net::SocketAddr>().unwrap();
+        let allowed = "8.8.8.8:28432".parse::<std::net::SocketAddr>().unwrap();
+        crate::dns::seed_for_test(HOST, PORT, vec![blocked, allowed]);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 10];
+            stream.read_exact(&mut req).await.unwrap();
+            let mut reply = vec![SOCKS_VERSION, REP_SUCCEEDED, 0x00, 0x03, HOST.len() as u8];
+            reply.extend_from_slice(HOST.as_bytes());
+            reply.extend_from_slice(&PORT.to_be_bytes());
+            stream.write_all(&reply).await.unwrap();
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let relay = socks5_send_udp_associate(&mut stream).await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(
+            relay, allowed,
+            "a blocked first address must fall through to the first allowed one"
+        );
+    }
 }

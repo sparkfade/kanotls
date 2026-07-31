@@ -73,7 +73,7 @@ pub async fn run_server(config_path: &str) -> anyhow::Result<()> {
         .session
         .as_ref()
         .map(|s| s.idle_timeout_secs)
-        .unwrap_or(45);
+        .unwrap_or(75);
     let traffic_script = inbound
         .settings
         .session

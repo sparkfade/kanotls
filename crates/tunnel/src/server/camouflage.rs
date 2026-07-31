@@ -148,16 +148,18 @@ pub(super) fn make_control_payload(ghost_count: u16) -> [u8; HANDSHAKE_CONTROL_L
 ///
 /// 旧实现返回硬编码的 300 且完全不看参数，于是线上会出现一个真实端点从未
 /// 产生过的固定尺寸（wire 305），一测长度即可命中。改为优先复用采样到的
-/// 最大尺寸（那是端点真实发过的），只有在完全没有可用采样时才从一个区间
-/// 随机取值——此时无论取什么都不可能保真，至少不留固定常量。
+/// 最大尺寸（那是端点真实发过的）；采样存在但都装不下 Noise 响应、或完全
+/// 没有采样时，退回最小可用尺寸——一个固定点，而**绝不是**宽区间均匀抽样：
+/// [54, 512] 的平直直方图不是任何真实 TLS 端点会产生的记录尺寸分布，观测者
+/// 跨连接采样即可识别（真实端点的记录尺寸高度集中，且 54 是合法 TLS 1.3
+/// 密文记录中几乎不会单独出现的尺寸，固定点至少不是一段不可能的形状）。
 pub(super) fn fallback_noise_response_record_len(sampled_sizes: &[usize]) -> usize {
     if let Some(&largest) = sampled_sizes.iter().max() {
         if largest >= MIN_NOISE_RESPONSE_RECORD_LEN {
             return largest.min(MAX_CAMOUFLAGE_APP_DATA_RECORD_LEN);
         }
     }
-    use rand::Rng;
-    rand::thread_rng().gen_range(MIN_NOISE_RESPONSE_RECORD_LEN..=512)
+    MIN_NOISE_RESPONSE_RECORD_LEN
 }
 
 pub(super) fn sanitize_camouflage_profile(mut profile: CamouflageProfile) -> CamouflageProfile {
@@ -223,16 +225,18 @@ pub(super) fn merge_camouflage_profile(
     sanitize_camouflage_profile(cached_profile)
 }
 
+/// 防御性降级：单条 app-data 记录的 profile 是 fast 采样「首条匹配即停」的
+/// 产物，不是一次完整的 flight——把它按 rank 3 入池，`sample_camouflage_profile`
+/// 就会把它与完整 profile 等权均匀抽取，回放出一条 1-ghost-record 的退化
+/// flight。任何未来路径都不允许把单条记录当作「完整」profile 提供。
 pub(super) fn camouflage_profile_rank(profile: &CamouflageProfile) -> u8 {
-    match (
-        !profile.server_records.is_empty(),
-        !profile.app_data_sizes.is_empty(),
-    ) {
-        (true, true) => 3,
-        (true, false) => 2,
-        (false, true) => 1,
-        (false, false) => 0,
+    if profile.server_records.is_empty() {
+        return if profile.app_data_sizes.is_empty() { 0 } else { 1 };
     }
+    if profile.app_data_sizes.len() <= 1 {
+        return 2;
+    }
+    3
 }
 
 pub(super) fn is_complete_camouflage_profile(profile: &CamouflageProfile) -> bool {
@@ -276,11 +280,13 @@ pub(super) fn pick_refresh_base_profile(
 /// / `app_data_sizes` 都是真实分配，于是「有没有 rank-3 条目」这个纯读问题要
 /// 付十余次分配与数 KB memcpy，而其中至多 1 个结果会被用到。
 ///
-/// 等价性依据：`camouflage_profile_rank` 只看 `server_records` 与
-/// `app_data_sizes` 是否为空；`sanitize_camouflage_profile` 从不改 `server_records`，
-/// 且**入池的每个变体都已经过 sanitize**（`push_profile_variant` 是唯一写入
-/// 路径，它在存入前 sanitize），而 sanitize 是幂等的 ⇒ 对池中变体
-/// `rank(sanitize(p)) == rank(p)`，在引用上算 rank 与在克隆上算 rank 结果相同。
+/// 等价性依据：`camouflage_profile_rank` 只看 `server_records` 是否为空、
+/// `app_data_sizes` 是否为空以及长度是否 > 1（单条记录视为 fast 采样提前
+/// 停止的产物，按 rank 2 处理，见该函数注释）；`sanitize_camouflage_profile`
+/// 从不改 `server_records`，且**入池的每个变体都已经过 sanitize**
+/// （`push_profile_variant` 是唯一写入路径，它在存入前 sanitize），而 sanitize
+/// 是幂等的 ⇒ 对池中变体 `rank(sanitize(p)) == rank(p)`，在引用上算 rank 与在
+/// 克隆上算 rank 结果相同。
 /// 这两条不变量由 `sanitize_camouflage_profile_is_idempotent` /
 /// `pooled_profiles_are_stored_pre_sanitized` 锁定。
 /// 迭代顺序、候选集合、`gen_range(0..len)` 的抽样域与 RNG 调用次数（恰好 1 次）
@@ -743,14 +749,35 @@ pub(super) fn maybe_spawn_camouflage_refresh_daemon(
             let random_interval = rand::thread_rng()
                 .gen_range(CAMOUFLAGE_REFRESH_DAEMON_MIN_SECS..=CAMOUFLAGE_REFRESH_DAEMON_MAX_SECS);
             tokio::time::sleep(Duration::from_secs(random_interval)).await;
-            match read_camouflage_server_records(&host, port, &client_hello, true, None).await {
+            let Some(fingerprint) = stable_client_hello_fingerprint(&client_hello) else {
+                continue;
+            };
+            let mut hex_buf = [0u8; 64];
+            let fingerprint_hex = hex_encode_fingerprint(&fingerprint, &mut hex_buf);
+            let key = camouflage_profile_key(&host, port, fingerprint_hex);
+            // 与热路径同一契约：已有缓存 profile 时走快速采样，并按缓存的首条
+            // app-data 尺寸对齐——首条命中即停，未命中则继续采全；随后把快速
+            // 采样合并进缓存（只刷新首条尺寸），避免把 1 条记录的退化 flight
+            // 存成 rank-3 的「完整」profile。无缓存时全量采样。
+            let cached_profile = get_cached_camouflage_profile_entry(&key).await;
+            let expected_first = cached_profile
+                .as_ref()
+                .and_then(|profile| profile.app_data_sizes.first().copied());
+            match read_camouflage_server_records(
+                &host,
+                port,
+                &client_hello,
+                expected_first.is_some(),
+                expected_first,
+            )
+            .await
+            {
                 Ok((_server_records, profile)) => {
-                    if let Some(fingerprint) = stable_client_hello_fingerprint(&client_hello) {
-                        let mut hex_buf = [0u8; 64];
-                        let fingerprint_hex = hex_encode_fingerprint(&fingerprint, &mut hex_buf);
-                        let key = camouflage_profile_key(&host, port, fingerprint_hex);
-                        store_camouflage_profile(key, profile).await;
-                    }
+                    let profile = match cached_profile {
+                        Some(cached) => merge_camouflage_profile(cached, profile),
+                        None => profile,
+                    };
+                    store_camouflage_profile(key, profile).await;
                 }
                 Err(e) => {
                     debug!(

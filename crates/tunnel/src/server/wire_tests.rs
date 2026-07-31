@@ -737,6 +737,57 @@ async fn indistinguishable_close_drains_before_closing() {
     );
 }
 
+/// 大载荷（超过曾经的 64 KiB 字节上限）不得让排空提前结束。
+///
+/// 此前排空循环同时受 `CLOSE_DRAIN_TIMEOUT` 与 `CLOSE_DRAIN_MAX_BYTES` 两个条件
+/// 约束：快发送方会在读到约 64 KiB 时退出循环、立即 `shutdown()`——关闭时刻从
+/// 恒定的 200 ms 退化成「发送速度的函数」，与「无论收到多少字节都跑满
+/// `CLOSE_DRAIN_TIMEOUT`」的文档契约相悖。排空只应受时间窗口约束：窗口是成本
+/// 上界，字节数不是。
+///
+/// 服务端启动在前、载荷分块写在后，因此 `elapsed` 就是排空窗口本身；只要
+/// 载荷到达（或已在队列中）的速度快于 64 KiB / 200 ms，此前的字节上限就会让
+/// 关闭显著提前。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indistinguishable_close_drains_fast_sender_for_full_budget() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (mut client, server) = connected_pair().await;
+    let started = std::time::Instant::now();
+    let closer = tokio::spawn(super::fallback::emit_indistinguishable_close(server));
+
+    for _ in 0..(200 * 1024 / 8192) {
+        client.write_all(&[0x16u8; 8192]).await.unwrap();
+    }
+    client.flush().await.unwrap();
+
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(10), client.read(&mut buf))
+        .await
+        .expect("close must not hang")
+        .expect("close must surface as a clean EOF");
+    let elapsed = started.elapsed();
+    assert_eq!(n, 0, "close must not emit any application bytes");
+
+    // 给可能的 RST 留出到达时间，再用一次写探测连接是否已被重置。
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    let post_eof_write = client.write_all(b"probe").await.map_err(|e| e.kind());
+    closer.await.unwrap();
+
+    assert!(
+        elapsed >= std::time::Duration::from_millis(150),
+        "200 KiB in flight closed the connection after only {:?} — the drain loop must \
+         run out its full budget regardless of how fast the sender pushes bytes",
+        elapsed
+    );
+    assert!(
+        post_eof_write.is_ok(),
+        "close of a connection with an undrained receive queue resets the connection \
+         ({:?}) — the full payload must have been drained before shutdown",
+        post_eof_write
+    );
+}
+
 /// 限额耗尽路径的关闭必须是一个**短的常量**，不得是随机延迟。
 ///
 /// 此前这条测试断言的是反面（「关闭必须带随机延迟」，`elapsed >= 150ms`），

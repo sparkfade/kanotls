@@ -177,6 +177,47 @@ fn normalize_client_hello_key_shares(record: &mut [u8]) -> Option<()> {
     Some(())
 }
 
+/// 解析 ECHClientHello（draft-ietf-tls-esni §5）的逐连接可变字段：
+/// `type(1)=0 (outer) ‖ kdf_id(2) ‖ aead_id(2) ‖ config_id(1) ‖ enc<0..2^16-1>
+/// ‖ payload<1..2^16-1>`，返回 `(config_id 偏移, enc 范围, payload 范围)`。
+///
+/// 这是 template.rs 逐连接刷新（`parse_client_hello_layout`）与指纹归一化置零
+/// **共用**的唯一解析器——两侧曾各有一份手动同步的拷贝，任何一侧改布局另一
+/// 侧就会漂移：刷新侧认为 enc 从 data+8 开始、归一化侧按 data+8 置零，一旦
+/// 其中一处偏移写错，指纹稳定性测试与线上行为会静默分叉。结构截断一律返回
+/// None（fail closed）。
+///
+/// `type != 0`（inner）由调用方各自处理：指纹侧跳过（inner 是 Empty，没有逐
+/// 连接字段），模板构建侧 fail closed（无法刷新的 ECH 会被逐字节重放成跨连接
+/// 常量）。
+pub(crate) fn ech_variable_field_ranges(
+    record: &[u8],
+    data_range: std::ops::Range<usize>,
+) -> Option<(usize, std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let start = data_range.start;
+    let end = data_range.end;
+    if end == start {
+        return None;
+    }
+    // type(1) ‖ kdf(2) ‖ aead(2) ‖ config_id(1) ‖ enc_len(2)
+    if end - start < 8 {
+        return None;
+    }
+    let enc_len = u16::from_be_bytes([record[start + 6], record[start + 7]]) as usize;
+    let enc_start = start + 8;
+    let enc_end = enc_start.checked_add(enc_len)?;
+    if enc_end.saturating_add(2) > end {
+        return None;
+    }
+    let payload_len = u16::from_be_bytes([record[enc_end], record[enc_end + 1]]) as usize;
+    let payload_start = enc_end + 2;
+    let payload_end = payload_start.checked_add(payload_len)?;
+    if payload_end != end {
+        return None;
+    }
+    Some((start + 5, enc_start..enc_end, payload_start..payload_end))
+}
+
 /// 将 GREASE ECH（`0xFE0D` encrypted_client_hello）中逐连接变化的字段置零：
 /// `config_id`(1 B)、`enc`、`payload`。
 ///
@@ -208,34 +249,13 @@ fn normalize_client_hello_ech_extension(record: &mut [u8]) -> Option<()> {
         if record[data] != 0 {
             return;
         }
-        // type(1) ‖ kdf(2) ‖ aead(2) ‖ config_id(1) ‖ enc_len(2)
-        if end - data < 8 {
-            malformed = true;
-            return;
-        }
-        let enc_len = u16::from_be_bytes([record[data + 6], record[data + 7]]) as usize;
-        let enc_start = data + 8;
-        let Some(enc_end) = enc_start.checked_add(enc_len) else {
+        let Some((config_id, enc, payload)) = ech_variable_field_ranges(record, data..end) else {
             malformed = true;
             return;
         };
-        if enc_end.saturating_add(2) > end {
-            malformed = true;
-            return;
-        }
-        let payload_len = u16::from_be_bytes([record[enc_end], record[enc_end + 1]]) as usize;
-        let payload_start = enc_end + 2;
-        let Some(payload_end) = payload_start.checked_add(payload_len) else {
-            malformed = true;
-            return;
-        };
-        if payload_end != end {
-            malformed = true;
-            return;
-        }
-        zero_ranges.push(data + 5..data + 6);
-        zero_ranges.push(enc_start..enc_end);
-        zero_ranges.push(payload_start..payload_end);
+        zero_ranges.push(config_id..config_id + 1);
+        zero_ranges.push(enc);
+        zero_ranges.push(payload);
     })?;
     if malformed {
         return None;
@@ -762,6 +782,29 @@ pub fn unmask_noise_ephemeral_key(
 ) -> [u8; 32] {
     let mask = derive_noise_e_mask(derived_psk, noise_tag);
     xor_32_bytes(masked, &mask)
+}
+
+/// Box-Muller 标准正态采样：`z ~ N(0,1)`。`u1 <= 0.0` 的 guard 保证 `ln` 的
+/// 参数严格为正。曾有三份逐字节相同的 Box-Muller 块（shaper 的 IAT 模型、
+/// session 的合成 H2 交换间隔、`control_size` 的截断正态），统一收拢到此处。
+pub(crate) fn sample_standard_normal() -> f64 {
+    use rand::Rng;
+    use std::f64::consts::PI;
+    let mut rng = rand::thread_rng();
+    loop {
+        let u1: f64 = rng.gen_range(0.0..1.0);
+        let u2: f64 = rng.gen_range(0.0..1.0);
+        if u1 <= 0.0 {
+            continue;
+        }
+        return (-2.0_f64 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
+    }
+}
+
+/// 对数正态采样：`mu` 是对数空间的位置参数（即 `ln(中位数)`）、`sigma` 是
+/// 形状参数。三处调用方曾各存一份逐字节相同的实现，统一收拢到此处。
+pub fn sample_log_normal(mu: f64, sigma: f64) -> f64 {
+    (mu + sigma * sample_standard_normal()).exp()
 }
 
 #[cfg(test)]
