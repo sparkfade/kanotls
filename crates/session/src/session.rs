@@ -450,8 +450,7 @@ const H2_EXCHANGE_STEADY_SIGMA: f64 = 1.2;
 const H2_EXCHANGE_MAX_INTERVAL_SECS: u64 = 300;
 
 /// 测试覆写点：0 表示使用上面的生产常量。
-pub(crate) static H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES: AtomicUsize =
-    AtomicUsize::new(0);
+pub(crate) static H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static H2_EXCHANGE_INTERVAL_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
 
 /// H2 骨架关闭时的定时器“禁用”姿态：分支被 select guard 屏蔽，deadline
@@ -491,7 +490,11 @@ const PADDING_SETTINGS_ACK_WIRE: usize = kanotls_tunnel::control_size::SETTINGS_
 /// 请求换来的是响应体。此前被删掉的是另一种做法——`total_junk =
 /// frame.payload.len() - 2`，让应答尺寸成为请求尺寸的**连续**函数，那才是一条
 /// 可观测的相关性。这里是一张 3 项的离散角色表。
-fn padding_reply_wire_len(request_wire_len: usize, index: usize, direction: FlowDirection) -> usize {
+fn padding_reply_wire_len(
+    request_wire_len: usize,
+    index: usize,
+    direction: FlowDirection,
+) -> usize {
     if index > 0 {
         return PADDING_WINDOW_UPDATE_WIRE;
     }
@@ -613,8 +616,7 @@ fn prepare_control_packet_records(
             // 与载荷长度无关。分布与 `TrafficShaper` 的 `InteractiveControl` 共用
             // 同一个定义（`control_size::next_data_record_payload`），此前是本文件
             // 私有的 200–600 均匀区间——两处对「H2 数据记录量级」各存一份定义。
-            let chunk =
-                kanotls_tunnel::control_size::next_data_record_payload(direction, &mut rng);
+            let chunk = kanotls_tunnel::control_size::next_data_record_payload(direction, &mut rng);
             (
                 SnowyStream::data_record_wire_len(chunk),
                 remaining.min(chunk),
@@ -798,13 +800,13 @@ impl WindowState {
         loop {
             let total = prev.saturating_add(len);
             let next = if total >= threshold { 0 } else { total };
-            match self
-                .conn_consumed_since_wu
-                .compare_exchange(prev, next, Ordering::Relaxed, Ordering::Relaxed)
-            {
-                Ok(_) => {
-                    return (total >= threshold).then(|| total.min(u32::MAX as u64) as u32)
-                }
+            match self.conn_consumed_since_wu.compare_exchange(
+                prev,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return (total >= threshold).then(|| total.min(u32::MAX as u64) as u32),
                 Err(actual) => prev = actual,
             }
         }
@@ -819,15 +821,9 @@ impl WindowState {
     /// 回补帧走 `try_write_packets`（fire-and-forget）：控制队列满时丢弃是
     /// **保守且自愈**的——发送方少拿一次信贷只会更早停发，而接收缓冲
     /// （≥ 窗口 ≥ 阈值）仍在被中继排空，下一次越过阈值必会再发一条。
-    pub(crate) fn note_consumed(
-        &self,
-        sid: u32,
-        stream_consumed_since_wu: &AtomicU64,
-        len: usize,
-    ) {
+    pub(crate) fn note_consumed(&self, sid: u32, stream_consumed_since_wu: &AtomicU64, len: usize) {
         let len_u64 = len as u64;
-        let stream_total =
-            stream_consumed_since_wu.fetch_add(len_u64, Ordering::Relaxed) + len_u64;
+        let stream_total = stream_consumed_since_wu.fetch_add(len_u64, Ordering::Relaxed) + len_u64;
         if stream_total >= self.stream_wu_threshold {
             stream_consumed_since_wu.fetch_sub(stream_total, Ordering::Relaxed);
             self.send_window_update(sid, stream_total.min(u32::MAX as u64) as u32);
@@ -838,13 +834,11 @@ impl WindowState {
     }
 
     fn send_window_update(&self, sid: u32, increment: u32) {
-        let packet =
-            encode_padding_window_update_sized(sid, increment, PADDING_WINDOW_UPDATE_WIRE);
-        if let Err(e) = self.writer.try_write_packets(
-            vec![packet],
-            FlushBehavior::Auto,
-            TrafficClass::Control,
-        ) {
+        let packet = encode_padding_window_update_sized(sid, increment, PADDING_WINDOW_UPDATE_WIRE);
+        if let Err(e) =
+            self.writer
+                .try_write_packets(vec![packet], FlushBehavior::Auto, TrafficClass::Control)
+        {
             debug!("window update dropped (control queue full): {}", e);
         }
     }
@@ -1362,7 +1356,8 @@ impl Session {
         peer_never_processed(&self.peer_goaway_last_stream_id, stream_id)
     }
 
-    pub fn buffered_stream_bytes(&self) -> usize {        self.buffered_stream_bytes.load(Ordering::Relaxed)
+    pub fn buffered_stream_bytes(&self) -> usize {
+        self.buffered_stream_bytes.load(Ordering::Relaxed)
     }
 
     /// 池选择/补涓热路径使用的无锁计数：与 streams 映射中 read_closed=false
@@ -1466,12 +1461,7 @@ impl Session {
             if self.active_stream_count() >= self.max_streams_per_session {
                 anyhow::bail!("max streams per session reached");
             }
-            register_stream_locked(
-                &mut streams,
-                &self.capacity_stream_count,
-                sid,
-                handle,
-            );
+            register_stream_locked(&mut streams, &self.capacity_stream_count, sid, handle);
         }
 
         if !has_deferred_open {
@@ -2067,10 +2057,7 @@ impl Session {
                         .await
                         .get_mut(&frame.stream_id)
                         .map(|handle| {
-                            mark_stream_read_closed_locked(
-                                handle,
-                                &self.capacity_stream_count,
-                            );
+                            mark_stream_read_closed_locked(handle, &self.capacity_stream_count);
                             handle.fin_tx.clone()
                         })
                 };
@@ -2147,7 +2134,11 @@ impl Session {
                 }
             }
             CMD_PADDING => {
-                let flag = frame.payload.first().copied().unwrap_or(PADDING_FLAG_REQUEST);
+                let flag = frame
+                    .payload
+                    .first()
+                    .copied()
+                    .unwrap_or(PADDING_FLAG_REQUEST);
                 if flag == PADDING_FLAG_GOAWAY {
                     self.note_peer_goaway(&frame.payload);
                 } else if flag == PADDING_FLAG_WINDOW_UPDATE {
@@ -2170,9 +2161,8 @@ impl Session {
                 } else if flag == PADDING_FLAG_REQUEST {
                     // 请求记录的线速尺寸由帧长唯一复原（junk 已按目标反解），
                     // 应答的 H2 角色据此决定——见 padding_reply_wire_len。
-                    let request_wire = FRAME_HEADER_SIZE
-                        + frame.payload.len()
-                        + CONTROL_RECORD_MIN_OVERHEAD;
+                    let request_wire =
+                        FRAME_HEADER_SIZE + frame.payload.len() + CONTROL_RECORD_MIN_OVERHEAD;
                     let m = frame
                         .payload
                         .get(1)
@@ -2236,11 +2226,7 @@ impl Session {
         let mut pending = self.pending_data.lock().await;
         // 四个限额检查全部 O(1)（PendingData 维护运行计数）。此前前两个
         // 分别是全量求和与单队列求和，恰好在背压发生时被逐帧调用。
-        if pending
-            .total_bytes()
-            .saturating_add(payload.len())
-            > MAX_PENDING_STREAM_BYTES
-        {
+        if pending.total_bytes().saturating_add(payload.len()) > MAX_PENDING_STREAM_BYTES {
             warn!("dropping pending stream data: pending byte limit exceeded");
             return false;
         }
@@ -2262,11 +2248,7 @@ impl Session {
         } else {
             MAX_STREAM_OVERFLOW_BYTES
         };
-        if pending
-            .stream_bytes(sid)
-            .saturating_add(payload.len())
-            > overflow_limit
-        {
+        if pending.stream_bytes(sid).saturating_add(payload.len()) > overflow_limit {
             warn!(
                 stream_id = sid,
                 "dropping pending stream data: per-stream overflow byte limit exceeded"
@@ -2306,11 +2288,7 @@ impl Session {
 
         // 两个限额检查都是 O(1)（PendingOpenStreams 维护运行计数）。此前字节
         // 上限是对全部条目的全量求和，而它恰好在每存一帧时被调一次。
-        if pending
-            .total_bytes()
-            .saturating_add(payload.len())
-            > MAX_PENDING_STREAM_BYTES
-        {
+        if pending.total_bytes().saturating_add(payload.len()) > MAX_PENDING_STREAM_BYTES {
             warn!(
                 stream_id = sid,
                 "dropping pending stream data: pending byte limit exceeded"
@@ -3255,10 +3233,7 @@ impl SessionWriter {
             // 它们会被那次 flush 一并带出，线上序仍是「已 prepare 的数据 →
             // 插队 control」（与逐条 flush 时一致），但记录归属的时间槽会错。
             // 此处的先 flush 消除了这种情形。
-            if quiet_gap
-                || policy.delay > Duration::ZERO
-                || batch.is_full(buffered)
-            {
+            if quiet_gap || policy.delay > Duration::ZERO || batch.is_full(buffered) {
                 let arrivals_before = inbound.arrivals();
                 batch.flush(write_half).await?;
                 if quiet_gap {
@@ -3657,7 +3632,9 @@ async fn read_tunnel_chunk(
 ) -> std::io::Result<usize> {
     use bytes::BufMut;
     buf.reserve(TUNNEL_READ_CHUNK);
-    read_half.read_buf(&mut (&mut *buf).limit(TUNNEL_READ_CHUNK)).await
+    read_half
+        .read_buf(&mut (&mut *buf).limit(TUNNEL_READ_CHUNK))
+        .await
 }
 
 #[cfg(test)]

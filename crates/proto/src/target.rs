@@ -292,11 +292,14 @@ mod tests {
     #[test]
     fn host_display_and_authority() {
         assert_eq!(Host::Domain("a.b".to_string()).authority(), "a.b");
+        assert_eq!(Host::Ipv6("::1".parse().unwrap()).authority(), "[::1]");
         assert_eq!(
-            Host::Ipv6("::1".parse().unwrap()).authority(),
-            "[::1]"
+            Host::from("1.2.3.4"),
+            Host::Ipv4("1.2.3.4".parse().unwrap())
         );
-        assert_eq!(Host::from("1.2.3.4"), Host::Ipv4("1.2.3.4".parse().unwrap()));
-        assert_eq!(Host::from("example.com"), Host::Domain("example.com".to_string()));
+        assert_eq!(
+            Host::from("example.com"),
+            Host::Domain("example.com".to_string())
+        );
     }
 }

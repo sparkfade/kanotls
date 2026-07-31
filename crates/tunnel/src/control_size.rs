@@ -633,16 +633,21 @@ mod tests {
                 // 真实 H2 里它本来就可以只有一百来字节；而合成交换的应答不走这
                 // 一档（走 `next_data_record_payload`，恒 > L1）。
                 if direction == FlowDirection::C2S {
-                    assert!(
-                        wire > L1_MAX_WIRE_LEN,
-                        "C2S HEADERS 记录 {} 落在 L1",
-                        wire
-                    );
+                    assert!(wire > L1_MAX_WIRE_LEN, "C2S HEADERS 记录 {} 落在 L1", wire);
                 }
-                assert!((lo..=hi).contains(&wire), "{:?} HEADERS 记录 {} 越界", direction, wire);
+                assert!(
+                    (lo..=hi).contains(&wire),
+                    "{:?} HEADERS 记录 {} 越界",
+                    direction,
+                    wire
+                );
                 seen.insert(wire);
             }
-            assert!(seen.len() > 20, "{:?} HEADERS 尺寸必须是分布而不是常量", direction);
+            assert!(
+                seen.len() > 20,
+                "{:?} HEADERS 尺寸必须是分布而不是常量",
+                direction
+            );
         }
     }
 

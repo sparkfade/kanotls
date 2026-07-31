@@ -348,8 +348,8 @@ impl TrafficShaper {
         // 静默，那是一个真实 nginx 不存在的形态。
         if self.packet_seq == 0 && self.direction == FlowDirection::C2S {
             use rand::Rng;
-            let payload = rand::thread_rng()
-                .gen_range(FIRST_RECORD_PAYLOAD_LO..=FIRST_RECORD_PAYLOAD_HI);
+            let payload =
+                rand::thread_rng().gen_range(FIRST_RECORD_PAYLOAD_LO..=FIRST_RECORD_PAYLOAD_HI);
             // post_script_off 语义是「关闭整形」，此时不让出方向（读循环的
             // H2 骨架同样被它关掉），只保留尺寸上限。
             let mut policy = ShapePolicy {
@@ -604,8 +604,8 @@ impl TrafficShaper {
                 // 尺寸模型完全不参与放松：`payload` 仍来自同一个采样器。
                 let delay_p = MARKOV_DELAY_PROBABILITY * self.post_window_shaping_weight();
                 let delay = if delay_p > 0.0 && rng.gen::<f64>() < delay_p {
-                    let sample = sample_log_normal(self.markov_delay_mu, MARKOV_DELAY_SIGMA)
-                        .max(0.0);
+                    let sample =
+                        sample_log_normal(self.markov_delay_mu, MARKOV_DELAY_SIGMA).max(0.0);
                     Duration::from_micros((sample * 1000.0).round() as u64)
                 } else {
                     Duration::ZERO
@@ -717,8 +717,7 @@ mod tests {
             false,
         );
         assert_eq!(
-            shaper.script[0].len_lo,
-            shaper.script[0].len_hi,
+            shaper.script[0].len_lo, shaper.script[0].len_hi,
             "? 规则必须在 randomize 期坍缩成固定值"
         );
         shaper.skip_first_flight();
@@ -893,7 +892,11 @@ mod tests {
         // must win over the script from the very first data record.
         let mut shaper = TrafficShaper::new(FlowDirection::C2S, Some(&lines(&["0=L:500"])), false);
         shaper.skip_first_flight();
-        assert!(shaper.next_data_policy(BULK_FAST_PATH_THRESHOLD).allow_full_block);
+        assert!(
+            shaper
+                .next_data_policy(BULK_FAST_PATH_THRESHOLD)
+                .allow_full_block
+        );
         let mut shaper = TrafficShaper::new(FlowDirection::C2S, Some(&lines(&["0=L:500"])), false);
         shaper.skip_first_flight();
         assert!(shaper.next_data_policy(cap).allow_full_block);
@@ -911,16 +914,18 @@ mod tests {
         use kanotls_tunnel::control_size::L1_MAX_WIRE_LEN;
         // 覆盖到危险边界两侧：161 是截断后仍落在 L1 的最大值，162 才安全。
         for rule in [
-            "0=L:1", "0=L:1-2", "0=L:50-120", "0=L:100-200", "0=L:160", "0=L:161",
+            "0=L:1",
+            "0=L:1-2",
+            "0=L:50-120",
+            "0=L:100-200",
+            "0=L:160",
+            "0=L:161",
             "0=L:162",
         ] {
             for direction in [FlowDirection::C2S, FlowDirection::S2C] {
                 for _ in 0..200 {
-                    let mut shaper = TrafficShaper::new(
-                        direction,
-                        Some(&lines(&["stop=32", rule])),
-                        false,
-                    );
+                    let mut shaper =
+                        TrafficShaper::new(direction, Some(&lines(&["stop=32", rule])), false);
                     shaper.skip_first_flight();
                     // 覆盖脚本窗口与其后的融合/Markov 窗口。每条记录各起一轮
                     // drain（`begin_drain` 清 bulk 串标记），对应「小写入各自
@@ -1032,7 +1037,11 @@ mod tests {
         let cap = SnowyStream::data_record_capacity();
         let mut shaper = TrafficShaper::new(FlowDirection::C2S, Some(&lines(&["0=L:500"])), true);
         shaper.packet_seq = shaper.script_stop;
-        assert!(shaper.next_data_policy(BULK_FAST_PATH_THRESHOLD).allow_full_block);
+        assert!(
+            shaper
+                .next_data_policy(BULK_FAST_PATH_THRESHOLD)
+                .allow_full_block
+        );
         let mut shaper = TrafficShaper::new(FlowDirection::C2S, Some(&lines(&["0=L:500"])), true);
         shaper.packet_seq = shaper.script_stop;
         assert!(shaper.next_data_policy(cap).allow_full_block);
@@ -1120,8 +1129,11 @@ mod tests {
 
     #[test]
     fn fake_jitter_zero_pins_to_current_record() {
-        let mut shaper =
-            TrafficShaper::new(FlowDirection::C2S, Some(&lines(&["0=L:100,D:0,F:2"])), false);
+        let mut shaper = TrafficShaper::new(
+            FlowDirection::C2S,
+            Some(&lines(&["0=L:100,D:0,F:2"])),
+            false,
+        );
         shaper.skip_first_flight();
         let policy = shaper.next_data_policy(50);
         assert!(policy.pre_fake.is_none());
@@ -1133,8 +1145,11 @@ mod tests {
     fn fake_jitter_negative_emits_pre_or_post() {
         // F:1?-1: offset in {-1, 0} — the fake is attached to this record
         // either pre or post; never deferred.
-        let mut shaper =
-            TrafficShaper::new(FlowDirection::C2S, Some(&lines(&["0=L:100,D:0,F:1?-1"])), false);
+        let mut shaper = TrafficShaper::new(
+            FlowDirection::C2S,
+            Some(&lines(&["0=L:100,D:0,F:1?-1"])),
+            false,
+        );
         shaper.skip_first_flight();
         let mut seen_pre = false;
         let mut seen_post = false;

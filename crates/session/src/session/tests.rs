@@ -2,12 +2,12 @@ use super::{
     coalesce_encoded_frames, BufferedPayload, PendingData, Session, SessionConfig,
     STREAM_CHANNEL_CAPACITY,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::server::ServerSessionHandler;
+use bytes::Bytes;
 use futures::poll;
 use kanotls_tunnel::common::{derive_psk, NOISE_PARAMS};
 use kanotls_tunnel::SnowyStream;
-use bytes::Bytes;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -180,7 +180,10 @@ fn test_session_config(is_client: bool) -> SessionConfig {
     }
 }
 
-fn build_transport_pair() -> (kanotls_tunnel::NoiseTransport, kanotls_tunnel::NoiseTransport) {
+fn build_transport_pair() -> (
+    kanotls_tunnel::NoiseTransport,
+    kanotls_tunnel::NoiseTransport,
+) {
     let derived_psk = derive_psk(b"session-open-path-tests");
     let mut initiator = snow::Builder::new(NOISE_PARAMS.clone())
         .psk(0, &derived_psk)
@@ -1011,16 +1014,13 @@ async fn no_flow_control_gating_without_peer_fc_declaration() {
 
     // raw server 只回 SYNACK、从不发 SETTINGS ⇒ 客户端永远收不到 fc 声明。
     let (client, mut stream, mut server_read, _server_write, mut buf, mut read_buf) =
-        raw_server_session_with_open_stream(test_session_config(true), b"no-fc.example:443")
-            .await;
+        raw_server_session_with_open_stream(test_session_config(true), b"no-fc.example:443").await;
 
     let pattern = |i: usize| -> u8 { ((i * 3 + 1) % 251) as u8 };
     let writer = tokio::spawn(async move {
         let mut sent = 0usize;
         while sent < STREAM_WINDOW * 3 {
-            let chunk: Vec<u8> = (0..STREAM_WINDOW / 2)
-                .map(|j| pattern(sent + j))
-                .collect();
+            let chunk: Vec<u8> = (0..STREAM_WINDOW / 2).map(|j| pattern(sent + j)).collect();
             stream.write(&chunk).await.expect("client writes chunk");
             sent += chunk.len();
         }
@@ -1039,7 +1039,10 @@ async fn no_flow_control_gating_without_peer_fc_declaration() {
     let mut received = 0usize;
     let mut count = 0usize;
     while received < STREAM_WINDOW * 3 && count < 1000 {
-        let n = server_read.read(&mut read_buf).await.expect("raw server reads");
+        let n = server_read
+            .read(&mut read_buf)
+            .await
+            .expect("raw server reads");
         if n == 0 {
             break;
         }
@@ -1100,9 +1103,7 @@ async fn client_answers_real_server_settings_with_a_settings_ack() {
                 let mut cursor = bytes::BytesMut::from(payload.as_slice());
                 while let Some(frame) = crate::frame::Frame::decode(&mut cursor) {
                     // flag=1 的 33 字节应答记录即 SETTINGS-ACK 角色。
-                    if frame.cmd == crate::frame::CMD_PADDING
-                        && frame.payload.first() == Some(&1)
-                    {
+                    if frame.cmd == crate::frame::CMD_PADDING && frame.payload.first() == Some(&1) {
                         ack = Some(size);
                     }
                 }
@@ -1331,7 +1332,10 @@ async fn concurrent_bidirectional_bulk_transfer_keeps_session_usable() {
                 .await
                 .expect("server accepts stream")
                 .expect("server accepts stream");
-        assert_eq!(server_stream.read().await, Some(Bytes::from(target.to_vec())));
+        assert_eq!(
+            server_stream.read().await,
+            Some(Bytes::from(target.to_vec()))
+        );
         server_stream
             .send_synack()
             .await
@@ -1479,7 +1483,10 @@ async fn concurrent_bidirectional_bulk_transfer_keeps_session_usable() {
         .expect("probe synack");
     probe.wait_open().await.expect("probe opens");
     probe.write(b"ping").await.expect("probe writes ping");
-    assert_eq!(probe_server_stream.read().await, Some(Bytes::from(b"ping".to_vec())));
+    assert_eq!(
+        probe_server_stream.read().await,
+        Some(Bytes::from(b"ping".to_vec()))
+    );
     probe_server_stream
         .write(b"pong")
         .await
@@ -1589,7 +1596,10 @@ async fn cmd_padding_reply_flag_is_silently_absorbed() {
         .write(b"healthy")
         .await
         .expect("client writes after stray padding");
-    assert_eq!(server_stream.read().await, Some(Bytes::from(b"healthy".to_vec())));
+    assert_eq!(
+        server_stream.read().await,
+        Some(Bytes::from(b"healthy".to_vec()))
+    );
 
     client.force_close();
     server.session.force_close();
@@ -1702,9 +1712,7 @@ async fn auto_write_returns_before_shaped_emission_completes() {
     stream.wait_open().await.expect("stream opens");
 
     // Drain the server side so socket buffers never stall the writer loop.
-    let drain = tokio::spawn(async move {
-        while server_stream.read().await.is_some() {}
-    });
+    let drain = tokio::spawn(async move { while server_stream.read().await.is_some() {} });
 
     let chunk = vec![0x5Au8; 64 * 1024];
     let started = std::time::Instant::now();
@@ -1848,15 +1856,17 @@ async fn pre_synack_overflow_data_and_fin_are_delivered_before_eof() {
     // 模拟 SYNACK 到达前积压的状态：数据量超过 channel 容量，末尾带 FIN。
     let frame_count = STREAM_CHANNEL_CAPACITY + 8;
     for idx in 0..frame_count {
-        assert!(client
-            .store_pending_data(
-                sid,
-                crate::session::BufferedPayload::new(
-                    vec![idx as u8; 64],
-                    &client.buffered_stream_bytes
+        assert!(
+            client
+                .store_pending_data(
+                    sid,
+                    crate::session::BufferedPayload::new(
+                        vec![idx as u8; 64],
+                        &client.buffered_stream_bytes
+                    )
                 )
-            )
-            .await);
+                .await
+        );
     }
     client.store_pending_fin(sid).await;
 
@@ -1974,7 +1984,10 @@ async fn raw_server_session_with_open_stream(
     let (mut server_read, mut server_write) = server_tunnel.into_split();
 
     let mut stream = client.open_stream().await.expect("stream opens");
-    stream.write_early(target).await.expect("client writes target");
+    stream
+        .write_early(target)
+        .await
+        .expect("client writes target");
 
     let mut buf = bytes::BytesMut::with_capacity(65536);
     let mut read_buf = vec![0u8; 16384];
@@ -2120,10 +2133,7 @@ async fn bulk_consumption_emits_real_window_update_frames() {
         CHUNKS,
         updates
     );
-    assert_eq!(
-        stream_updates, 0,
-        "256 KiB 传输不得越过 1 MiB 每流回补阈值"
-    );
+    assert_eq!(stream_updates, 0, "256 KiB 传输不得越过 1 MiB 每流回补阈值");
 
     H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES.store(0, Ordering::Relaxed);
     client.force_close();
@@ -2209,7 +2219,10 @@ async fn post_script_off_disables_h2_skeleton_injection() {
         .expect("padding counter joins before timeout")
         .expect("padding counter completes");
 
-    assert_eq!(received, TOTAL, "bulk transfer must complete with gating on");
+    assert_eq!(
+        received, TOTAL,
+        "bulk transfer must complete with gating on"
+    );
     assert_eq!(
         padding_frames, 0,
         "post_script_off must disable all h2 skeleton padding injection"
@@ -2422,7 +2435,8 @@ fn prune_keeps_handles_with_live_channels() {
 
 // 裸服务端配对：client 端包装成 SnowyStream，server 端保留裸 TcpStream
 // 与 server 端传输态，用于逐字节抓取线上 record 并离线解密比对。
-async fn client_stream_with_raw_server() -> (SnowyStream, TcpStream, kanotls_tunnel::NoiseTransport) {
+async fn client_stream_with_raw_server() -> (SnowyStream, TcpStream, kanotls_tunnel::NoiseTransport)
+{
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("listener binds");
@@ -2478,7 +2492,11 @@ async fn store_pending_open_data_limit_semantics_are_preserved() {
     let session = Session::new(client_tunnel, test_session_config(false), None);
 
     // 未登记的流：返回 false（表示「未处理，走常规派发」），且不建条目。
-    assert!(!session.store_pending_open_data(7, Bytes::from(vec![0u8; 4])).await);
+    assert!(
+        !session
+            .store_pending_open_data(7, Bytes::from(vec![0u8; 4]))
+            .await
+    );
     assert!(!session.pending_open_streams.lock().await.contains(7));
     assert_eq!(session.buffered_stream_bytes(), 0);
 
@@ -2486,9 +2504,17 @@ async fn store_pending_open_data_limit_semantics_are_preserved() {
 
     // 每流帧上限：越限后仍返回 true（帧已被吞掉），但不得入队。
     for _ in 0..super::MAX_PENDING_STREAM_FRAMES {
-        assert!(session.store_pending_open_data(7, Bytes::from(vec![0u8; 1])).await);
+        assert!(
+            session
+                .store_pending_open_data(7, Bytes::from(vec![0u8; 1]))
+                .await
+        );
     }
-    assert!(session.store_pending_open_data(7, Bytes::from(vec![0u8; 1])).await);
+    assert!(
+        session
+            .store_pending_open_data(7, Bytes::from(vec![0u8; 1]))
+            .await
+    );
     {
         let pending = session.pending_open_streams.lock().await;
         assert_eq!(pending.stream_frames(7), super::MAX_PENDING_STREAM_FRAMES);
@@ -2502,14 +2528,25 @@ async fn store_pending_open_data_limit_semantics_are_preserved() {
     // 字节上限是全局的：另一条流吃满余额后，任何新帧都必须被拒。
     session.pending_open_streams.lock().await.insert_new(8);
     let remaining = super::MAX_PENDING_STREAM_BYTES - super::MAX_PENDING_STREAM_FRAMES;
-    assert!(session.store_pending_open_data(8, Bytes::from(vec![0u8; remaining])).await);
+    assert!(
+        session
+            .store_pending_open_data(8, Bytes::from(vec![0u8; remaining]))
+            .await
+    );
     {
         let pending = session.pending_open_streams.lock().await;
         assert_eq!(pending.total_bytes(), super::MAX_PENDING_STREAM_BYTES);
         assert_eq!(pending.stream_frames(8), 1);
     }
-    assert!(session.store_pending_open_data(8, Bytes::from(vec![0u8; 1])).await);
-    assert_eq!(session.pending_open_streams.lock().await.stream_frames(8), 1);
+    assert!(
+        session
+            .store_pending_open_data(8, Bytes::from(vec![0u8; 1]))
+            .await
+    );
+    assert_eq!(
+        session.pending_open_streams.lock().await.stream_frames(8),
+        1
+    );
 
     // 全部丢弃后两本账归零。
     session.pending_open_streams.lock().await.clear();
@@ -2588,15 +2625,9 @@ async fn control_requests_flushed(
 ) -> Result<(), String> {
     let mut batch = super::FlushBatch::default();
     super::SessionWriter::prepare_deferred_control_requests(
-        requests,
-        write_half,
-        direction,
-        &mut batch,
+        requests, write_half, direction, &mut batch,
     )?;
-    batch
-        .flush(write_half)
-        .await
-        .map_err(|e| e.to_string())
+    batch.flush(write_half).await.map_err(|e| e.to_string())
 }
 
 // 用给定传输态手工封一条 0x17 控制记录（块结构见 §3.9）：
@@ -2722,8 +2753,7 @@ async fn padding_replies_are_independent_records_with_h2_role_sizes() {
         });
 
         let request = crate::frame::encode_padding_request_sized(m, super::PADDING_REQUEST_WIRE);
-        let record =
-            seal_control_record(&mut server_noise, &request, super::PADDING_REQUEST_WIRE);
+        let record = seal_control_record(&mut server_noise, &request, super::PADDING_REQUEST_WIRE);
         assert_eq!(
             record.len(),
             super::PADDING_REQUEST_WIRE,
@@ -2801,7 +2831,10 @@ fn control_record_size_is_allowed(size: usize) -> bool {
     // 离散 H2 帧尺寸；HEADERS 截断正态（C2S 274–824 / S2C 124–424）；按 H2
     // 数据记录分布切分的段（下界 = L1 上界 + 1，上界 = 一个 MTU 分段）；
     // 满载数据记录。
-    debug_assert_eq!(MIN_DATA_RECORD_PAYLOAD + MIN_DATA_WIRE_LEN, L1_MAX_WIRE_LEN + 1);
+    debug_assert_eq!(
+        MIN_DATA_RECORD_PAYLOAD + MIN_DATA_WIRE_LEN,
+        L1_MAX_WIRE_LEN + 1
+    );
     CONTROL_DISCRETE_POOL.contains(&size)
         || (124..=824).contains(&size)
         || (L1_MAX_WIRE_LEN + 1..=1400 + MIN_DATA_WIRE_LEN).contains(&size)
@@ -3091,7 +3124,10 @@ async fn scripted_batched_flush_matches_per_record_byte_stream() {
     assert_eq!(plaintext, payload);
     assert_eq!(
         plaintext,
-        reference.iter().flat_map(|(_, p)| p.clone()).collect::<Vec<u8>>()
+        reference
+            .iter()
+            .flat_map(|(_, p)| p.clone())
+            .collect::<Vec<u8>>()
     );
 }
 
@@ -3110,7 +3146,7 @@ async fn zero_delay_records_coalesce_and_delayed_record_flushes_before_sleep() {
         script: Vec<String>,
         pending_bytes: usize,
     ) -> (usize, std::time::Duration, std::time::Duration) {
-            use crate::shaper::TrafficShaper;
+        use crate::shaper::TrafficShaper;
         use kanotls_tunnel::FlowDirection;
         use tokio::io::AsyncReadExt;
 
@@ -3163,8 +3199,11 @@ async fn zero_delay_records_coalesce_and_delayed_record_flushes_before_sleep() {
 
     // (b) delay > 0：记录必须在 sleep 之前就离开 write_buffer，故首条记录
     // 到达对端的时刻远早于整段 drain 结束（drain 要等两次 ~200ms 采样）。
-    let (first_read, first_read_at, drive_elapsed) =
-        drive(vec!["stop=64".to_string(), "0=L:1,D:200,F:0".to_string()], 2 * CHUNK).await;
+    let (first_read, first_read_at, drive_elapsed) = drive(
+        vec!["stop=64".to_string(), "0=L:1,D:200,F:0".to_string()],
+        2 * CHUNK,
+    )
+    .await;
     assert_eq!(first_read, record_wire, "带延迟的记录逐条 flush");
     assert!(
         first_read_at * 2 < drive_elapsed,
@@ -3234,7 +3273,11 @@ async fn first_upstream_burst_stays_under_300_bytes() {
     // 余下的字节在让出方向之后继续发出，且重组后与原帧序列逐字节相同。
     let mut expected = crate::frame::Frame::cmd_settings().encode().unwrap();
     expected.extend_from_slice(&crate::frame::Frame::syn(sid).encode().unwrap());
-    expected.extend_from_slice(&crate::frame::Frame::psh(sid, target.to_vec()).encode().unwrap());
+    expected.extend_from_slice(
+        &crate::frame::Frame::psh(sid, target.to_vec())
+            .encode()
+            .unwrap(),
+    );
     expected.extend_from_slice(
         &crate::frame::Frame::psh(sid, inner_hello.clone())
             .encode()
@@ -3269,7 +3312,10 @@ async fn first_upstream_burst_stays_under_300_bytes() {
     assert_eq!(decoded, expected, "让出方向后余下字节必须完整按序送达");
 
     // 任何一条记录都不得等于「内层首包 + 24」。
-    let leaked = crate::frame::Frame::psh(sid, inner_hello).encode().unwrap().len()
+    let leaked = crate::frame::Frame::psh(sid, inner_hello)
+        .encode()
+        .unwrap()
+        .len()
         + crate::frame::CONTROL_RECORD_MIN_OVERHEAD;
     assert!(
         !sizes.contains(&leaked),
@@ -3395,7 +3441,8 @@ async fn prepare_data_record_accumulates_until_flush() {
     let wire = SnowyStream::data_record_wire_len(payload.len());
 
     let after_first = {
-        w.prepare_data_record(&payload, wire).expect("prepare first");
+        w.prepare_data_record(&payload, wire)
+            .expect("prepare first");
         w.buffered_write_len()
     };
     assert_eq!(after_first, wire);
@@ -3443,7 +3490,9 @@ async fn delay_window_passes_through_syn_before_delay_expires() {
     let psh = crate::frame::Frame::psh(7, vec![0xAAu8; 1000])
         .encode()
         .expect("psh encodes");
-    let syn = crate::frame::Frame::syn(0x2A).encode().expect("syn encodes");
+    let syn = crate::frame::Frame::syn(0x2A)
+        .encode()
+        .expect("syn encodes");
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(8);
     let pending_client_settings = Arc::new(tokio::sync::Mutex::new(None));
     let inbound = Arc::new(super::InboundSignal::default());
@@ -3529,7 +3578,9 @@ async fn delay_window_defers_syn_off_frame_boundary() {
     let psh = crate::frame::Frame::psh(7, vec![0xAAu8; 1000])
         .encode()
         .expect("psh encodes");
-    let syn = crate::frame::Frame::syn(0x2A).encode().expect("syn encodes");
+    let syn = crate::frame::Frame::syn(0x2A)
+        .encode()
+        .expect("syn encodes");
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(8);
     let pending_client_settings = Arc::new(tokio::sync::Mutex::new(None));
     let inbound = Arc::new(super::InboundSignal::default());
@@ -3574,11 +3625,7 @@ async fn delay_window_defers_syn_off_frame_boundary() {
     .expect("drive_shaper ok");
 
     assert!(fake.is_empty());
-    assert_eq!(
-        deferred.len(),
-        1,
-        "非帧边界窗口内的 SYN 必须暂存，不得插队"
-    );
+    assert_eq!(deferred.len(), 1, "非帧边界窗口内的 SYN 必须暂存，不得插队");
 
     let response_rx = response_rx;
     tokio::pin!(response_rx);
@@ -3724,8 +3771,12 @@ async fn delay_window_blocks_pass_through_once_deferred() {
         .expect("psh b encodes");
     let mut psh = psh_a.clone();
     psh.extend_from_slice(&psh_b);
-    let syn_a = crate::frame::Frame::syn(0x2A).encode().expect("syn a encodes");
-    let syn_b = crate::frame::Frame::syn(0x2B).encode().expect("syn b encodes");
+    let syn_a = crate::frame::Frame::syn(0x2A)
+        .encode()
+        .expect("syn a encodes");
+    let syn_b = crate::frame::Frame::syn(0x2B)
+        .encode()
+        .expect("syn b encodes");
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(8);
     let pending_client_settings = Arc::new(tokio::sync::Mutex::new(None));
     let inbound = Arc::new(super::InboundSignal::default());
@@ -3883,7 +3934,10 @@ async fn tapped_tunnel_pair() -> (SnowyStream, SnowyStream, Tap) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            t1.lock().unwrap().push(WireEvent { dir: Dir::C2S, bytes: buf[..n].to_vec() });
+            t1.lock().unwrap().push(WireEvent {
+                dir: Dir::C2S,
+                bytes: buf[..n].to_vec(),
+            });
             if sw.write_all(&buf[..n]).await.is_err() {
                 break;
             }
@@ -3897,7 +3951,10 @@ async fn tapped_tunnel_pair() -> (SnowyStream, SnowyStream, Tap) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            t2.lock().unwrap().push(WireEvent { dir: Dir::S2C, bytes: buf[..n].to_vec() });
+            t2.lock().unwrap().push(WireEvent {
+                dir: Dir::S2C,
+                bytes: buf[..n].to_vec(),
+            });
             if cw.write_all(&buf[..n]).await.is_err() {
                 break;
             }
@@ -3955,7 +4012,6 @@ fn bursts(packets: &[(Dir, usize)]) -> Vec<(Dir, usize)> {
     }
     out
 }
-
 
 // 一个方向上的 TLS record 线速尺寸序列，只按明文 record 头切分（不解密）。
 fn record_sizes(events: &[WireEvent], dir: Dir) -> Vec<usize> {
@@ -4121,12 +4177,32 @@ async fn paper_features_stay_clear_of_nested_handshake_grams() {
     let _wire_lock = WIRE_OBSERVATION_LOCK.lock().await;
     const ROUNDS: usize = 3;
     let scenarios = [
-        Scenario { inner: 64, downstream: 4096, origin_latency_ms: ORIGIN_LATENCY_MS },
-        Scenario { inner: 517, downstream: 4096, origin_latency_ms: ORIGIN_LATENCY_MS },
-        Scenario { inner: 1884, downstream: 4096, origin_latency_ms: ORIGIN_LATENCY_MS },
-        Scenario { inner: 20000, downstream: 4096, origin_latency_ms: ORIGIN_LATENCY_MS },
+        Scenario {
+            inner: 64,
+            downstream: 4096,
+            origin_latency_ms: ORIGIN_LATENCY_MS,
+        },
+        Scenario {
+            inner: 517,
+            downstream: 4096,
+            origin_latency_ms: ORIGIN_LATENCY_MS,
+        },
+        Scenario {
+            inner: 1884,
+            downstream: 4096,
+            origin_latency_ms: ORIGIN_LATENCY_MS,
+        },
+        Scenario {
+            inner: 20000,
+            downstream: 4096,
+            origin_latency_ms: ORIGIN_LATENCY_MS,
+        },
         // bulk 下行：`(−L4,−L4,−L4)` 在这里必然出现，正如真实 HTTPS 下载。
-        Scenario { inner: 517, downstream: 400_000, origin_latency_ms: ORIGIN_LATENCY_MS },
+        Scenario {
+            inner: 517,
+            downstream: 400_000,
+            origin_latency_ms: ORIGIN_LATENCY_MS,
+        },
     ];
 
     // 每个场景是一条独立连接（各自的 TcpListener + 中继任务），互不干扰，
@@ -4134,9 +4210,9 @@ async fn paper_features_stay_clear_of_nested_handshake_grams() {
     let mut tasks = Vec::new();
     for _ in 0..ROUNDS {
         for scenario in scenarios {
-            tasks.push(tokio::spawn(
-                async move { (scenario, capture_scenario(scenario).await) },
-            ));
+            tasks.push(tokio::spawn(async move {
+                (scenario, capture_scenario(scenario).await)
+            }));
         }
     }
 
@@ -4243,7 +4319,10 @@ async fn first_upstream_record_is_a_data_record_not_a_ping() {
             .upstream_records
             .first()
             .expect("client must have written at least one record");
-        assert_ne!(first, PING_WIRE, "inner={inner} 的首条上行记录是 PING（41）");
+        assert_ne!(
+            first, PING_WIRE,
+            "inner={inner} 的首条上行记录是 PING（41）"
+        );
         assert_ne!(
             first, WINDOW_UPDATE_WIRE,
             "inner={inner} 的首条上行记录是 WINDOW_UPDATE（37）"
@@ -4274,7 +4353,12 @@ async fn first_upstream_record_is_a_data_record_not_a_ping() {
 #[tokio::test]
 async fn bulk_downstream_still_produces_full_mss_runs_like_real_https() {
     let _wire_lock = WIRE_OBSERVATION_LOCK.lock().await;
-    let capture = capture_scenario(Scenario { inner: 517, downstream: 400_000, origin_latency_ms: ORIGIN_LATENCY_MS }).await;
+    let capture = capture_scenario(Scenario {
+        inner: 517,
+        downstream: 400_000,
+        origin_latency_ms: ORIGIN_LATENCY_MS,
+    })
+    .await;
     let grams = grams(&capture.packets);
     let segmented = *PAPER_TOP_GRAMS
         .iter()
@@ -4297,7 +4381,8 @@ async fn bulk_downstream_still_produces_full_mss_runs_like_real_https() {
 }
 
 // 裸客户端 + 真实服务端 Session：用于观察服务端主动发出的记录。
-async fn raw_client_with_server_session() -> (Arc<Session>, TcpStream, kanotls_tunnel::NoiseTransport) {
+async fn raw_client_with_server_session(
+) -> (Arc<Session>, TcpStream, kanotls_tunnel::NoiseTransport) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("listener binds");
@@ -4439,9 +4524,7 @@ async fn client_answers_a_settings_sized_request_with_a_settings_ack() {
             for (size, payload) in drain_wire_records(&mut wire, &mut server_noise) {
                 let mut cursor = bytes::BytesMut::from(payload.as_slice());
                 while let Some(frame) = crate::frame::Frame::decode(&mut cursor) {
-                    if frame.cmd == crate::frame::CMD_PADDING
-                        && frame.payload.first() == Some(&1)
-                    {
+                    if frame.cmd == crate::frame::CMD_PADDING && frame.payload.first() == Some(&1) {
                         ack = Some(size);
                     }
                 }
@@ -4625,7 +4708,11 @@ async fn zero_latency_origin_still_avoids_the_control_pair_gram() {
         let capture = task.await.expect("capture task joins");
         let (dir, first_burst) = *capture.bursts.first().expect("at least one burst");
         assert_eq!(dir, Dir::C2S);
-        assert!(first_burst < 300, "第一个上行 burst {} 必须 < 300", first_burst);
+        assert!(
+            first_burst < 300,
+            "第一个上行 burst {} 必须 < 300",
+            first_burst
+        );
         for gram in grams(&capture.packets) {
             assert_ne!(
                 gram,
@@ -4702,7 +4789,11 @@ async fn queued_control_and_data_share_one_flush() {
     // 两条请求在同一时刻入队：中间没有任何真正的挂起点，写循环还没被调度。
     let mut control_write = session
         .writer
-        .submit_write_packets(vec![reply.clone()], FlushBehavior::Auto, TrafficClass::Control)
+        .submit_write_packets(
+            vec![reply.clone()],
+            FlushBehavior::Auto,
+            TrafficClass::Control,
+        )
         .await
         .expect("control queued");
     let mut bulk_write = session
@@ -5126,10 +5217,11 @@ async fn unprocessed_streams_fail_with_a_distinguishable_retryable_error() {
         .write_early(b"first.example:443")
         .await
         .expect("client sends target");
-    let (sid1, server_stream) = tokio::time::timeout(Duration::from_secs(1), server.accept_stream())
-        .await
-        .expect("server accepts stream")
-        .expect("server accepts stream");
+    let (sid1, server_stream) =
+        tokio::time::timeout(Duration::from_secs(1), server.accept_stream())
+            .await
+            .expect("server accepts stream")
+            .expect("server accepts stream");
     server_stream.send_synack().await.expect("synack");
     drop(server_stream);
 
@@ -5182,11 +5274,6 @@ async fn post_script_off_teardown_has_no_goaway() {
     let wire = read_to_eof(&mut raw_peer).await;
     assert_eq!(split_record_sizes(&wire), vec![CLOSE_NOTIFY_WIRE]);
 }
-
-
-
-
-
 
 // 观测口径扩展：**整条连接的一生**，而不只是出生时的前 25 个包。
 //
@@ -5288,7 +5375,9 @@ async fn stream_lifecycles_never_reproduce_the_control_pair_gram() {
     // 两条连接并发跑，覆盖 Chrome / 带 ML-KEM 的 Firefox 两种内层首包尺寸。
     let tasks: Vec<_> = [517usize, 1884]
         .into_iter()
-        .map(|inner| tokio::spawn(async move { (inner, scan_stream_lifecycles(inner, 4096, 8).await) }))
+        .map(|inner| {
+            tokio::spawn(async move { (inner, scan_stream_lifecycles(inner, 4096, 8).await) })
+        })
         .collect();
     for task in tasks {
         let (inner, hits) = task.await.expect("scan joins");
@@ -5432,7 +5521,10 @@ async fn deferred_open_reaches_peer_without_a_local_first_write() {
         let banner = tokio::time::timeout(Duration::from_secs(2), stream.read())
             .await
             .unwrap_or_else(|_| {
-                panic!("第 {} 条流：本端不写时开流必须在有界时间内出网，不得挂死", i + 1)
+                panic!(
+                    "第 {} 条流：本端不写时开流必须在有界时间内出网，不得挂死",
+                    i + 1
+                )
             });
         assert_eq!(
             banner.as_deref(),

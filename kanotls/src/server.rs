@@ -206,8 +206,9 @@ async fn handle_server_conn(
         ServerAcceptError::Internal(err) => ConnectionEnd::Fault(err),
     })?;
     let user_name = ctx.user_names[user_index].as_str();
-    let outbound = resolve_server_outbound(&ctx.config, ctx.inbound_tag.as_deref(), Some(user_name))
-        .map_err(ConnectionEnd::Fault)?;
+    let outbound =
+        resolve_server_outbound(&ctx.config, ctx.inbound_tag.as_deref(), Some(user_name))
+            .map_err(ConnectionEnd::Fault)?;
     // 此前是 info!（默认级别），于是服务端在默认配置下就把「客户端 IP ↔
     // 用户名」的配对逐连接落盘：服务器一旦被查封，日志本身就是「谁在什么
     // 时间用这个代理」的名单。仅去掉 IP 也不够——保留在 info! 的逐连接行

@@ -185,11 +185,10 @@ pub(crate) const MIN_GOAWAY_RECORD_WIRE_LEN: usize =
 
 /// 一条控制记录在 `SnowyStream::prepare_control_record` 下的固定 wire 开销：
 /// block 长度前缀 + TLS record 头 + AEAD tag + inner content type。
-pub(crate) const CONTROL_RECORD_MIN_OVERHEAD: usize =
-    kanotls_tunnel::common::BLOCK_LEN_PREFIX_SIZE
-        + kanotls_tunnel::common::TLS_RECORD_HEADER_LEN
-        + kanotls_tunnel::common::AEAD_TAG_LEN
-        + kanotls_tunnel::common::INNER_CONTENT_TYPE_LEN;
+pub(crate) const CONTROL_RECORD_MIN_OVERHEAD: usize = kanotls_tunnel::common::BLOCK_LEN_PREFIX_SIZE
+    + kanotls_tunnel::common::TLS_RECORD_HEADER_LEN
+    + kanotls_tunnel::common::AEAD_TAG_LEN
+    + kanotls_tunnel::common::INNER_CONTENT_TYPE_LEN;
 
 /// 单条 CMD_PADDING 控制记录的结构下限（junk 长度为 0 时的线速尺寸）：
 /// 33 字节，恰好等于控制尺寸采样池的最小档（H2 SETTINGS_ACK）。目标尺寸
@@ -362,10 +361,7 @@ pub(crate) fn encode_psh_frames(stream_id: u32, data: &[u8]) -> anyhow::Result<V
     Ok(packets)
 }
 
-pub(crate) fn coalesce_encoded_frames(
-    frames: Vec<Vec<u8>>,
-    max_packet_len: usize,
-) -> Vec<Vec<u8>> {
+pub(crate) fn coalesce_encoded_frames(frames: Vec<Vec<u8>>, max_packet_len: usize) -> Vec<Vec<u8>> {
     // 单帧是最常见形态（write_data、Frame::psh、FIN/SYN 都只有一帧）：此前
     // 无条件走 `current.extend_from_slice(&frame)`，即一次 Vec 分配 + 整包
     // 拷贝，而结果与直接返回原 Vec 逐字节相同（超过 max_packet_len 的单帧
@@ -496,7 +492,10 @@ mod tests {
         // flag 对但载荷装不下 id（对端实现有误 / 帧被截断）。
         assert_eq!(decode_padding_goaway(&[]), None);
         assert_eq!(decode_padding_goaway(&[PADDING_FLAG_GOAWAY]), None);
-        assert_eq!(decode_padding_goaway(&[PADDING_FLAG_GOAWAY, 0, 1, 2, 3]), None);
+        assert_eq!(
+            decode_padding_goaway(&[PADDING_FLAG_GOAWAY, 0, 1, 2, 3]),
+            None
+        );
         assert_eq!(
             decode_padding_goaway(&[PADDING_FLAG_GOAWAY, 0, 0, 0, 1, 2]),
             Some(258)
@@ -513,8 +512,7 @@ mod tests {
         for target in [37usize, 41, 82] {
             for stream_id in [0u32, 1, 3, 65535, u32::MAX] {
                 for increment in [0u32, 1, 65535, u32::MAX] {
-                    let packet =
-                        encode_padding_window_update_sized(stream_id, increment, target);
+                    let packet = encode_padding_window_update_sized(stream_id, increment, target);
                     assert_eq!(packet[0], CMD_PADDING);
                     assert_eq!(packet[1..5], stream_id.to_be_bytes());
                     assert_eq!(packet.len() + CONTROL_RECORD_MIN_OVERHEAD, target);
@@ -562,7 +560,10 @@ mod tests {
             None
         );
         assert_eq!(decode_padding_window_update(&[]), None);
-        assert_eq!(decode_padding_window_update(&[PADDING_FLAG_WINDOW_UPDATE]), None);
+        assert_eq!(
+            decode_padding_window_update(&[PADDING_FLAG_WINDOW_UPDATE]),
+            None
+        );
         assert_eq!(
             decode_padding_window_update(&[PADDING_FLAG_WINDOW_UPDATE, 0, 1, 2, 3]),
             None
@@ -606,8 +607,14 @@ mod tests {
     /// 包括超长单帧与空帧这两个边界。
     #[test]
     fn coalesce_single_frame_matches_copy_path() {
-        assert_eq!(coalesce_encoded_frames(vec![vec![9u8; 10]], 32), vec![vec![9u8; 10]]);
-        assert_eq!(coalesce_encoded_frames(vec![vec![9u8; 40]], 32), vec![vec![9u8; 40]]);
+        assert_eq!(
+            coalesce_encoded_frames(vec![vec![9u8; 10]], 32),
+            vec![vec![9u8; 10]]
+        );
+        assert_eq!(
+            coalesce_encoded_frames(vec![vec![9u8; 40]], 32),
+            vec![vec![9u8; 40]]
+        );
         assert!(coalesce_encoded_frames(vec![Vec::new()], 32).is_empty());
         assert!(coalesce_encoded_frames(Vec::new(), 32).is_empty());
     }

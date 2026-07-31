@@ -310,11 +310,9 @@ pub(crate) fn fill_x25519_public_key(share_data: &mut [u8]) -> bool {
 /// 生成一个真实的 X25519 临时公钥。ClientHello 侧需要把同一个值写到多个份额
 /// 里（0x001d 与混合份额的 X25519 半部），所以这里返回值而不是就地填充。
 fn generate_x25519_public_key() -> Option<[u8; 32]> {
-    let private_key = ring::agreement::EphemeralPrivateKey::generate(
-        &ring::agreement::X25519,
-        system_random(),
-    )
-    .ok()?;
+    let private_key =
+        ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::X25519, system_random())
+            .ok()?;
     let public_key = private_key.compute_public_key().ok()?;
     let public_bytes = public_key.as_ref();
     if public_bytes.len() != 32 {
@@ -496,10 +494,7 @@ fn strip_client_hello_extensions(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
 
 /// [`strip_client_hello_extensions`] 的实现，剥离集合作为参数传入，使剥离机制
 /// 本身可以在剥离表为空的情况下继续被测试覆盖。
-fn strip_named_client_hello_extensions(
-    bytes: &[u8],
-    stripped: &[u16],
-) -> anyhow::Result<Vec<u8>> {
+fn strip_named_client_hello_extensions(bytes: &[u8], stripped: &[u16]) -> anyhow::Result<Vec<u8>> {
     if bytes.len() < 9 || bytes[0] != 0x16 || bytes[5] != 0x01 {
         anyhow::bail!("template is not a TLS ClientHello record");
     }
@@ -697,7 +692,9 @@ fn rotate_grease_supported_groups(
     rng: &mut impl Rng,
 ) -> anyhow::Result<()> {
     const SUPPORTED_GROUPS_EXTENSION_TYPE: u16 = 0x000a;
-    let Some(extension) = find_extension(bytes, extensions_len_range, SUPPORTED_GROUPS_EXTENSION_TYPE)? else {
+    let Some(extension) =
+        find_extension(bytes, extensions_len_range, SUPPORTED_GROUPS_EXTENSION_TYPE)?
+    else {
         return Ok(());
     };
     let data_range = extension.data_range;
@@ -728,8 +725,11 @@ fn rotate_grease_supported_versions(
     rng: &mut impl Rng,
 ) -> anyhow::Result<()> {
     const SUPPORTED_VERSIONS_EXTENSION_TYPE: u16 = 0x002B;
-    let Some(extension) =
-        find_extension(bytes, extensions_len_range, SUPPORTED_VERSIONS_EXTENSION_TYPE)?
+    let Some(extension) = find_extension(
+        bytes,
+        extensions_len_range,
+        SUPPORTED_VERSIONS_EXTENSION_TYPE,
+    )?
     else {
         return Ok(());
     };
@@ -930,8 +930,8 @@ fn validate_auxiliary_key_share_shapes(
 ) -> anyhow::Result<()> {
     for range in ranges {
         let share = &bytes[range.clone()];
-        let supported = share.len() == 1216
-            || (share.len() == 65 && !share.is_empty() && share[0] == 0x04);
+        let supported =
+            share.len() == 1216 || (share.len() == 65 && !share.is_empty() && share[0] == 0x04);
         if !supported {
             anyhow::bail!(
                 "unsupported auxiliary key_share ({} bytes; supported: 1216-byte \
@@ -1209,11 +1209,10 @@ mod tests {
         let ja3_extensions_stable = instantiated_ja3_extensions.len() == 1;
         // 此前剥离 0x0022/0x001C/0xFE0D 使上线扩展从捕获的 15 个变成 12 个，
         // 不对应任何已发布的 Firefox 版本，JA4 的扩展计数与排序哈希直接失配。
-        let extensions_match_capture =
-            instantiated_extension_lists.len() == 1 && {
-                let instantiated = instantiated_extension_lists.iter().next().unwrap();
-                *instantiated == format_extension_list(&original_extensions)
-            };
+        let extensions_match_capture = instantiated_extension_lists.len() == 1 && {
+            let instantiated = instantiated_extension_lists.iter().next().unwrap();
+            *instantiated == format_extension_list(&original_extensions)
+        };
         let no_unexpected_firefox_padding = original_has_padding || firefox_padding_samples == 0;
         let no_firefox_micro_jumps = firefox_record_lengths.len() == 1;
 
@@ -1541,9 +1540,19 @@ mod tests {
 
     #[test]
     fn unsupported_fingerprint_is_rejected() {
-        assert!(get_or_build_client_hello_template("example.com", Some("rustls"), None, true).is_err());
-        assert!(get_or_build_client_hello_template("example.com", Some("python-openssl"), None, true).is_err());
-        assert!(get_or_build_client_hello_template("example.com", Some("chrome"), None, true).is_err());
+        assert!(
+            get_or_build_client_hello_template("example.com", Some("rustls"), None, true).is_err()
+        );
+        assert!(get_or_build_client_hello_template(
+            "example.com",
+            Some("python-openssl"),
+            None,
+            true
+        )
+        .is_err());
+        assert!(
+            get_or_build_client_hello_template("example.com", Some("chrome"), None, true).is_err()
+        );
     }
 
     /// 捕获模板的 15 个扩展类型（顺序即上线顺序）。JA3 的扩展字段与 JA4 的扩展
@@ -1577,7 +1586,10 @@ mod tests {
             stripped, FIREFOX_BOOTSTRAP_CLIENT_HELLO,
             "剥离表为空，捕获模板必须逐字节不变"
         );
-        assert_eq!(extension_types(&stripped), CAPTURED_EXTENSION_TYPES.to_vec());
+        assert_eq!(
+            extension_types(&stripped),
+            CAPTURED_EXTENSION_TYPES.to_vec()
+        );
         assert_eq!(read_u16(&stripped, 3).unwrap() as usize + 5, stripped.len());
         assert_eq!(read_u24(&stripped, 6).unwrap() + 9, stripped.len());
         // Layout must still parse: extensions block is self-consistent.
@@ -1707,7 +1719,11 @@ mod tests {
             .ech_grease_ranges
             .clone()
             .expect("捕获模板必须带 GREASE ECH");
-        let mut variable = vec![random_range, session_id_range, layout.key_share_range.clone()];
+        let mut variable = vec![
+            random_range,
+            session_id_range,
+            layout.key_share_range.clone(),
+        ];
         variable.extend(layout.auxiliary_key_share_ranges.iter().cloned());
         variable.push(ech.config_id..ech.config_id + 1);
         variable.push(ech.enc.clone());
@@ -1907,10 +1923,12 @@ mod tests {
             cursor += 2;
         }
 
-        if let Some(extension) = find_extension(bytes, &layout.extensions_len_range, 0x000a).unwrap()
+        if let Some(extension) =
+            find_extension(bytes, &layout.extensions_len_range, 0x000a).unwrap()
         {
             let groups_len = read_u16(bytes, extension.data_range.start).unwrap() as usize;
-            let groups_end = (extension.data_range.start + 2 + groups_len).min(extension.data_range.end);
+            let groups_end =
+                (extension.data_range.start + 2 + groups_len).min(extension.data_range.end);
             let mut cursor = extension.data_range.start + 2;
             while cursor + 2 <= groups_end {
                 let value = read_u16(bytes, cursor).unwrap();
@@ -1922,7 +1940,8 @@ mod tests {
         }
 
         // supported_versions 的列表长度是 u8（不同于 supported_groups 的 u16）。
-        if let Some(extension) = find_extension(bytes, &layout.extensions_len_range, 0x002b).unwrap()
+        if let Some(extension) =
+            find_extension(bytes, &layout.extensions_len_range, 0x002b).unwrap()
         {
             let versions_len = bytes[extension.data_range.start] as usize;
             let versions_end =
@@ -1948,7 +1967,10 @@ mod tests {
         p256[0] = 0x04;
         let ranges = vec![Range { start: 0, end: 65 }];
         assert!(validate_auxiliary_key_share_shapes(&p256, &ranges).is_ok());
-        let ranges = vec![Range { start: 0, end: 1216 }];
+        let ranges = vec![Range {
+            start: 0,
+            end: 1216,
+        }];
         assert!(validate_auxiliary_key_share_shapes(&[0u8; 1216], &ranges).is_ok());
 
         // P-384（97 B）/ P-521（133 B）0x04 前缀份额：ring 无法生成合法点，
@@ -2059,8 +2081,7 @@ mod tests {
             .unwrap()
             .expect("firefox template must carry supported_groups");
         let first_group_offset = groups_extension.data_range.start + 2;
-        bytes[first_group_offset..first_group_offset + 2]
-            .copy_from_slice(&0x1A1Au16.to_be_bytes());
+        bytes[first_group_offset..first_group_offset + 2].copy_from_slice(&0x1A1Au16.to_be_bytes());
         let versions_extension = find_extension(&bytes, &layout.extensions_len_range, 0x002b)
             .unwrap()
             .expect("firefox template must carry supported_versions");
@@ -2300,8 +2321,15 @@ mod tests {
             let ech = layout.ech_grease_ranges.clone().expect("ECH must survive");
             // cipher_suite（kdf‖aead）与所有长度字段必须恒定 —— 真实端点的 HPKE
             // 套件是编译期常量，随机化它本身就是判别特征。
-            assert_eq!(out[ech.config_id - 5], 0, "ECHClientHello.type 必须恒为 outer(0)");
-            assert_eq!(&out[ech.config_id - 4..ech.config_id], &[0x00, 0x01, 0x00, 0x01]);
+            assert_eq!(
+                out[ech.config_id - 5],
+                0,
+                "ECHClientHello.type 必须恒为 outer(0)"
+            );
+            assert_eq!(
+                &out[ech.config_id - 4..ech.config_id],
+                &[0x00, 0x01, 0x00, 0x01]
+            );
             assert_eq!(ech.enc.end - ech.enc.start, 32);
             assert_eq!(ech.payload.end - ech.payload.start, 239);
 

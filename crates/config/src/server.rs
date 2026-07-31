@@ -30,23 +30,21 @@ pub fn validate_server_config(config: &ServerConfig, config_path: &str) -> Resul
     }
 
     if let Some(routing) = config.routing.as_ref() {
-        let inbound_user_map: std::collections::HashMap<
-            &str,
-            std::collections::HashSet<String>,
-        > = config
-            .inbounds
-            .iter()
-            .filter_map(|inbound| {
-                let tag = inbound.tag.as_deref()?;
-                let users = inbound
-                    .settings
-                    .users
-                    .iter()
-                    .map(|user| user.name.clone())
-                    .collect();
-                Some((tag, users))
-            })
-            .collect();
+        let inbound_user_map: std::collections::HashMap<&str, std::collections::HashSet<String>> =
+            config
+                .inbounds
+                .iter()
+                .filter_map(|inbound| {
+                    let tag = inbound.tag.as_deref()?;
+                    let users = inbound
+                        .settings
+                        .users
+                        .iter()
+                        .map(|user| user.name.clone())
+                        .collect();
+                    Some((tag, users))
+                })
+                .collect();
         validate_routing_rules(
             routing,
             config

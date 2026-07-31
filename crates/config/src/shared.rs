@@ -323,11 +323,14 @@ mod tests {
         assert!(validate_session_config("test", &session).is_ok());
     }
 
-    fn rule(inbound: &[&str], auth_user: Option<&[&str]>, outbound: &str) -> crate::model::RoutingRule {
+    fn rule(
+        inbound: &[&str],
+        auth_user: Option<&[&str]>,
+        outbound: &str,
+    ) -> crate::model::RoutingRule {
         crate::model::RoutingRule {
             inbound: inbound.iter().map(|s| s.to_string()).collect(),
-            auth_user: auth_user
-                .map(|users| users.iter().map(|s| s.to_string()).collect()),
+            auth_user: auth_user.map(|users| users.iter().map(|s| s.to_string()).collect()),
             outbound: outbound.to_string(),
         }
     }
@@ -336,7 +339,9 @@ mod tests {
         crate::model::Routing { rules }
     }
 
-    fn user_map<'a>(users: &'a std::collections::HashSet<String>) -> impl Fn(&str) -> Option<&'a std::collections::HashSet<String>> {
+    fn user_map<'a>(
+        users: &'a std::collections::HashSet<String>,
+    ) -> impl Fn(&str) -> Option<&'a std::collections::HashSet<String>> {
         move |tag| (tag == "tls-in").then_some(users)
     }
 
@@ -375,10 +380,8 @@ mod tests {
 
     #[test]
     fn validate_routing_rules_accepts_known_auth_users() {
-        let users: std::collections::HashSet<String> = ["1", "2"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let users: std::collections::HashSet<String> =
+            ["1", "2"].iter().map(|s| s.to_string()).collect();
         let rules = routing(vec![
             rule(&["tls-in"], Some(&["1", "2"]), "direct"),
             rule(&["tls-in"], None, "direct"),
@@ -394,7 +397,8 @@ mod tests {
 
     #[test]
     fn validate_routing_rules_rejects_unknown_auth_user() {
-        let users: std::collections::HashSet<String> = ["1"].iter().map(|s| s.to_string()).collect();
+        let users: std::collections::HashSet<String> =
+            ["1"].iter().map(|s| s.to_string()).collect();
         let rules = routing(vec![rule(&["tls-in"], Some(&["ghost"]), "direct")]);
         let err = validate_routing_rules(
             &rules,
@@ -408,7 +412,8 @@ mod tests {
 
     #[test]
     fn validate_routing_rules_rejects_empty_auth_user_list() {
-        let users: std::collections::HashSet<String> = ["1"].iter().map(|s| s.to_string()).collect();
+        let users: std::collections::HashSet<String> =
+            ["1"].iter().map(|s| s.to_string()).collect();
         let rules = routing(vec![rule(&["tls-in"], Some(&[]), "direct")]);
         let err = validate_routing_rules(
             &rules,
@@ -422,7 +427,8 @@ mod tests {
 
     #[test]
     fn validate_routing_rules_rejects_unknown_inbound_and_outbound() {
-        let users: std::collections::HashSet<String> = ["1"].iter().map(|s| s.to_string()).collect();
+        let users: std::collections::HashSet<String> =
+            ["1"].iter().map(|s| s.to_string()).collect();
         let rules = routing(vec![rule(&["nope-in"], None, "direct")]);
         assert!(validate_routing_rules(
             &rules,

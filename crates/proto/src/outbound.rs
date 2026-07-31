@@ -1,4 +1,6 @@
-use crate::socks5::{socks5_handshake, socks5_send_connect, socks5_send_udp_associate, Socks5Target};
+use crate::socks5::{
+    socks5_handshake, socks5_send_connect, socks5_send_udp_associate, Socks5Target,
+};
 use crate::target::{is_blocked_destination, Host, Target};
 use crate::uot::{decode_socks5_udp, encode_socks5_udp};
 use std::net::SocketAddr;
@@ -69,7 +71,10 @@ impl DirectOutbound {
         }
 
         Err(last_err.unwrap_or_else(|| {
-            anyhow::anyhow!("direct connect to {} found no usable address", target.authority())
+            anyhow::anyhow!(
+                "direct connect to {} found no usable address",
+                target.authority()
+            )
         }))
     }
 
@@ -330,7 +335,9 @@ impl UdpRelay {
 /// 成功时列表非空：全被阻断或解析失败都会以 Err 返回。socks5 UDP relay
 /// 地址的选择也走这里（`socks5_send_udp_associate`），保证两条路径共享
 /// 同一套目的地过滤口径。
-pub(crate) async fn resolve_remote_target(target: &Target) -> Result<Vec<SocketAddr>, anyhow::Error> {
+pub(crate) async fn resolve_remote_target(
+    target: &Target,
+) -> Result<Vec<SocketAddr>, anyhow::Error> {
     let check = |addr: SocketAddr| -> Result<Vec<SocketAddr>, anyhow::Error> {
         if is_blocked_destination(&addr) {
             anyhow::bail!("blocked destination: {}", addr);

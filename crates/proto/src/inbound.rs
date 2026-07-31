@@ -104,9 +104,7 @@ impl ConnectHandshake {
                 self.writer.write_all(&reply).await?;
             }
             InboundKind::Http => {
-                self.writer
-                    .write_all(http::connect_success_reply())
-                    .await?;
+                self.writer.write_all(http::connect_success_reply()).await?;
             }
         }
         Ok(())

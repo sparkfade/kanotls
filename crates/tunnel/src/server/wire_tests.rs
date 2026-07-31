@@ -57,11 +57,13 @@ fn sample_flight(sizes: &[usize]) -> (Vec<u8>, Vec<std::ops::Range<usize>>) {
     let mut payloads = Vec::new();
     let mut offset = 0usize;
     while offset + TLS_RECORD_HEADER_LEN <= sequence.len() {
-        let len =
-            u16::from_be_bytes([sequence[offset + 3], sequence[offset + 4]]) as usize;
+        let len = u16::from_be_bytes([sequence[offset + 3], sequence[offset + 4]]) as usize;
         let start = offset + TLS_RECORD_HEADER_LEN;
         let end = start + len;
-        assert!(end <= sequence.len(), "record overruns the generated flight");
+        assert!(
+            end <= sequence.len(),
+            "record overruns the generated flight"
+        );
         payloads.push(start..end);
         offset = end;
     }
@@ -199,7 +201,11 @@ fn x25519_key_share_has_canonical_high_bit() {
         let mut records = synthetic_server_hello(0x11EC, 1088 + 32);
         assert!(patch_server_hello_key_share(&mut records));
         let ke = key_exchange_bytes(&records);
-        assert_eq!(ke[1088 + 31] & 0x80, 0, "hybrid X25519 half must have MSB clear");
+        assert_eq!(
+            ke[1088 + 31] & 0x80,
+            0,
+            "hybrid X25519 half must have MSB clear"
+        );
     }
 }
 
@@ -343,7 +349,10 @@ fn replay_burst_breaks_only_on_sampled_significant_gaps() {
 
     // 阈值本身不带随机抖动：断点位置由真实测量值决定，而不是由随机数决定。
     // （真实端点的突发形态是确定的；在这个维度上随机化本身就是判别特征。）
-    let boundary = timing_profile(SIGNIFICANT_REPLAY_GAP_US, vec![SIGNIFICANT_REPLAY_GAP_US - 1]);
+    let boundary = timing_profile(
+        SIGNIFICANT_REPLAY_GAP_US,
+        vec![SIGNIFICANT_REPLAY_GAP_US - 1],
+    );
     for _ in 0..64 {
         assert!(replay_gap_before_us(&boundary, 0) >= SIGNIFICANT_REPLAY_GAP_US);
         assert!(replay_gap_before_us(&boundary, 1) < SIGNIFICANT_REPLAY_GAP_US);
@@ -475,7 +484,10 @@ async fn synthetic_replay_preserves_record_shape_and_freshens_every_payload() {
             observed, app_data_sizes,
             "replayed record sizes/count/order must match the sampled profile exactly"
         );
-        assert_eq!(bytes[0], 0x16, "flight must open with the ServerHello record");
+        assert_eq!(
+            bytes[0], 0x16,
+            "flight must open with the ServerHello record"
+        );
     }
 
     // 跨连接不得出现逐字节重复的 16 字节窗口（含前置小记录的 payload）。
@@ -724,9 +736,7 @@ async fn indistinguishable_close_drains_before_closing() {
         observations
     );
 
-    let timing_gap = observations[0]
-        .2
-        .abs_diff(observations[1].2);
+    let timing_gap = observations[0].2.abs_diff(observations[1].2);
     assert!(
         timing_gap <= std::time::Duration::from_millis(250),
         "close instant differs by {:?} between a silent client and one that sent a \
