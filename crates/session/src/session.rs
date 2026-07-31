@@ -325,10 +325,11 @@ const STICKY_BULK_FLUSH_MAX_RECORDS: usize = 8;
 const STICKY_BULK_FLUSH_MAX_BYTES: usize = 128 * 1024;
 
 /// 稳态 H2 行为骨架（post-script steady state）：真实 HTTP/2 接收端按消费
-/// 字节数回发 WINDOW_UPDATE，并在**空闲**时发 PING/PING-ACK 对。内容加密
-/// 不可见，只需复刻尺寸/时序语义。两者都以 CMD_PADDING 帧实现：flag=1 被
-/// 对端静默吸收（等价 WINDOW_UPDATE 的“无回复”语义），flag=0 m=1 会换来
-/// 一条 reply（等价 PING/PING-ACK 对）。
+/// 字节数回发 WINDOW_UPDATE，并对收到的 PING 回 PING-ACK。内容加密不可见，
+/// 只需复刻尺寸/时序语义。两者都以 CMD_PADDING 帧实现：flag=1 被对端静默
+/// 吸收（等价 WINDOW_UPDATE 的“无回复”语义），flag=0 m=1 会换来一条 reply
+/// （等价 PING/PING-ACK 对）。客户端不做空闲探活 PING（用户明确不需要
+/// 保活），flag=0 m=1 的请求只来自脚本 fake 交互与合成 H2 交换。
 ///
 /// WINDOW_UPDATE 的触发阈值是**逐进程常量**，不逐次重采样。此前是
 /// `gen_range(1MB..=4MB)` 且每越过一次就重新采样一个新阈值 ⇒ 全随机，而
@@ -348,29 +349,10 @@ const STICKY_BULK_FLUSH_MAX_BYTES: usize = 128 * 1024;
 const H2_FIREFOX_SESSION_WINDOW_BYTES: usize = 12 * 1024 * 1024;
 static H2_WINDOW_UPDATE_THRESHOLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-/// PING 的**空闲**阈值：Firefox 的 `network.http.spdy.ping-threshold`，
-/// 默认 58 秒。
-///
-/// 此前是「固定周期定时器 + 随机 60–150s 周期 + 两端都发」，三处都不对：
-/// * 真实 H2 按**无活动**触发——`Http2Session::ReadTimeoutTick` 的判据是
-///   `(now - mLastReadEpoch) < mPingThreshold` 就直接返回，即以「距上次从
-///   socket 读到数据的时长」为准。固定周期会在**正在传输大流量**的连接上
-///   插 PING，而真实 H2 有活动就不需要探活。空闲判据取「对端到达」而不是
-///   「任意收发」，正是为了与 `mLastReadEpoch` 同口径。
-/// * **nginx 从不主动发 H2 PING**，只回 PING-ACK ⇒ 仅客户端方向发起。
-/// * 阈值是实现里的 pref 常量，不是随机周期：在真实实现恒定的维度上随机化
-///   本身就是判别特征。
-const H2_PING_IDLE_THRESHOLD_SECS: u64 = 58;
-
 /// 论文（USENIX Sec'24, Xue et al.）的观测窗口 `Wo`：25 个承载数据的 TCP 包。
 ///
-/// 连接仍处在这个窗口之内时**抑制 PING**。空闲触发本身已经让 PING 前面隔着
-/// ≥58 秒的静默，但论文的 3-gram 取在**包序列**上、不看时间间隔：一个已预热
-/// 的池化连接长时间空闲后发出的 `(+41, −41)` 对，若前一个包恰是此前下行
-/// burst 的尾段，序列上就是 `(−L4, L1, −L1)`（Distinc 2.879）。
-///
 /// 包数用「读循环收到的对端到达次数」近似：一次 `read()` 至少对应一个 TCP
-/// 段，故 arrivals ≤ 实际包数——**低估**方向，只会让抑制期更长，是保守的。
+/// 段，故 arrivals ≤ 实际包数——**低估**方向，只会让窗口判定更晚，是保守的。
 ///
 /// `TrafficShaper` 的窗口外放松（见 `shaper::POST_WINDOW_RELAX_BAND`）复用
 /// 同一个常量，但用的是一个更严的下界：`flush 次数 + arrivals`。
@@ -453,7 +435,6 @@ const H2_EXCHANGE_MAX_INTERVAL_SECS: u64 = 300;
 /// 测试覆写点：0 表示使用上面的生产常量。
 pub(crate) static H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES: AtomicUsize =
     AtomicUsize::new(0);
-pub(crate) static H2_PING_IDLE_THRESHOLD_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static H2_EXCHANGE_INTERVAL_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
 
 /// H2 骨架关闭时的定时器“禁用”姿态：分支被 select guard 屏蔽，deadline
@@ -650,31 +631,6 @@ fn h2_window_update_threshold() -> usize {
     *H2_WINDOW_UPDATE_THRESHOLD.get_or_init(|| H2_FIREFOX_SESSION_WINDOW_BYTES / 2)
 }
 
-/// PING 的空闲阈值：常量，不采样（论证见 `H2_PING_IDLE_THRESHOLD_SECS`）。
-fn h2_ping_idle_threshold() -> Duration {
-    let override_ms = H2_PING_IDLE_THRESHOLD_OVERRIDE_MS.load(Ordering::Relaxed);
-    if override_ms > 0 {
-        return Duration::from_millis(override_ms);
-    }
-    Duration::from_secs(H2_PING_IDLE_THRESHOLD_SECS)
-}
-
-/// 对数正态采样（Box-Muller），与 `shaper::sample_log_normal` 同口径。
-fn sample_log_normal_ms(mu: f64, sigma: f64) -> f64 {
-    use rand::Rng;
-    use std::f64::consts::PI;
-    let mut rng = rand::thread_rng();
-    loop {
-        let u1: f64 = rng.gen_range(0.0..1.0);
-        let u2: f64 = rng.gen_range(0.0..1.0);
-        if u1 <= 0.0 {
-            continue;
-        }
-        let z = (-2.0_f64 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
-        return (mu + sigma * z).exp();
-    }
-}
-
 /// 下一次合成 H2 交换的间隔：开场窗口内是数十毫秒量级，之后是浏览量级。
 fn sample_h2_exchange_interval(opening_left: u32) -> Duration {
     let override_ms = H2_EXCHANGE_INTERVAL_OVERRIDE_MS.load(Ordering::Relaxed);
@@ -686,7 +642,7 @@ fn sample_h2_exchange_interval(opening_left: u32) -> Duration {
     } else {
         (H2_EXCHANGE_STEADY_MU_MS, H2_EXCHANGE_STEADY_SIGMA)
     };
-    let ms = sample_log_normal_ms(mu, sigma).max(1.0);
+    let ms = kanotls_tunnel::utils::sample_log_normal(mu, sigma).max(1.0);
     Duration::from_micros((ms * 1000.0).round() as u64)
         .min(Duration::from_secs(H2_EXCHANGE_MAX_INTERVAL_SECS))
 }
@@ -1444,18 +1400,6 @@ impl Session {
         // 分支被 guard 屏蔽）。
         let h2_skeleton_enabled = !self.post_script_off;
         let mut bytes_since_window_update = 0usize;
-        // PING 仅客户端方向发起：nginx 从不主动发 H2 PING，只回 PING-ACK。
-        // 触发条件是**空闲**而不是固定周期，故这里的定时器只是一个自校正的
-        // tick：到期后先看「距上次对端到达」够不够阈值，不够就按剩余时间重新
-        // 武装。论证见 H2_PING_IDLE_THRESHOLD_SECS。
-        let h2_ping_enabled = h2_skeleton_enabled && self.is_client;
-        let mut last_inbound_at = tokio::time::Instant::now();
-        let h2_ping_timer = tokio::time::sleep(if h2_ping_enabled {
-            h2_ping_idle_threshold()
-        } else {
-            H2_TIMER_DISABLED
-        });
-        tokio::pin!(h2_ping_timer);
 
         // 合成共存流：仅客户端方向（真实 H2 的请求由客户端发起）。
         let h2_exchange_enabled = h2_skeleton_enabled && self.is_client;
@@ -1490,36 +1434,6 @@ impl Session {
                         break;
                     }
                     idle_timeout.as_mut().reset(tokio::time::Instant::now() + idle_duration);
-                    continue;
-                }
-                _ = &mut h2_ping_timer, if h2_ping_enabled => {
-                    // 空闲探活：flag=0 m=1 请求（wire 恰为 H2 PING 尺寸），
-                    // 对端回一条 padding reply，构成 PING/PING-ACK 时序。
-                    let threshold = h2_ping_idle_threshold();
-                    if last_inbound_at.elapsed() < threshold {
-                        // 期间有对端数据到达 ⇒ 连接不空闲，真实 H2 不探活。
-                        h2_ping_timer.as_mut().reset(last_inbound_at + threshold);
-                        continue;
-                    }
-                    // 仍在论文的 Wo 观测窗口内时抑制，论证见
-                    // PAPER_OBSERVATION_WINDOW_PACKETS。
-                    if self.inbound.arrivals() >= PAPER_OBSERVATION_WINDOW_PACKETS {
-                        let packet = encode_padding_request_sized(1, PADDING_REQUEST_WIRE);
-                        if let Err(e) = self
-                            .writer
-                            .submit_write_packets(
-                                vec![packet],
-                                FlushBehavior::Auto,
-                                TrafficClass::Control,
-                            )
-                            .await
-                        {
-                            warn!("failed to queue h2 ping padding: {}", e);
-                        }
-                    }
-                    h2_ping_timer
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + threshold);
                     continue;
                 }
                 _ = &mut h2_exchange_timer, if h2_exchange_enabled => {
@@ -1574,9 +1488,6 @@ impl Session {
 
             // 方向改变信号：写循环据此结束第一个上行 burst（见 InboundSignal）。
             self.inbound.note_arrival();
-            // PING 的空闲判据与 Firefox 的 `mLastReadEpoch` 同口径：只由
-            // 「从 socket 读到数据」刷新。
-            last_inbound_at = tokio::time::Instant::now();
 
             if buf.len() > MAX_SESSION_REASSEMBLY_BYTES {
                 warn!(
@@ -3405,9 +3316,9 @@ const TUNNEL_REASSEMBLY_CAPACITY: usize = 65536;
 ///
 /// **这个数字是线上可观测的，不能顺手放大。** `InboundSignal::arrivals()`
 /// 计的就是「成功 read 的次数」，而它同时是：喂给 `TrafficShaper` 的窗口
-/// 进度下界（`begin_drain`）、PING 抑制的判据（`>= PAPER_OBSERVATION_WINDOW_PACKETS`）、
-/// 以及让出方向的等待条件（`wait_for_peer_turn`）。一次读得越多，arrivals
-/// 涨得越慢，整形窗口就退出得越晚——记录尺寸与延迟分布随之改变。
+/// 进度下界（`begin_drain`）与让出方向的等待条件（`wait_for_peer_turn`）。
+/// 一次读得越多，arrivals 涨得越慢，整形窗口就退出得越晚——记录尺寸与延迟
+/// 分布随之改变。
 const TUNNEL_READ_CHUNK: usize = 16384;
 
 /// 直接读进重组缓冲的未初始化尾部。

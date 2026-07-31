@@ -47,10 +47,23 @@ pub const MAX_DELAY_MEDIAN_MS: f64 = 500.0;
 /// 内嵌默认脚本用的是 0.5–0.7；2.0 已经把 99.9 分位放宽到中位数的约 480 倍。
 pub const MAX_DELAY_SIGMA: f64 = 2.0;
 
+/// `F:n?k` 抖动偏移的上界（记录数）。
+///
+/// 无界 `|k|` 会让 `shaper::TrafficShaper` 的 `deferred_fakes` 队列无界增长，
+/// 且 `release_due_fakes` 每次策略调用都要为整个队列做一次全量扫描。64 条
+/// 记录远超脚本实际管辖的观测窗口，超界即解析失败并回退内嵌默认脚本。
+pub const MAX_FAKE_JITTER_OFFSET: i32 = 64;
+
 #[derive(Clone, Debug)]
 pub struct ScriptRule {
     pub len_lo: usize,
     pub len_hi: usize,
+    /// `L:base?range` 标记：窗口在**每连接一次**的 `randomize_script` 里坍缩
+    /// 成固定值，此前在 parse 期用 `thread_rng()` 抽样——校验（`shared.rs`）
+    /// 与 shaper 构造各抽一次、取值不同，L1 lint 判据随运行而变。parse 现在
+    /// 完全确定：`?` 规则存 `(base, base+range)` 窗口，lint 按窗口下界（保守
+    /// 方向）判断。
+    pub len_pinned: bool,
     pub delay: DelaySpec,
     pub expect_responses: u8,
     /// Fake-response position jitter: the emission offset (in records,
@@ -81,7 +94,10 @@ pub struct ParsedScript {
 /// the embedded default script).
 ///
 /// `L: base?range` semantics: the value is fixed for the lifetime of the
-/// connection, sampled once here at parse time as `base + U[0, range]`.
+/// connection, sampled **per connection** as `base + U[0, range]` in the
+/// shaper's `randomize_script` pass (the window collapses there). Parse
+/// itself is deterministic — validation, lint and the runtime all agree on
+/// the same window.
 pub fn parse_traffic_script(lines: &[String]) -> Result<ParsedScript, String> {
     let mut rules = Vec::new();
     let mut stop: Option<u64> = None;
@@ -148,18 +164,19 @@ fn parse_rule_body(body: &str) -> Result<ScriptRule, String> {
         }
     }
 
-    let (len_lo, len_hi) =
+    let (len_lo, len_hi, len_pinned) =
         len_range.ok_or_else(|| format!("missing L field in '{}'", body))?;
     Ok(ScriptRule {
         len_lo,
         len_hi,
+        len_pinned,
         delay,
         expect_responses: fake_response,
         fake_jitter,
     })
 }
 
-fn parse_len_spec(rest: &str) -> Result<(usize, usize), String> {
+fn parse_len_spec(rest: &str) -> Result<(usize, usize, bool), String> {
     if let Some((lo, hi)) = rest.split_once('-') {
         let lo: usize = lo
             .trim()
@@ -172,10 +189,12 @@ fn parse_len_spec(rest: &str) -> Result<(usize, usize), String> {
         if lo > hi {
             return Err(format!("len_lo {} > len_hi {}", lo, hi));
         }
-        Ok((lo, hi))
+        Ok((lo, hi, false))
     } else if let Some((base, range)) = rest.split_once('?') {
-        // `?` semantics: the value is fixed for the lifetime of the
-        // connection, sampled once at parse time as base + U[0, range].
+        // `?` 只标记窗口、**不抽样**：parse 保持确定性，坍缩发生在 shaper 的
+        // `randomize_script`（每连接一次，见 `ScriptRule::len_pinned`）。此前在
+        // 这里用 `thread_rng()` 抽固定值，导致校验与运行各取一个不同的值、
+        // L1 lint 判据随运行而变。
         let base: usize = base
             .trim()
             .parse()
@@ -184,15 +203,14 @@ fn parse_len_spec(rest: &str) -> Result<(usize, usize), String> {
             .trim()
             .parse()
             .map_err(|e| format!("bad len range: {}", e))?;
-        use rand::Rng;
-        let fixed = base.saturating_add(rand::thread_rng().gen_range(0..=range));
-        Ok((fixed, fixed))
+        Ok((base, base.saturating_add(range), true))
     } else {
         // Bare `L: N` is a fixed value, lo == hi == N.
         let fixed: usize = rest
+            .trim()
             .parse()
             .map_err(|e| format!("bad fixed len: {}", e))?;
-        Ok((fixed, fixed))
+        Ok((fixed, fixed, false))
     }
 }
 
@@ -219,7 +237,7 @@ fn median_ms_to_mu(median_ms: f64) -> Result<f64, String> {
 
 /// `D:` 的两种写法：
 ///
-/// * `D:0` —— 零延迟（`DelaySpec::None`）；
+/// * `D:0` / `D:0.0` —— 零延迟（`DelaySpec::None`）；
 /// * `D:median` —— 中位数毫秒，sigma 取默认 0.5；
 /// * `D:median-sigma` —— 中位数毫秒 + 对数空间 sigma。
 ///
@@ -227,7 +245,9 @@ fn median_ms_to_mu(median_ms: f64) -> Result<f64, String> {
 /// 文档：此前双参数形式把它当对数空间的 mu 直接存下，同一个数字在两种写法下
 /// 差出 3–7 倍）。
 fn parse_delay_spec(rest: &str) -> Result<DelaySpec, String> {
-    if rest == "0" {
+    // 先按 f64 整体解析：任何 == 0.0 的写法（`0`、`0.0`、`0.00`…）都是零延迟。
+    // 此前只识别字面量 `"0"`，`D:0.0` 会落到中位数校验里被拒绝。
+    if rest.parse::<f64>().map(|v| v == 0.0).unwrap_or(false) {
         return Ok(DelaySpec::None);
     }
     if let Some((median_s, sigma_s)) = rest.split_once('-') {
@@ -271,6 +291,12 @@ fn parse_fake_spec(rest: &str) -> Result<(u8, i32), String> {
             .trim()
             .parse()
             .map_err(|e| format!("bad fake jitter: {}", e))?;
+        if jitter.abs() > MAX_FAKE_JITTER_OFFSET {
+            return Err(format!(
+                "fake jitter {} exceeds the ±{} record bound",
+                jitter, MAX_FAKE_JITTER_OFFSET
+            ));
+        }
         Ok((count, jitter))
     } else {
         let count: u8 = rest
@@ -415,7 +441,12 @@ pub fn lint_traffic_script(script: &ParsedScript) -> Vec<String> {
     // 单规则脚本不判：`rules.len() == 1` 时不存在「周期」，所有记录本来就来自
     // 同一个分布，没有可供相关的相位。
     let rule_count = script.rules.len() as u64;
-    if rule_count >= 2 && script.stop * MAX_SCRIPT_CYCLES_DEN > rule_count * MAX_SCRIPT_CYCLES_NUM {
+    // saturating_mul：`stop` 接近 u64::MAX 时普通乘法在 debug 构建下直接 panic
+    // （一个本应只产生警告的输入路径），饱和后判据照常给出「远超 1.5 倍」。
+    if rule_count >= 2
+        && script.stop.saturating_mul(MAX_SCRIPT_CYCLES_DEN)
+            > rule_count.saturating_mul(MAX_SCRIPT_CYCLES_NUM)
+    {
         warnings.push(format!(
             "stop={} over {} rules means the script replays its rule cycle {:.1} times. Rules are \
              applied as packet_seq % rule_count, so repeating the cycle injects a periodic \
@@ -698,6 +729,24 @@ mod tests {
         assert_eq!(p.rules[0].fake_jitter, -1);
     }
 
+    /// 抖动偏移必须落在 ±MAX_FAKE_JITTER_OFFSET 内：无界 `|k|` 会让 shaper 的
+    /// `deferred_fakes` 队列无界增长（`release_due_fakes` 每次策略调用全量扫描）。
+    #[test]
+    fn parse_rejects_out_of_bounds_fake_jitter() {
+        for spec in ["F:1?65", "F:1?-65", "F:2?999", "F:2?-1000"] {
+            assert!(
+                parse_traffic_script(&lines(&[&format!("0=L:100,D:0,{}", spec)])).is_err(),
+                "{} must be rejected",
+                spec
+            );
+        }
+        // 上界本身合法，正负两侧都放行。
+        for spec in ["F:1?64", "F:1?-64"] {
+            let p = parse_traffic_script(&lines(&[&format!("0=L:100,D:0,{}", spec)])).unwrap();
+            assert_eq!(p.rules[0].fake_jitter.abs(), 64);
+        }
+    }
+
     #[test]
     fn parse_rejects_empty_entry() {
         assert!(parse_traffic_script(&lines(&[""])).is_err());
@@ -753,12 +802,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_question_mark_syntax_fixed_value() {
+    fn parse_question_mark_syntax_marks_window_and_is_deterministic() {
+        // `?` 只标记窗口、不抽样：parse 多次结果必须逐字节一致（此前在 parse
+        // 期抽固定值，同一脚本每次解析结果都不同）。
+        let mut expected: Option<ParsedScript> = None;
         for _ in 0..20 {
             let p = parse_traffic_script(&lines(&["0=L:100?50,D:0,F:0"])).unwrap();
             assert_eq!(p.rules.len(), 1);
-            assert_eq!(p.rules[0].len_lo, p.rules[0].len_hi);
-            assert!((100..=150).contains(&p.rules[0].len_lo));
+            let rule = &p.rules[0];
+            assert!(rule.len_pinned, "? 规则必须标记 len_pinned");
+            assert_eq!(rule.len_lo, 100);
+            assert_eq!(rule.len_hi, 150);
+            if let Some(prev) = &expected {
+                assert!(
+                    prev.rules[0].len_lo == rule.len_lo && prev.rules[0].len_hi == rule.len_hi,
+                    "parse 必须是确定性的：? 规则的窗口不得随解析而变"
+                );
+            }
+            expected = Some(p);
+        }
+    }
+
+    #[test]
+    fn parse_range_and_bare_lengths_are_not_pinned() {
+        for spec in ["0=L:100-200,D:0,F:0", "0=L:333,D:0,F:0"] {
+            let p = parse_traffic_script(&lines(&[spec])).unwrap();
+            assert!(!p.rules[0].len_pinned, "{} 不得标记 len_pinned", spec);
         }
     }
 
@@ -778,6 +847,20 @@ mod tests {
                 assert!((sigma_ms - 0.5).abs() < 0.01);
             }
             _ => panic!("expected LogNormal"),
+        }
+    }
+
+    /// 零延迟的三种写法必须解析成同一个 `DelaySpec::None`——此前只有字面量
+    /// `"0"` 被识别，`D:0.0` 会被中位数校验拒绝。
+    #[test]
+    fn parse_zero_delay_accepts_decimal_zero() {
+        for spec in ["D:0", "D:0.0", "D:0.00"] {
+            let p = parse_traffic_script(&lines(&[&format!("0=L:300,{}", spec)])).unwrap();
+            assert!(
+                matches!(p.rules[0].delay, DelaySpec::None),
+                "{} 必须解析成 DelaySpec::None",
+                spec
+            );
         }
     }
 
@@ -871,6 +954,24 @@ mod tests {
         assert!(!lint_hits(&["stop=64", "0=L:300-400,D:0,F:0"], "rule cycle"));
     }
 
+    /// `stop = u64::MAX` 时 lint 必须返回警告而不是在乘法上 panic（debug 构建
+    /// 下普通乘法会溢出回绕）。
+    #[test]
+    fn lint_survives_extreme_stop_without_panicking() {
+        let p = parse_traffic_script(&lines(&[
+            "stop=18446744073709551615",
+            "0=L:300-400,D:0,F:0",
+            "1=L:300-400,D:0,F:0",
+        ]))
+        .unwrap();
+        assert_eq!(p.stop, u64::MAX);
+        let warnings = lint_traffic_script(&p);
+        assert!(
+            warnings.iter().any(|w| w.contains("rule cycle")),
+            "stop=u64::MAX 必须产生周期警告而非 panic"
+        );
+    }
+
     #[test]
     fn lint_accepts_a_clean_script() {
         assert!(lint(&[
@@ -961,7 +1062,7 @@ mod tests {
             }
         }
         assert!(
-            parsed.stop * MAX_SCRIPT_CYCLES_DEN
+            parsed.stop.saturating_mul(MAX_SCRIPT_CYCLES_DEN)
                 <= parsed.rules.len() as u64 * MAX_SCRIPT_CYCLES_NUM,
             "stop={} 超出规则数的 1.5 倍",
             parsed.stop

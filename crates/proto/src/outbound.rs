@@ -33,36 +33,38 @@ impl DirectOutbound {
 
     async fn connect(&self, target: &Target) -> Result<TcpStream, anyhow::Error> {
         let addrs = resolve_remote_target(target).await?;
-
-        // 依次尝试所有放行地址。每个地址分到总预算的等份（下限 2 秒），因此
-        // 一个挂死的地址不会吃掉全部预算——connection refused / unreachable
-        // 这类快速失败则会立刻落到下一个地址。
-        let per_attempt = self
-            .connect_timeout
-            .checked_div(addrs.len() as u32)
-            .unwrap_or(self.connect_timeout)
-            .max(Duration::from_secs(2))
-            .min(self.connect_timeout);
         let deadline = tokio::time::Instant::now() + self.connect_timeout;
 
-        let mut last_err: Option<anyhow::Error> = None;
+        // Happy Eyeballs 竞速：全部放行地址同时发起连接，各自受**总**预算
+        // 约束（任务启动时按剩余时间计算，晚启动的任务拿到的份额更小），首个
+        // 成功即胜出，其余任务随 JoinSet 丢弃被中止。
+        //
+        // 此前的「每地址 time/addr数 等分、下限 2s」有两个病态：慢而可用的首
+        // 地址会在自己的份额内被砍掉（即使它比后续地址更快完成），而 2s 下限
+        // 在 ≥6 地址时耗尽总 deadline、最后几个地址永远轮不到。竞速同时解决
+        // 两者：快慢不再由解析顺序决定，任何地址都在总预算内有完整机会。
+        let mut races = tokio::task::JoinSet::new();
         for addr in &addrs {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match tokio::time::timeout(per_attempt.min(remaining), TcpStream::connect(*addr)).await
-            {
+            let addr = *addr;
+            races.spawn(async move {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                match tokio::time::timeout(remaining, TcpStream::connect(addr)).await {
+                    Ok(Ok(stream)) => Ok(stream),
+                    Ok(Err(e)) => Err(anyhow::anyhow!("direct connect to {} failed: {}", addr, e)),
+                    Err(_) => Err(anyhow::anyhow!("direct connect to {} timed out", addr)),
+                }
+            });
+        }
+
+        let mut last_err: Option<anyhow::Error> = None;
+        while let Some(joined) = races.join_next().await {
+            match joined {
                 Ok(Ok(remote)) => {
                     remote.set_nodelay(true)?;
                     return Ok(remote);
                 }
-                Ok(Err(e)) => {
-                    last_err = Some(anyhow::anyhow!("direct connect to {} failed: {}", addr, e));
-                }
-                Err(_) => {
-                    last_err = Some(anyhow::anyhow!("direct connect to {} timed out", addr));
-                }
+                Ok(Err(e)) => last_err = Some(e),
+                Err(e) => last_err = Some(anyhow::anyhow!("connect race task failed: {}", e)),
             }
         }
 
@@ -324,7 +326,11 @@ impl UdpRelay {
 /// 此前只返回首个放行地址，于是一个不可达的首地址（典型：配置了 IPv6 但
 /// 路由黑洞）会把整个连接拖满 connect_timeout 然后失败，尽管后面还有可用
 /// 的 IPv4 地址。
-async fn resolve_remote_target(target: &Target) -> Result<Vec<SocketAddr>, anyhow::Error> {
+///
+/// 成功时列表非空：全被阻断或解析失败都会以 Err 返回。socks5 UDP relay
+/// 地址的选择也走这里（`socks5_send_udp_associate`），保证两条路径共享
+/// 同一套目的地过滤口径。
+pub(crate) async fn resolve_remote_target(target: &Target) -> Result<Vec<SocketAddr>, anyhow::Error> {
     let check = |addr: SocketAddr| -> Result<Vec<SocketAddr>, anyhow::Error> {
         if is_blocked_destination(&addr) {
             anyhow::bail!("blocked destination: {}", addr);

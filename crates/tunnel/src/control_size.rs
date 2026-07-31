@@ -1,5 +1,4 @@
 use rand::prelude::*;
-use std::f64::consts::PI;
 
 use crate::common::{
     AEAD_TAG_LEN, BLOCK_LEN_PREFIX_SIZE, INNER_CONTENT_TYPE_LEN, MIN_DATA_WIRE_LEN,
@@ -146,23 +145,6 @@ const MERGED_SETTINGS_WU_LARGE_WIRE: usize = 58 + BLOCK_LEN_PREFIX_SIZE + CONTRO
 const MERGED_SETTINGS_ACK_WU_WIRE: usize = 22 + BLOCK_LEN_PREFIX_SIZE + CONTROL_TLS_OVERHEAD;
 const MERGED_PING_WU_WIRE: usize = 30 + BLOCK_LEN_PREFIX_SIZE + CONTROL_TLS_OVERHEAD;
 
-/// Handshake 态的加权抽样池，**已不在生产控制路径上**：开场序列改由
-/// `h2_opening_size` 确定性给出（见 `H2_OPENING_MAX_LEN`）。这里保留它是
-/// 为了不改动冻结的 `next_control_size(ConnectionState::Handshake, …)` 公开
-/// 接口语义——`crates/session` 正并发依赖该签名。若确认无外部调用方再传
-/// `Handshake`，本池连同 `HANDSHAKE_HEADERS_WEIGHT` 可整体退役。
-static HANDSHAKE_POOL_SIZES: [usize; 7] = [
-    SETTINGS_ACK_WIRE,
-    SETTINGS_SMALL_WIRE,
-    SETTINGS_LARGE_WIRE,
-    MERGED_SETTINGS_WU_SMALL_WIRE,
-    MERGED_SETTINGS_WU_LARGE_WIRE,
-    MERGED_SETTINGS_ACK_WU_WIRE,
-    WINDOW_UPDATE_WIRE,
-];
-
-static HANDSHAKE_POOL_WEIGHTS: [f64; 7] = [0.08, 0.25, 0.25, 0.14, 0.14, 0.10, 0.04];
-
 static TRANSPORT_POOL_SIZES: [usize; 5] = [
     WINDOW_UPDATE_WIRE,
     PING_WIRE,
@@ -172,7 +154,6 @@ static TRANSPORT_POOL_SIZES: [usize; 5] = [
 ];
 static TRANSPORT_POOL_WEIGHTS: [f64; 5] = [0.35, 0.25, 0.20, 0.10, 0.10];
 
-const HANDSHAKE_HEADERS_WEIGHT: f64 = 0.05;
 const TRANSPORT_HEADERS_WEIGHT: f64 = 0.10;
 
 /// 以与 `weights.iter().sum::<f64>()` 完全相同的顺序左折叠累加，因此常量
@@ -204,16 +185,6 @@ struct ControlPool {
     discrete_threshold: f64,
 }
 
-static HANDSHAKE_POOL: ControlPool = ControlPool {
-    sizes: &HANDSHAKE_POOL_SIZES,
-    weights: &HANDSHAKE_POOL_WEIGHTS,
-    weight_sum: sum_weights(&HANDSHAKE_POOL_WEIGHTS),
-    discrete_threshold: discrete_threshold(
-        sum_weights(&HANDSHAKE_POOL_WEIGHTS),
-        HANDSHAKE_HEADERS_WEIGHT,
-    ),
-};
-
 static TRANSPORT_POOL: ControlPool = ControlPool {
     sizes: &TRANSPORT_POOL_SIZES,
     weights: &TRANSPORT_POOL_WEIGHTS,
@@ -232,15 +203,12 @@ struct TruncatedNormal {
 }
 
 impl TruncatedNormal {
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
+    fn sample<R: Rng + ?Sized>(&self, _rng: &mut R) -> f64 {
         loop {
-            let u1: f64 = rng.gen_range(0.0..1.0);
-            let u2: f64 = rng.gen_range(0.0..1.0);
-            if u1 <= 0.0 {
-                continue;
-            }
-            let z = (-2.0_f64 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
-            let val = z * self.stddev + self.mean;
+            // Box-Muller 核心与 `utils::sample_log_normal` 共用（曾各存一份）；
+            // 此处不复用对数正态版本——截断正态的变换是 `z·stddev + mean`，
+            // 不取指数。
+            let val = self.mean + self.stddev * crate::utils::sample_standard_normal();
             if val >= self.lower && val <= self.upper {
                 return val;
             }
@@ -345,8 +313,10 @@ pub fn next_control_size(
     rng: &mut impl Rng,
 ) -> usize {
     let pool = match state {
-        ConnectionState::Handshake => &HANDSHAKE_POOL,
-        ConnectionState::Transport => &TRANSPORT_POOL,
+        // Handshake 态只是开场别名：开场序列完全由 `SnowyWriteHalf::
+        // next_control_size` 里的 `h2_opening_size` 逐条决定（见
+        // `H2_OPENING_MAX_LEN`），序列耗尽后一律与本池同分布。
+        ConnectionState::Handshake | ConnectionState::Transport => &TRANSPORT_POOL,
     };
 
     if rng.gen::<f64>() < pool.discrete_threshold {
@@ -389,19 +359,6 @@ mod tests {
     const _MPWU_CHECK: () = assert!(MERGED_PING_WU_WIRE == 54);
 
     #[test]
-    fn handshake_pool_excludes_ping() {
-        let pool = HANDSHAKE_POOL.sizes;
-        assert!(!pool.contains(&PING_WIRE));
-        assert!(!pool.contains(&MERGED_PING_WU_WIRE));
-        assert!(pool.contains(&SETTINGS_SMALL_WIRE));
-        assert!(pool.contains(&SETTINGS_LARGE_WIRE));
-        assert!(pool.contains(&SETTINGS_ACK_WIRE));
-        assert!(pool.contains(&MERGED_SETTINGS_WU_SMALL_WIRE));
-        assert!(pool.contains(&MERGED_SETTINGS_WU_LARGE_WIRE));
-        assert!(pool.contains(&MERGED_SETTINGS_ACK_WU_WIRE));
-    }
-
-    #[test]
     fn transport_pool_excludes_settings() {
         let pool = TRANSPORT_POOL.sizes;
         assert!(!pool.contains(&SETTINGS_SMALL_WIRE));
@@ -414,10 +371,10 @@ mod tests {
     }
 
     #[test]
-    fn next_control_size_handshake_returns_valid_sizes() {
+    fn next_control_size_transport_returns_valid_sizes() {
         let mut rng = rand::thread_rng();
         for _ in 0..500 {
-            let size = next_control_size(ConnectionState::Handshake, FlowDirection::C2S, &mut rng);
+            let size = next_control_size(ConnectionState::Transport, FlowDirection::S2C, &mut rng);
             assert!(size >= SETTINGS_ACK_WIRE, "size {} too small", size);
             assert!(
                 size <= 800 + BLOCK_LEN_PREFIX_SIZE + CONTROL_TLS_OVERHEAD,
@@ -427,15 +384,17 @@ mod tests {
         }
     }
 
+    // Handshake 态退役旧加权池后只是 Transport 的别名（开场序列由
+    // `h2_opening_size` 单独保证，见 `h2_opening_sequence_*`）：任何取值都
+    // 不得再携带 SETTINGS 尺寸——那是旧 HANDSHAKE_POOL 的支撑集。
     #[test]
-    fn next_control_size_transport_returns_valid_sizes() {
+    fn handshake_alias_never_produces_settings() {
         let mut rng = rand::thread_rng();
-        for _ in 0..500 {
-            let size = next_control_size(ConnectionState::Transport, FlowDirection::S2C, &mut rng);
-            assert!(size >= SETTINGS_ACK_WIRE, "size {} too small", size);
+        for _ in 0..2000 {
+            let size = next_control_size(ConnectionState::Handshake, FlowDirection::S2C, &mut rng);
             assert!(
-                size <= 800 + BLOCK_LEN_PREFIX_SIZE + CONTROL_TLS_OVERHEAD,
-                "size {} too large",
+                !is_settings_bearing_wire_size(size),
+                "handshake alias produced SETTINGS wire size {}",
                 size
             );
         }
@@ -493,19 +452,6 @@ mod tests {
     }
 
     #[test]
-    fn handshake_never_produces_ping() {
-        let mut rng = rand::thread_rng();
-        for _ in 0..2000 {
-            let size = next_control_size(ConnectionState::Handshake, FlowDirection::C2S, &mut rng);
-            assert_ne!(size, PING_WIRE, "handshake produced PING wire size");
-            assert_ne!(
-                size, MERGED_PING_WU_WIRE,
-                "handshake produced PING+WU wire size"
-            );
-        }
-    }
-
-    #[test]
     fn transport_never_produces_settings() {
         let mut rng = rand::thread_rng();
         for _ in 0..2000 {
@@ -533,25 +479,14 @@ mod tests {
     // 相等，否则采样分布会发生（微小但真实的）漂移。
     #[test]
     fn hoisted_weight_sums_are_bit_identical_to_runtime_sums() {
-        let handshake_runtime: f64 = HANDSHAKE_POOL_WEIGHTS.iter().sum();
         let transport_runtime: f64 = TRANSPORT_POOL_WEIGHTS.iter().sum();
-        assert_eq!(
-            HANDSHAKE_POOL.weight_sum.to_bits(),
-            handshake_runtime.to_bits()
-        );
         assert_eq!(
             TRANSPORT_POOL.weight_sum.to_bits(),
             transport_runtime.to_bits()
         );
 
-        let handshake_threshold =
-            1.0 - HANDSHAKE_HEADERS_WEIGHT / (handshake_runtime + HANDSHAKE_HEADERS_WEIGHT);
         let transport_threshold =
             1.0 - TRANSPORT_HEADERS_WEIGHT / (transport_runtime + TRANSPORT_HEADERS_WEIGHT);
-        assert_eq!(
-            HANDSHAKE_POOL.discrete_threshold.to_bits(),
-            handshake_threshold.to_bits()
-        );
         assert_eq!(
             TRANSPORT_POOL.discrete_threshold.to_bits(),
             transport_threshold.to_bits()
@@ -560,7 +495,6 @@ mod tests {
 
     #[test]
     fn pool_arrays_stay_aligned() {
-        assert_eq!(HANDSHAKE_POOL.sizes.len(), HANDSHAKE_POOL.weights.len());
         assert_eq!(TRANSPORT_POOL.sizes.len(), TRANSPORT_POOL.weights.len());
     }
 
@@ -736,7 +670,7 @@ mod tests {
             for _ in 0..2000 {
                 let wire = next_data_record_payload(direction, &mut rng) + MIN_DATA_WIRE_LEN;
                 assert!(
-                    !TRANSPORT_POOL_SIZES.contains(&wire) && !HANDSHAKE_POOL_SIZES.contains(&wire),
+                    !TRANSPORT_POOL_SIZES.contains(&wire),
                     "{:?} data record wire {} collides with a control pool size",
                     direction,
                     wire

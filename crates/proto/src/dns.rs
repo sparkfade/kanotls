@@ -83,6 +83,15 @@ fn store(key: String, addrs: Arc<[SocketAddr]>) {
     );
 }
 
+/// 测试专用：把一条解析结果直接写入缓存，绕开真实 DNS。
+///
+/// 依赖真实 DNS 顺序的测试（如「被阻断首地址回退到第二地址」）需要
+/// 固定解析结果；用唯一 host:port 作键，避免与同二进制内其他用例互相踩踏。
+#[cfg(test)]
+pub(crate) fn seed_for_test(host: &str, port: u16, addrs: Vec<SocketAddr>) {
+    store(format!("{}:{}", host, port), addrs.into());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

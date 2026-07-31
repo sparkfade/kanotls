@@ -686,11 +686,7 @@ impl AsyncRead for SnowyReadHalf {
                                 let data_range = if len
                                     >= BLOCK_LEN_PREFIX_SIZE + INNER_CONTENT_TYPE_LEN
                                 {
-                                    let data_len = u16::from_be_bytes([
-                                        this.decrypt_buf[0],
-                                        this.decrypt_buf[1],
-                                    ]) as usize;
-                                    let data_len = data_len
+                                    let data_len = prefix_data_len
                                         .min(len - BLOCK_LEN_PREFIX_SIZE - INNER_CONTENT_TYPE_LEN);
                                     BLOCK_LEN_PREFIX_SIZE..BLOCK_LEN_PREFIX_SIZE + data_len
                                 } else {

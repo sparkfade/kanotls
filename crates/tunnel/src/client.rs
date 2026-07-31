@@ -56,6 +56,71 @@ fn resolve_outer_client_fingerprint(fingerprint: Option<&str>) -> Option<&str> {
     fingerprint.map(str::trim)
 }
 
+/// [`client_tunnel`] 的失败分类。
+///
+/// # 为什么必须是类型而不是错误文案
+///
+/// `kanotls/src/connector.rs` 需要把「PSK / SNI 与服务器不匹配」从普通建连
+/// 失败里挑出来做只提示一次的诊断。此前用 `Error::to_string()` 的子串匹配
+/// 实现，而这正是服务器侧已经弃用的反模式（见 `ServerAcceptError` 的注释）：
+/// 任一条 `bail!` 的文案被改动就会静默失配，编译器不会给出任何提示。
+/// 改成类型化之后，新增失败路径必须显式选一个变体，漏选不会编译。
+#[derive(Debug)]
+pub enum TunnelConnectError {
+    /// 客户端收到了完整的真实 flight 却在其中找不到 Noise 响应——服务端
+    /// 拒绝认证后把这条连接交给了 fallback 透明中继。只可能是 PSK 不匹配，
+    /// 或 `tls.sni` 与服务端 `camouflage.host` 不一致。
+    AuthRejected(String),
+    /// 其余失败（连接被拒、超时、DNS、记录读取错误等），由连接池自身的
+    /// 告警承载。
+    Other(anyhow::Error),
+}
+
+impl TunnelConnectError {
+    fn auth_rejected(msg: impl Into<String>) -> Self {
+        Self::AuthRejected(msg.into())
+    }
+}
+
+impl std::fmt::Display for TunnelConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AuthRejected(msg) => std::fmt::Display::fmt(msg, f),
+            Self::Other(err) => std::fmt::Display::fmt(err, f),
+        }
+    }
+}
+
+impl std::error::Error for TunnelConnectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AuthRejected(_) => None,
+            Self::Other(err) => Some(err.as_ref()),
+        }
+    }
+}
+
+/// 未显式分类的 `?` 一律落到 `Other`，与 `ServerAcceptError` 的默认方向一致。
+impl From<anyhow::Error> for TunnelConnectError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Other(err)
+    }
+}
+
+/// `std::io::Error`（连接被拒、超时、DNS、读写失败）与 `snow::Error`（密钥
+/// 协商、加密）同样落 `Other`：这两类都不是「PSK / SNI 不匹配」的诊断。
+impl From<std::io::Error> for TunnelConnectError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Other(anyhow::Error::new(err))
+    }
+}
+
+impl From<snow::Error> for TunnelConnectError {
+    fn from(err: snow::Error) -> Self {
+        Self::Other(anyhow::Error::new(err))
+    }
+}
+
 pub async fn client_tunnel(
     server_addr: &str,
     sni: &str,
@@ -63,7 +128,7 @@ pub async fn client_tunnel(
     insecure: bool,
     fingerprint: Option<&str>,
     custom_template_bytes: Option<&[u8]>,
-) -> Result<SnowyStream, anyhow::Error> {
+) -> Result<SnowyStream, TunnelConnectError> {
     let mut tcp = TcpStream::connect(server_addr).await?;
     tcp.set_nodelay(true)?;
     let _ = apply_tcp_keepalive(&tcp);
@@ -76,7 +141,10 @@ pub async fn client_tunnel(
     let mut msg_buf = [0u8; 48];
     let init_len = noise.write_message(&[], &mut msg_buf)?;
     if init_len != 48 {
-        anyhow::bail!("unexpected Noise init length: {}", init_len);
+        return Err(TunnelConnectError::Other(anyhow::anyhow!(
+            "unexpected Noise init length: {}",
+            init_len
+        )));
     }
     let psk_e = &msg_buf[..48];
     let mut client_noise_tag = [0u8; 16];
@@ -125,7 +193,9 @@ pub async fn client_tunnel(
             0x16 => {
                 handshake_records += 1;
                 if handshake_records > CLIENT_HANDSHAKE_MAX_HANDSHAKE_RECORDS {
-                    anyhow::bail!("too many server handshake records before Noise response");
+                    return Err(TunnelConnectError::auth_rejected(
+                        "too many server handshake records before Noise response",
+                    ));
                 }
                 if is_server_hello(record) {
                     found_server_hello = true;
@@ -134,17 +204,19 @@ pub async fn client_tunnel(
             0x14 => {
                 ccs_records += 1;
                 if ccs_records > CLIENT_HANDSHAKE_MAX_CCS_RECORDS {
-                    anyhow::bail!("too many server CCS records before Noise response");
+                    return Err(TunnelConnectError::auth_rejected(
+                        "too many server CCS records before Noise response",
+                    ));
                 }
             }
             0x17 => {
                 if found_server_hello {
                     app_data_probes += 1;
                     if app_data_probes > CLIENT_HANDSHAKE_MAX_APP_DATA_PROBES {
-                        anyhow::bail!(
+                        return Err(TunnelConnectError::auth_rejected(format!(
                             "failed to locate Noise response within {} application-data records",
                             CLIENT_HANDSHAKE_MAX_APP_DATA_PROBES
-                        );
+                        )));
                     }
                     if payload.len() < 32 {
                         debug!(
@@ -179,10 +251,17 @@ pub async fn client_tunnel(
                         }
                     }
                 } else {
-                    anyhow::bail!("server sent application data before ServerHello");
+                    return Err(TunnelConnectError::Other(anyhow::anyhow!(
+                        "server sent application data before ServerHello"
+                    )));
                 }
             }
-            _ => anyhow::bail!("unexpected server handshake record type: {:#x}", typ),
+            _ => {
+                return Err(TunnelConnectError::Other(anyhow::anyhow!(
+                    "unexpected server handshake record type: {:#x}",
+                    typ
+                )))
+            }
         }
     }
 
@@ -202,7 +281,11 @@ pub async fn client_tunnel(
                     .map_err(|e| anyhow::anyhow!("ghost drain record {}: {}", i, e))?;
 
             if typ != 0x17 {
-                anyhow::bail!("expected 0x17 ghost record {}, got type {:#x}", i, typ);
+                return Err(TunnelConnectError::Other(anyhow::anyhow!(
+                    "expected 0x17 ghost record {}, got type {:#x}",
+                    i,
+                    typ
+                )));
             }
             debug!(
                 "drained ghost 0x17 record {}/{} ({} bytes)",

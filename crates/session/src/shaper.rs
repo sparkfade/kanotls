@@ -1,4 +1,5 @@
 use kanotls_config::script::{parse_traffic_script, DelaySpec, ParsedScript, ScriptRule};
+use kanotls_tunnel::utils::sample_log_normal;
 use kanotls_tunnel::{FlowDirection, SnowyStream};
 use std::time::Duration;
 
@@ -186,7 +187,7 @@ pub(crate) struct TrafficShaper {
 ///   `SETTINGS + WINDOW_UPDATE + SETTINGS-ACK`，客户端再回 `SETTINGS-ACK`；
 /// * 连接生命周期——`Session` 的合成 H2 请求/响应交换（HEADERS 尺寸的请求换
 ///   响应尺寸的应答），即论文所称的 "synthetic co-existing flows"；
-/// * 消费字节驱动的 `WINDOW_UPDATE` 与空闲驱动的 `PING`（既有骨架）。
+/// * 消费字节驱动的 `WINDOW_UPDATE`（既有骨架）。
 ///
 /// `ScriptRule::expect_responses` / `fake_jitter` 仍是配置层的公开字段，用户脚本
 /// 显式写 `F:n` 时行为不变——只是默认不再使用。
@@ -196,6 +197,7 @@ fn embedded_script() -> ParsedScript {
             ScriptRule {
                 len_lo: 200,
                 len_hi: 250,
+                len_pinned: false,
                 delay: DelaySpec::None,
                 expect_responses: 0,
                 fake_jitter: 0,
@@ -203,6 +205,7 @@ fn embedded_script() -> ParsedScript {
             ScriptRule {
                 len_lo: 180,
                 len_hi: 220,
+                len_pinned: false,
                 delay: DelaySpec::LogNormal {
                     mu_ms: 1.5_f64.ln(),
                     sigma_ms: 0.6,
@@ -213,6 +216,7 @@ fn embedded_script() -> ParsedScript {
             ScriptRule {
                 len_lo: 250,
                 len_hi: 350,
+                len_pinned: false,
                 delay: DelaySpec::None,
                 expect_responses: 0,
                 fake_jitter: 0,
@@ -220,6 +224,7 @@ fn embedded_script() -> ParsedScript {
             ScriptRule {
                 len_lo: 300,
                 len_hi: 400,
+                len_pinned: false,
                 delay: DelaySpec::LogNormal {
                     mu_ms: 2.0_f64.ln(),
                     sigma_ms: 0.5,
@@ -230,6 +235,7 @@ fn embedded_script() -> ParsedScript {
             ScriptRule {
                 len_lo: 200,
                 len_hi: 300,
+                len_pinned: false,
                 delay: DelaySpec::None,
                 expect_responses: 0,
                 fake_jitter: 0,
@@ -237,6 +243,7 @@ fn embedded_script() -> ParsedScript {
             ScriptRule {
                 len_lo: 400,
                 len_hi: 600,
+                len_pinned: false,
                 delay: DelaySpec::LogNormal {
                     mu_ms: 3.0_f64.ln(),
                     sigma_ms: 0.7,
@@ -360,7 +367,7 @@ impl TrafficShaper {
         if pending_len >= BULK_FAST_PATH_THRESHOLD || pending_len >= cap {
             self.state = MacroState::AsymmetricBulk;
             self.bulk_run = true;
-            return ShapePolicy {
+            let mut policy = ShapePolicy {
                 target_wire_len: SnowyStream::max_data_record_wire_len(),
                 delay: Duration::ZERO,
                 fake: None,
@@ -368,6 +375,8 @@ impl TrafficShaper {
                 allow_full_block: true,
                 quiet_gap: false,
             };
+            self.release_due_fakes(&mut policy);
+            return policy;
         }
 
         // Bulk hysteresis: the tail of a bulk burst goes out at its exact
@@ -377,7 +386,7 @@ impl TrafficShaper {
         if self.bulk_run && self.state == MacroState::AsymmetricBulk && pending_len < cap {
             self.state = MacroState::InteractiveControl;
             self.bulk_run = false;
-            return ShapePolicy {
+            let mut policy = ShapePolicy {
                 target_wire_len: SnowyStream::data_record_wire_len(pending_len),
                 delay: Duration::ZERO,
                 fake: None,
@@ -385,6 +394,8 @@ impl TrafficShaper {
                 allow_full_block: false,
                 quiet_gap: false,
             };
+            self.release_due_fakes(&mut policy);
+            return policy;
         }
 
         // post_script_shaping = "off": once the script is exhausted, emit
@@ -443,6 +454,10 @@ impl TrafficShaper {
             .as_ref()
             .map(|f| f.responses as u16)
             .unwrap_or(0);
+        // 注意：队列**不保证**按 target 单调——`packet_seq + offset` 里的
+        // offset 每条规则独立采样，后入队的条目可能带更小的 target，因此到期
+        // 条目可能排在未到期条目之后，不能只截断队首。队列长度受解析器
+        // `MAX_FAKE_JITTER_OFFSET` 上界约束，这里全量扫描、只保留未到期项。
         let mut retained = std::collections::VecDeque::new();
         for (target, responses) in self.deferred_fakes.drain(..) {
             if past_script || seq >= target {
@@ -638,21 +653,6 @@ fn delay_from_spec(spec: &DelaySpec) -> Duration {
     }
 }
 
-fn sample_log_normal(mu: f64, sigma: f64) -> f64 {
-    use rand::Rng;
-    use std::f64::consts::PI;
-    let mut rng = rand::thread_rng();
-    loop {
-        let u1: f64 = rng.gen_range(0.0..1.0);
-        let u2: f64 = rng.gen_range(0.0..1.0);
-        if u1 <= 0.0 {
-            continue;
-        }
-        let z = (-2.0_f64 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
-        return (mu + sigma * z).exp();
-    }
-}
-
 /// Per-connection randomization pass over a built script: rotate the rule
 /// order by a random offset, then scale every rule's length window by an
 /// independent U[SCRIPT_LEN_SCALE_LO, SCRIPT_LEN_SCALE_HI] sample (clamped
@@ -677,8 +677,17 @@ fn randomize_script(script: &mut [ScriptRule]) {
     let cap = SnowyStream::data_record_capacity();
     for rule in script.iter_mut() {
         let scale = rng.gen_range(SCRIPT_LEN_SCALE_LO..=SCRIPT_LEN_SCALE_HI);
-        let lo = (rule.len_lo as f64 * scale) as usize;
-        let hi = (rule.len_hi as f64 * scale) as usize;
+        // `?` 规则：窗口在此处每连接坍缩一次成固定值——这正是「连接生命周期
+        // 内固定」语义的实现点（parse 保持确定性，见 `ScriptRule::len_pinned`）。
+        // 坍缩后与普通规则一样再缩放，分布等价于 (base + U[0, range]) × scale。
+        let (lo, hi) = if rule.len_pinned {
+            let fixed = rng.gen_range(rule.len_lo..=rule.len_hi);
+            (fixed, fixed)
+        } else {
+            (rule.len_lo, rule.len_hi)
+        };
+        let lo = (lo as f64 * scale) as usize;
+        let hi = (hi as f64 * scale) as usize;
         rule.len_lo = lo.max(1).min(cap);
         rule.len_hi = hi.max(rule.len_lo).min(cap);
 
@@ -698,13 +707,19 @@ mod tests {
 
     #[test]
     fn question_mark_value_stable_across_policies() {
-        // A `?` rule is fixed at parse time: repeated policy calls must
-        // yield the same target wire length.
+        // A `?` rule collapses once per connection at randomize time: after
+        // construction the window is a fixed point, and repeated policy calls
+        // must yield the same target wire length.
         // stop=8：跳过首发记录后仍有充足的脚本包数，两次查询都走脚本。
         let mut shaper = TrafficShaper::new(
             FlowDirection::C2S,
             Some(&lines(&["stop=8", "0=L:100?50"])),
             false,
+        );
+        assert_eq!(
+            shaper.script[0].len_lo,
+            shaper.script[0].len_hi,
+            "? 规则必须在 randomize 期坍缩成固定值"
         );
         shaper.skip_first_flight();
         let first = shaper.next_data_policy(50);

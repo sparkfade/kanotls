@@ -60,7 +60,7 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
         .session
         .as_ref()
         .map(|s| s.idle_timeout_secs)
-        .unwrap_or(45)
+        .unwrap_or(75)
         .clamp(MIN_CLIENT_IDLE_TIMEOUT_SECS, MAX_CLIENT_IDLE_TIMEOUT_SECS);
     let install_salt: [u8; 16] = rand::random();
     let traffic_script = outbound

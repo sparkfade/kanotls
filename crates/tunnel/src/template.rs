@@ -11,8 +11,8 @@ use crate::fp;
 use crate::templates;
 use crate::utils::{
     client_hello_random_and_session_id_ranges, derive_counter_mac, derive_counter_mask,
-    extract_client_hello_random_and_session_id, is_grease_value, mask_noise_ephemeral_key,
-    xor_u64_bytes, ECH_EXTENSION_TYPE, GREASE_VALUES,
+    ech_variable_field_ranges, extract_client_hello_random_and_session_id, is_grease_value,
+    mask_noise_ephemeral_key, xor_u64_bytes, ECH_EXTENSION_TYPE, GREASE_VALUES,
 };
 
 lazy_static! {
@@ -161,12 +161,24 @@ impl ClientHelloTemplate {
                         }
                     } else if !share_data.is_empty() && share_data[0] == 0x04 {
                         // 其他 0x04 前缀（P-384 97 B / P-521 133 B）只出现在
-                        // 自定义模板里；ring 不提供 P-521，这里仍是随机填充，
-                        // 因此这类份额也不是合法曲线点。内嵌 Firefox 预设不
-                        // 走这条分支，留作已知缺口。
-                        rng.fill_bytes(&mut share_data[1..]);
+                        // 自定义模板里；ring 不提供这两条曲线，无法生成合法点。
+                        // 加载期校验（`validate_auxiliary_key_share_shapes`）
+                        // 已拒绝这类模板，这里是同一道保险：任何绕过校验的
+                        // 模板都 fail closed——随机字节几乎必定不是合法曲线点，
+                        // 做点校验的服务器会回 illegal_parameter、DPI 验一次
+                        // 曲线方程即可零误报命中，与 P-256 分支此前消除的判别
+                        // 器同类。
+                        anyhow::bail!(
+                            "unsupported {}0x04-prefixed auxiliary key_share (only 65-byte \
+                             P-256 is supported)",
+                            share_data.len()
+                        );
                     } else {
-                        rng.fill_bytes(share_data);
+                        anyhow::bail!(
+                            "unsupported auxiliary key_share shape ({} bytes; supported: \
+                             1216-byte X25519MLKEM768 hybrid, 65-byte 0x04 P-256)",
+                            share_data.len()
+                        );
                     }
                 }
             }
@@ -401,6 +413,7 @@ fn build_client_hello_template(
         layout = parse_client_hello_layout(&bytes)?;
     }
     validate_padding_extension_zero(&bytes, &layout.extensions_len_range)?;
+    validate_auxiliary_key_share_shapes(&bytes, &layout.auxiliary_key_share_ranges)?;
 
     let session_len = layout.session_id_range.end - layout.session_id_range.start;
     if session_len < 32 {
@@ -903,6 +916,33 @@ fn parse_client_hello_layout(bytes: &[u8]) -> anyhow::Result<ClientHelloLayout> 
     })
 }
 
+/// 辅助 key_share 只允许两种可以**保真刷新**的形状：1216 字节的
+/// X25519MLKEM768 混合份额（ML-KEM 系数密装 + 32 字节 X25519）与 65 字节
+/// 0x04 前缀的 P-256 SEC1 点。其余形状（P-384 97 B / P-521 133 B 等，只出现
+/// 在自定义模板里）ring 无法生成合法曲线点，随机填充会留下「非法曲线点」
+/// 判别器——做点校验的服务器回 illegal_parameter，DPI 验一次曲线方程即可
+/// 零误报命中，与 P-256 分支刚消除的同类。与 §2.3「不支持的组 fail closed」
+/// 同一政策：操作员在启动时（或模板热重载时）拿到错误，而不是把带特征的
+/// 模板发上线。
+fn validate_auxiliary_key_share_shapes(
+    bytes: &[u8],
+    ranges: &[Range<usize>],
+) -> anyhow::Result<()> {
+    for range in ranges {
+        let share = &bytes[range.clone()];
+        let supported = share.len() == 1216
+            || (share.len() == 65 && !share.is_empty() && share[0] == 0x04);
+        if !supported {
+            anyhow::bail!(
+                "unsupported auxiliary key_share ({} bytes; supported: 1216-byte \
+                 X25519MLKEM768 hybrid, 65-byte 0x04 P-256)",
+                share.len()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// 定位 GREASE ECH 里三个必须逐连接刷新的字段。
 ///
 /// ECHClientHello（draft-ietf-tls-esni §5）：
@@ -916,9 +956,10 @@ fn parse_client_hello_layout(bytes: &[u8]) -> anyhow::Result<ClientHelloLayout> 
 /// 捕获模板：`1 + 4 + 1 + (2+32) + (2+239) = 281` 字节，与 extension_length
 /// 精确吻合。
 ///
-/// 解析失败即 `Err`（fail closed）：一个我们无法刷新的 ECH 扩展会被逐字节重放
-/// 到每条连接上，那正是 §2.3 所说的跨连接常量。让操作员在启动时就拿到错误，
-/// 而不是把这份指纹发上线。
+/// 布局解析由 `utils::ech_variable_field_ranges` 提供（与指纹归一化共用，避免
+/// 两侧手动同步漂移）；本函数只做调用方语义：inner(1) 类型 fail closed —— 一个
+/// 我们无法刷新的 ECH 扩展会被逐字节重放到每条连接上，那正是 §2.3 所说的
+/// 跨连接常量。让操作员在启动时就拿到错误，而不是把这份指纹发上线。
 fn parse_ech_grease_ranges(
     bytes: &[u8],
     data_start: usize,
@@ -934,30 +975,14 @@ fn parse_ech_grease_ranges(
             bytes[data_start]
         );
     }
-    if data_end - data_start < 8 {
-        anyhow::bail!("truncated encrypted_client_hello extension");
-    }
-    let config_id = data_start + 5;
-    let enc_len = read_u16(bytes, data_start + 6)? as usize;
-    let enc_start = data_start + 8;
-    let enc_end = enc_start + enc_len;
-    if enc_end + 2 > data_end {
-        anyhow::bail!("truncated encrypted_client_hello enc field");
-    }
-    let payload_len = read_u16(bytes, enc_end)? as usize;
-    let payload_start = enc_end + 2;
-    let payload_end = payload_start + payload_len;
-    if payload_end != data_end {
-        anyhow::bail!(
-            "encrypted_client_hello payload length {} does not fill extension_data ({} bytes left)",
-            payload_len,
-            data_end.saturating_sub(payload_start)
-        );
-    }
+    let Some((config_id, enc, payload)) = ech_variable_field_ranges(bytes, data_start..data_end)
+    else {
+        anyhow::bail!("malformed encrypted_client_hello extension");
+    };
     Ok(EchGreaseRanges {
         config_id,
-        enc: enc_start..enc_end,
-        payload: payload_start..payload_end,
+        enc,
+        payload,
     })
 }
 
@@ -1913,6 +1938,40 @@ mod tests {
         }
 
         values
+    }
+
+    #[test]
+    fn auxiliary_key_share_shapes_are_validated_at_load_time() {
+        // 65 字节 0x04（P-256）与 1216 字节（X25519MLKEM768 混合）是仅有的
+        // 合法形状。
+        let mut p256 = [0u8; 65];
+        p256[0] = 0x04;
+        let ranges = vec![Range { start: 0, end: 65 }];
+        assert!(validate_auxiliary_key_share_shapes(&p256, &ranges).is_ok());
+        let ranges = vec![Range { start: 0, end: 1216 }];
+        assert!(validate_auxiliary_key_share_shapes(&[0u8; 1216], &ranges).is_ok());
+
+        // P-384（97 B）/ P-521（133 B）0x04 前缀份额：ring 无法生成合法点，
+        // 必须 fail closed，绝不随机填充。
+        for len in [97usize, 133] {
+            let mut share = vec![0u8; len];
+            share[0] = 0x04;
+            let ranges = vec![Range { start: 0, end: len }];
+            assert!(
+                validate_auxiliary_key_share_shapes(&share, &ranges).is_err(),
+                "{}0x04-prefixed share (P-384/P-521) must be rejected",
+                len
+            );
+        }
+
+        // 65 字节但非 0x04 前缀，以及未知形状：同样拒绝。
+        let mut not_sec1 = [0u8; 65];
+        not_sec1[0] = 0x03;
+        let ranges = vec![Range { start: 0, end: 65 }];
+        assert!(validate_auxiliary_key_share_shapes(&not_sec1, &ranges).is_err());
+        let ranges = vec![Range { start: 0, end: 32 }];
+        assert!(validate_auxiliary_key_share_shapes(&[0u8; 32], &ranges).is_err());
+        assert!(validate_auxiliary_key_share_shapes(&[], &[]).is_ok());
     }
 
     #[test]
