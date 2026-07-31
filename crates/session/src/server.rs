@@ -1,9 +1,9 @@
-use bytes::Bytes;
 use crate::frame::{Frame, CMD_SYNACK};
 use crate::session::{
     register_stream_locked, unregister_stream_locked, BufferedPayload, PendingAcceptFlushResult,
     PendingData, Session, SessionConfig, StreamHandle, TrafficClass,
 };
+use bytes::Bytes;
 use kanotls_tunnel::SnowyStream;
 use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;

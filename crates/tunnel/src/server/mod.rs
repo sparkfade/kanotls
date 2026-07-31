@@ -186,7 +186,8 @@ fn authenticate_client_hello(
         // `check_counter_replay`（会 bump LRU 顺序）与 `is_replay`（命中即
         // 写入 REPLAY_CACHE）的调用条件集合也与重排前完全相同：两者仍然
         // 只在「MAC 通过且 Noise 通过」时被调用，因此副作用的次数与时机不变。
-        let want_mac = derive_counter_mac(derived_psk, &random_copy, &masked_counter, random_prefix);
+        let want_mac =
+            derive_counter_mac(derived_psk, &random_copy, &masked_counter, random_prefix);
         let mut want_mac_masked = want_mac;
         mask_mac_flags(&mut want_mac_masked);
         if !constant_time_eq(&got_mac, &want_mac_masked) {
@@ -465,12 +466,9 @@ pub(super) async fn consume_client_flight3_ghost(
     // of the first upload TLS record that may immediately follow Flight 3.
     let mut total_read = 0usize;
     while total_read < minimum_needed {
-        let n = tokio::time::timeout_at(
-            deadline,
-            tcp.read(&mut wire[total_read..minimum_needed]),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("timeout reading client Flight 3 ghost"))??;
+        let n = tokio::time::timeout_at(deadline, tcp.read(&mut wire[total_read..minimum_needed]))
+            .await
+            .map_err(|_| anyhow::anyhow!("timeout reading client Flight 3 ghost"))??;
         if n == 0 {
             anyhow::bail!("unexpected eof reading client Flight 3 ghost");
         }
@@ -1204,7 +1202,10 @@ mod tests {
         let profile = sample_camouflage_profile(&CamouflageProfilePool {
             profiles: vec![
                 pooled(test_camouflage_profile(vec![0x16, 0x03, 0x03], vec![])),
-                pooled(test_camouflage_profile(vec![0x16, 0x03, 0x03], vec![53, 1024])),
+                pooled(test_camouflage_profile(
+                    vec![0x16, 0x03, 0x03],
+                    vec![53, 1024],
+                )),
                 pooled(test_camouflage_profile(vec![], vec![90])),
             ]
             .into_iter()
@@ -1514,9 +1515,10 @@ mod tests {
             .await
             .is_none());
 
-        let profile = lookup_cached_profile_for_client_hello("probe-only.example", 443, &client_hello)
-            .await
-            .expect("probe fallback remains visible");
+        let profile =
+            lookup_cached_profile_for_client_hello("probe-only.example", 443, &client_hello)
+                .await
+                .expect("probe fallback remains visible");
         assert_eq!(&*profile.app_data_sizes, &[53, 90][..]);
     }
 
@@ -1570,18 +1572,24 @@ mod tests {
     /// 记录尺寸分布。
     #[test]
     fn fallback_noise_response_len_reuses_largest_sample_or_minimum() {
-        use crate::common::MIN_NOISE_RESPONSE_RECORD_LEN;
         use super::camouflage::fallback_noise_response_record_len;
+        use crate::common::MIN_NOISE_RESPONSE_RECORD_LEN;
 
         // 有可承载 Noise 响应的采样：复用最大尺寸（主分支，含上限钳制）。
         assert_eq!(fallback_noise_response_record_len(&[23, 200]), 200);
         assert_eq!(fallback_noise_response_record_len(&[23, 20_000]), 16_401);
 
         // 采样存在但都太小：钳到最小可用值，而不是随机。
-        assert_eq!(fallback_noise_response_record_len(&[23, 31]), MIN_NOISE_RESPONSE_RECORD_LEN);
+        assert_eq!(
+            fallback_noise_response_record_len(&[23, 31]),
+            MIN_NOISE_RESPONSE_RECORD_LEN
+        );
 
         // 完全没有采样：最小可用值。
-        assert_eq!(fallback_noise_response_record_len(&[]), MIN_NOISE_RESPONSE_RECORD_LEN);
+        assert_eq!(
+            fallback_noise_response_record_len(&[]),
+            MIN_NOISE_RESPONSE_RECORD_LEN
+        );
 
         // 固定点：多轮调用结果必须完全一致。
         let results: std::collections::HashSet<usize> = (0..64)
@@ -1614,9 +1622,7 @@ mod tests {
             let (mut client, server) = connected_tcp_pair().await;
             let psks = test_psks(b"test-psk");
             let server_task =
-                tokio::spawn(
-                    async move { server_accept(server, &psks, "localhost", 443).await },
-                );
+                tokio::spawn(async move { server_accept(server, &psks, "localhost", 443).await });
 
             client.write_all(&initial_record).await.unwrap();
 
@@ -1957,7 +1963,9 @@ mod tests {
         let counter = ConnectionCounter::new();
         let template =
             get_or_build_client_hello_template("example.com", Some("firefox"), None, true).unwrap();
-        template.instantiate(psk, &noise_init, counter.next()).unwrap()
+        template
+            .instantiate(psk, &noise_init, counter.next())
+            .unwrap()
     }
 
     #[test]

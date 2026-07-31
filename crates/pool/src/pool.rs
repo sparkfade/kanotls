@@ -501,7 +501,8 @@ impl<C: TunnelConnector> PoolInner<C> {
 
         let stream_target = self.streams_per_connection_target();
         let demand_streams = waiters.saturating_add(total_active_streams).max(1);
-        let desired = demand_streams.saturating_add(stream_target.saturating_sub(1)) / stream_target;
+        let desired =
+            demand_streams.saturating_add(stream_target.saturating_sub(1)) / stream_target;
 
         if active_connections == 0 {
             return desired.min(1).min(self.target_pool_size);
@@ -1586,7 +1587,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(80)).await;
 
         let snapshot = pool.snapshot().await;
-        assert_eq!(snapshot.live, 1, "cold start must not open parallel tunnels");
+        assert_eq!(
+            snapshot.live, 1,
+            "cold start must not open parallel tunnels"
+        );
         assert_eq!(snapshot.pending_spawns, 0);
         assert_eq!(connector.sessions().await.len(), 1);
         pool.inner.acquire_waiters.store(0, Ordering::Relaxed);

@@ -57,9 +57,8 @@ pub(super) const TLS11_DOWNGRADE_SENTINEL: [u8; 8] =
 /// RFC 8446 §4.1.3：HelloRetryRequest 的 ServerHello.random 固定为
 /// SHA-256("HelloRetryRequest")。
 pub(super) const HELLO_RETRY_REQUEST_RANDOM: [u8; 32] = [
-    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8,
-    0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8,
-    0x33, 0x9c,
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
 ];
 
 /// 判断一条 0x16 记录是否为 HelloRetryRequest（handshake type 0x02 且
@@ -231,7 +230,11 @@ pub(super) fn merge_camouflage_profile(
 /// flight。任何未来路径都不允许把单条记录当作「完整」profile 提供。
 pub(super) fn camouflage_profile_rank(profile: &CamouflageProfile) -> u8 {
     if profile.server_records.is_empty() {
-        return if profile.app_data_sizes.is_empty() { 0 } else { 1 };
+        return if profile.app_data_sizes.is_empty() {
+            0
+        } else {
+            1
+        };
     }
     if profile.app_data_sizes.len() <= 1 {
         return 2;
@@ -429,9 +432,7 @@ pub(super) fn patch_server_hello_key_share(server_records: &mut [u8]) -> bool {
     let key_exchange = &mut server_records[range];
 
     match group {
-        X25519 if key_exchange.len() == 32 => {
-            crate::template::fill_x25519_public_key(key_exchange)
-        }
+        X25519 if key_exchange.len() == 32 => crate::template::fill_x25519_public_key(key_exchange),
         SECP256R1 if key_exchange.len() == 65 => {
             // Must be a real curve point — random bytes fail point validation.
             crate::template::fill_p256_public_key(key_exchange)
@@ -933,7 +934,11 @@ pub(super) async fn establish_synthetic_camouflage_tunnel(
 pub(super) fn replay_gap_before_us(profile: &CamouflageProfile, idx: usize) -> u32 {
     match idx.checked_sub(1) {
         None => profile.first_app_data_delay_us,
-        Some(prev) => profile.early_app_data_gap_us.get(prev).copied().unwrap_or(0),
+        Some(prev) => profile
+            .early_app_data_gap_us
+            .get(prev)
+            .copied()
+            .unwrap_or(0),
     }
 }
 
@@ -1382,9 +1387,8 @@ pub(super) async fn read_camouflage_server_records(
                         first_app_data_delay_us = Some(
                             server_hello_seen
                                 .map(|seen| {
-                                    now.duration_since(seen)
-                                        .as_micros()
-                                        .min(u32::MAX as u128) as u32
+                                    now.duration_since(seen).as_micros().min(u32::MAX as u128)
+                                        as u32
                                 })
                                 .unwrap_or(0),
                         );
@@ -1526,10 +1530,10 @@ mod tests {
             .instantiate(&[9u8; 32], &[7u8; 48], 42)
             .expect("client ClientHello");
 
-        let probe_fp = crate::utils::stable_client_hello_fingerprint(&probe)
-            .expect("probe fingerprint");
-        let client_fp = crate::utils::stable_client_hello_fingerprint(&client_ch)
-            .expect("client fingerprint");
+        let probe_fp =
+            crate::utils::stable_client_hello_fingerprint(&probe).expect("probe fingerprint");
+        let client_fp =
+            crate::utils::stable_client_hello_fingerprint(&client_ch).expect("client fingerprint");
         assert_eq!(
             probe_fp, client_fp,
             "探针 CH 与客户端 Firefox CH 的稳定指纹必须一致"

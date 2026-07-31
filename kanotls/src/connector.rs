@@ -87,7 +87,10 @@ impl TunnelConnector for KanotlsConnector {
 /// （连接被拒、超时、DNS 失败）由池自己的 `pooled tunnel connection failed`
 /// 告警承载，不在此重复。
 fn report_auth_misconfiguration(err: &kanotls_tunnel::client::TunnelConnectError, sni: &str) {
-    if !matches!(err, kanotls_tunnel::client::TunnelConnectError::AuthRejected(_)) {
+    if !matches!(
+        err,
+        kanotls_tunnel::client::TunnelConnectError::AuthRejected(_)
+    ) {
         return;
     }
     if AUTH_MISCONFIG_REPORTED.swap(true, Ordering::Relaxed) {

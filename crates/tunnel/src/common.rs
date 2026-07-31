@@ -429,7 +429,11 @@ impl SnowyStream {
         self.write.prepare_control_record(payload, target_wire_len)
     }
 
-    pub fn prepare_data_record(&mut self, payload: &[u8], target_wire_len: usize) -> io::Result<()> {
+    pub fn prepare_data_record(
+        &mut self,
+        payload: &[u8],
+        target_wire_len: usize,
+    ) -> io::Result<()> {
         self.write.prepare_data_record(payload, target_wire_len)
     }
 
@@ -528,7 +532,11 @@ impl SnowyWriteHalf {
     ///
     /// `payload` must not exceed `BLOCK_DATA_CAPACITY`; the caller (the slicer)
     /// is responsible for chunking larger buffers.
-    pub fn prepare_data_record(&mut self, payload: &[u8], target_wire_len: usize) -> io::Result<()> {
+    pub fn prepare_data_record(
+        &mut self,
+        payload: &[u8],
+        target_wire_len: usize,
+    ) -> io::Result<()> {
         debug_assert!(payload.len() <= BLOCK_DATA_CAPACITY);
         let target_plaintext_len = target_wire_len
             .saturating_sub(TLS_RECORD_HEADER_LEN + AEAD_TAG_LEN)
@@ -1347,8 +1355,7 @@ mod stateless_equivalence_tests {
                     block[pad_start..pad_end].fill(0);
                 }
                 block[..BLOCK_LEN_PREFIX_SIZE].copy_from_slice(&(pt.len() as u16).to_be_bytes());
-                block[BLOCK_LEN_PREFIX_SIZE..BLOCK_LEN_PREFIX_SIZE + pt.len()]
-                    .copy_from_slice(&pt);
+                block[BLOCK_LEN_PREFIX_SIZE..BLOCK_LEN_PREFIX_SIZE + pt.len()].copy_from_slice(&pt);
                 block[target_plaintext_len - 1] = INNER_CONTENT_TYPE_APP_DATA;
             }
             let ct_len = target_plaintext_len + AEAD_TAG_LEN;

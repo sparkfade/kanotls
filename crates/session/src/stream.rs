@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use crate::frame::{coalesce_encoded_frames, encode_psh_frames, Frame, MAX_PAYLOAD_LEN};
 use crate::session::{
     mark_stream_read_closed_locked, peer_never_processed, remember_closing_stream_sync,
@@ -6,6 +5,7 @@ use crate::session::{
     SharedTunnelWriter, StreamHandle, TrafficClass, WindowState,
 };
 use anyhow::Error;
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize};
 use std::sync::Arc;
@@ -776,9 +776,9 @@ impl Stream {
                     // 收到过 SYNACK 的流必然 ≤ 水位）。读循环先处理完 GOAWAY 帧
                     // 才清空 streams 映射、丢掉这里的 synack 发送端，所以此刻
                     // 判据必已就绪。
-                    let err = self.goaway_retry_error().unwrap_or_else(|| {
-                        anyhow::anyhow!("stream closed before SYNACK")
-                    });
+                    let err = self
+                        .goaway_retry_error()
+                        .unwrap_or_else(|| anyhow::anyhow!("stream closed before SYNACK"));
                     return Err(self.mark_open_failed(err, false));
                 }
                 Err(_) => {

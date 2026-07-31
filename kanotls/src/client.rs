@@ -80,10 +80,9 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
         traffic_script,
         post_script_off,
     );
-    let fingerprint_family = kanotls_config::normalize_tls_fingerprint(
-        fingerprint.as_deref().unwrap_or("firefox"),
-    )
-    .unwrap_or("firefox");
+    let fingerprint_family =
+        kanotls_config::normalize_tls_fingerprint(fingerprint.as_deref().unwrap_or("firefox"))
+            .unwrap_or("firefox");
     let pool = Arc::new(TunnelPool::new(
         session_config.clone(),
         PoolBehaviorConfig::from_psk(password.as_bytes(), &install_salt),
@@ -195,7 +194,8 @@ pub async fn run_client(config_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_client_routing_runtime(config: &ClientConfig) -> anyhow::Result<()> {    // 配置校验已保证 outbounds 非空。
+fn validate_client_routing_runtime(config: &ClientConfig) -> anyhow::Result<()> {
+    // 配置校验已保证 outbounds 非空。
     let first_tag = config.outbounds[0].tag.as_deref();
 
     for rule in config

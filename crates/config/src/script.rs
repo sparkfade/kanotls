@@ -21,7 +21,10 @@ pub enum DelaySpec {
     /// `D:3.0-0.7` 是 20.09ms（6.7×）、§3.5 声称 ~1.8ms 的 `D:2.0-0.5` 是
     /// 7.39ms（4.1×）。照文档写脚本会得到 3–7 倍长的记录间延迟——那是一份被
     /// 实质改写过的时序画像，而操作员完全无从察觉。现两种写法统一为中位数毫秒。
-    LogNormal { mu_ms: f64, sigma_ms: f64 },
+    LogNormal {
+        mu_ms: f64,
+        sigma_ms: f64,
+    },
 }
 
 /// `D:` 的中位数上界（毫秒）。
@@ -679,7 +682,14 @@ mod tests {
     /// 只做区间比较会让它一路穿到 `Duration::from_micros`。
     #[test]
     fn parse_rejects_non_finite_delays() {
-        for spec in ["D:inf", "D:inf-0.5", "D:NaN", "D:NaN-0.5", "D:2.0-inf", "D:2.0-NaN"] {
+        for spec in [
+            "D:inf",
+            "D:inf-0.5",
+            "D:NaN",
+            "D:NaN-0.5",
+            "D:2.0-inf",
+            "D:2.0-NaN",
+        ] {
             assert!(
                 parse_traffic_script(&lines(&[&format!("0=L:300,{}", spec)])).is_err(),
                 "{} must be rejected",
@@ -713,8 +723,8 @@ mod tests {
 
     #[test]
     fn parse_tolerates_whitespace() {
-        let p = parse_traffic_script(&lines(&[" stop = 3 ", " 0 = L:150-300, D: 0, F:1 ?2 "]))
-            .unwrap();
+        let p =
+            parse_traffic_script(&lines(&[" stop = 3 ", " 0 = L:150-300, D: 0, F:1 ?2 "])).unwrap();
         assert_eq!(p.stop, 3);
         assert_eq!(p.rules[0].len_lo, 150);
         assert_eq!(p.rules[0].len_hi, 300);
@@ -951,7 +961,10 @@ mod tests {
         assert!(with_stop(26));
 
         // 单规则脚本不判。
-        assert!(!lint_hits(&["stop=64", "0=L:300-400,D:0,F:0"], "rule cycle"));
+        assert!(!lint_hits(
+            &["stop=64", "0=L:300-400,D:0,F:0"],
+            "rule cycle"
+        ));
     }
 
     /// `stop = u64::MAX` 时 lint 必须返回警告而不是在乘法上 panic（debug 构建
@@ -974,12 +987,7 @@ mod tests {
 
     #[test]
     fn lint_accepts_a_clean_script() {
-        assert!(lint(&[
-            "stop=3",
-            "0=L:300-500,D:0,F:0",
-            "1=L:220-380,D:2.0-0.6,F:0",
-        ])
-        .is_empty());
+        assert!(lint(&["stop=3", "0=L:300-500,D:0,F:0", "1=L:220-380,D:2.0-0.6,F:0",]).is_empty());
     }
 
     /// 内嵌默认脚本（`shaper.rs::embedded_script` 的配置语法等价物）本身必须

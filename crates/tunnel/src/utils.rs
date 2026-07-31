@@ -318,8 +318,9 @@ fn normalize_client_hello_grease_positions(record: &mut [u8]) -> Option<()> {
                 }
                 let list_len =
                     u16::from_be_bytes([record[ext_data], record[ext_data + 1]]) as usize;
-                let Some(list_end) =
-                    ext_data.checked_add(2).and_then(|v| v.checked_add(list_len))
+                let Some(list_end) = ext_data
+                    .checked_add(2)
+                    .and_then(|v| v.checked_add(list_len))
                 else {
                     malformed = true;
                     return;
@@ -332,8 +333,9 @@ fn normalize_client_hello_grease_positions(record: &mut [u8]) -> Option<()> {
                     return;
                 }
                 let list_len = record[ext_data] as usize;
-                let Some(list_end) =
-                    ext_data.checked_add(1).and_then(|v| v.checked_add(list_len))
+                let Some(list_end) = ext_data
+                    .checked_add(1)
+                    .and_then(|v| v.checked_add(list_len))
                 else {
                     malformed = true;
                     return;
@@ -419,9 +421,10 @@ fn normalize_client_hello_padding_extension(record: &mut Vec<u8>) -> Option<()> 
 
     let removed = entry.end - entry.start;
     record.drain(entry);
-    let extensions_len =
-        u16::from_be_bytes([record[extensions_len_start], record[extensions_len_start + 1]])
-            as usize;
+    let extensions_len = u16::from_be_bytes([
+        record[extensions_len_start],
+        record[extensions_len_start + 1],
+    ]) as usize;
     let new_extensions_len = extensions_len.checked_sub(removed)? as u16;
     record[extensions_len_start..extensions_len_start + 2]
         .copy_from_slice(&new_extensions_len.to_be_bytes());
@@ -487,7 +490,8 @@ pub fn server_hello_key_share_range(
         while cursor + 4 <= extensions_end {
             let ext_type = u16::from_be_bytes([server_records[cursor], server_records[cursor + 1]]);
             let ext_len =
-                u16::from_be_bytes([server_records[cursor + 2], server_records[cursor + 3]]) as usize;
+                u16::from_be_bytes([server_records[cursor + 2], server_records[cursor + 3]])
+                    as usize;
             let data_start = cursor + 4;
             let data_end = data_start.checked_add(ext_len)?;
             if data_end > extensions_end {
@@ -500,8 +504,10 @@ pub fn server_hello_key_share_range(
                 if ext_len < 4 {
                     return None;
                 }
-                let group =
-                    u16::from_be_bytes([server_records[data_start], server_records[data_start + 1]]);
+                let group = u16::from_be_bytes([
+                    server_records[data_start],
+                    server_records[data_start + 1],
+                ]);
                 let ke_len = u16::from_be_bytes([
                     server_records[data_start + 2],
                     server_records[data_start + 3],
@@ -1112,11 +1118,17 @@ mod tests {
             normalized.len()
         );
         assert_eq!(
-            u16::from_be_bytes([normalized[ech_data_start + 6], normalized[ech_data_start + 7]]),
+            u16::from_be_bytes([
+                normalized[ech_data_start + 6],
+                normalized[ech_data_start + 7]
+            ]),
             4
         );
         assert_eq!(
-            u16::from_be_bytes([normalized[ech_data_start + 12], normalized[ech_data_start + 13]]),
+            u16::from_be_bytes([
+                normalized[ech_data_start + 12],
+                normalized[ech_data_start + 13]
+            ]),
             6
         );
         // 归一化幂等。

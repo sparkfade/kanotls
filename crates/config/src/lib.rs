@@ -24,7 +24,10 @@ mod tests {
     #[test]
     fn normalize_tls_fingerprint_maps_aliases_and_rejects_unknown() {
         assert_eq!(super::normalize_tls_fingerprint("Firefox"), Some("firefox"));
-        assert_eq!(super::normalize_tls_fingerprint(" firefox "), Some("firefox"));
+        assert_eq!(
+            super::normalize_tls_fingerprint(" firefox "),
+            Some("firefox")
+        );
         assert_eq!(super::normalize_tls_fingerprint("rustls"), None);
         assert_eq!(super::normalize_tls_fingerprint("python-openssl"), None);
         assert_eq!(super::normalize_tls_fingerprint("baseline"), None);
