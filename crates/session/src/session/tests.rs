@@ -834,6 +834,12 @@ async fn late_data_and_fin_after_local_close_are_ignored_without_warnings() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn established_stream_backpressures_instead_of_self_closing() {
+    // 发送侧流控：对端声明 fc 后，服务端发送被每流窗口门控。本用例一次性
+    // 灌入 4.25 MB（超过默认 2 MiB 窗口）再消费，因此把窗口放到足以
+    // 容纳整笔传输，被测的仍是「接收缓冲不杀流、数据完整交付」。
+    let _wire_lock = WIRE_OBSERVATION_LOCK.lock().await;
+    const WINDOW_OVERRIDE: usize = 6 * 1024 * 1024;
+    super::STREAM_WINDOW_OVERRIDE_BYTES.store(WINDOW_OVERRIDE, Ordering::Relaxed);
     let (client, server) = session_pair().await;
 
     let mut stream = client.open_stream().await.expect("stream opens");
@@ -885,8 +891,235 @@ async fn established_stream_backpressures_instead_of_self_closing() {
     assert_eq!(stream.read().await, None);
     send_task.await.expect("server send task completes");
 
+    super::STREAM_WINDOW_OVERRIDE_BYTES.store(0, Ordering::Relaxed);
     client.force_close();
     server.session.force_close();
+}
+
+// H2 流控端到端（C2S）：对端声明 fc 后，发送侧被每流窗口 + 连接级窗口
+// 门控；中继消费即回补 WINDOW_UPDATE，门控放行，整笔传输零丢失完成。
+// 这正是此前「缓冲超限 → 丢数据 + 杀流」的替代路径。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flow_control_gates_sender_until_consumption_grants_credit() {
+    use super::H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _wire_lock = WIRE_OBSERVATION_LOCK.lock().await;
+
+    // 每流窗口 256 KiB（回补阈值 128 KiB），连接级窗口 128 KiB
+    // （阈值覆写 64 KiB × 2）：总量 1 MiB 必须靠回补才能走完。
+    const STREAM_WINDOW: usize = 256 * 1024;
+    const CHUNK: usize = 64 * 1024;
+    const TOTAL: usize = 1024 * 1024;
+    super::STREAM_WINDOW_OVERRIDE_BYTES.store(STREAM_WINDOW, Ordering::Relaxed);
+    H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES.store(64 * 1024, Ordering::Relaxed);
+
+    let (client, server) = session_pair().await;
+
+    let mut stream = client.open_stream().await.expect("stream opens");
+    stream
+        .write_early(b"fc-gate.example:443")
+        .await
+        .expect("client sends target");
+    let (_sid, mut server_stream) =
+        tokio::time::timeout(Duration::from_secs(1), server.accept_stream())
+            .await
+            .expect("server accepts stream")
+            .expect("server accepts stream");
+    assert_eq!(
+        server_stream.read().await,
+        Some(Bytes::from(b"fc-gate.example:443".to_vec()))
+    );
+    server_stream
+        .send_synack()
+        .await
+        .expect("server sends synack");
+    stream.wait_open().await.expect("stream opens");
+
+    let pattern = |i: usize| -> u8 { ((i * 13 + 5) % 251) as u8 };
+    let writer_done = Arc::new(AtomicBool::new(false));
+    let writer_flag = writer_done.clone();
+    let writer = tokio::spawn(async move {
+        let mut sent = 0usize;
+        while sent < TOTAL {
+            let chunk: Vec<u8> = (0..CHUNK).map(|j| pattern(sent + j)).collect();
+            stream.write(&chunk).await.expect("client writes chunk");
+            sent += CHUNK;
+        }
+        stream.close_write().await.expect("client half closes");
+        writer_flag.store(true, Ordering::Relaxed);
+        sent
+    });
+
+    // 消费方先按兵不动：发送方必须被窗口钉住（在途 ≤ 256 KiB，远小于
+    // 总量 1 MiB），而不是把整笔数据灌进缓冲。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !writer_done.load(Ordering::Relaxed),
+        "发送方必须被每流窗口门控，不能无界灌入"
+    );
+
+    // 中继开始消费：每消费 64 KiB 回补一次，发送方逐步放行，整笔完成。
+    let reader = tokio::spawn(async move {
+        let mut received = 0usize;
+        let mut ok = true;
+        while let Some(data) = server_stream.read().await {
+            for (j, &b) in data.iter().enumerate() {
+                if b != pattern(received + j) {
+                    ok = false;
+                    break;
+                }
+            }
+            server_stream.note_consumed(data.len());
+            received += data.len();
+            if !ok {
+                break;
+            }
+        }
+        (received, ok)
+    });
+
+    let sent = tokio::time::timeout(Duration::from_secs(20), writer)
+        .await
+        .expect("writer must unblock after consumption")
+        .expect("writer joins");
+    let (received, ok) = tokio::time::timeout(Duration::from_secs(20), reader)
+        .await
+        .expect("reader must complete")
+        .expect("reader joins");
+
+    assert!(ok, "byte pattern corrupted under flow control");
+    assert_eq!(sent, TOTAL);
+    assert_eq!(received, TOTAL, "零丢失：门控 + 回补必须交付全部字节");
+
+    super::STREAM_WINDOW_OVERRIDE_BYTES.store(0, Ordering::Relaxed);
+    H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES.store(0, Ordering::Relaxed);
+    client.force_close();
+    server.session.force_close();
+}
+
+// 兼容性：对端 SETTINGS 未声明 fc 时，发送侧门控整体旁路——写入量与窗口
+// 无关，行为与旧版逐字节一致（旧对端不会回补，若本端照常门控会死锁）。
+#[tokio::test]
+async fn no_flow_control_gating_without_peer_fc_declaration() {
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncReadExt;
+    let _wire_lock = WIRE_OBSERVATION_LOCK.lock().await;
+
+    // 把窗口压到 64 KiB：若门控被误启用，写入 3× 窗口必然死锁。
+    const STREAM_WINDOW: usize = 64 * 1024;
+    super::STREAM_WINDOW_OVERRIDE_BYTES.store(STREAM_WINDOW, Ordering::Relaxed);
+
+    // raw server 只回 SYNACK、从不发 SETTINGS ⇒ 客户端永远收不到 fc 声明。
+    let (client, mut stream, mut server_read, _server_write, mut buf, mut read_buf) =
+        raw_server_session_with_open_stream(test_session_config(true), b"no-fc.example:443")
+            .await;
+
+    let pattern = |i: usize| -> u8 { ((i * 3 + 1) % 251) as u8 };
+    let writer = tokio::spawn(async move {
+        let mut sent = 0usize;
+        while sent < STREAM_WINDOW * 3 {
+            let chunk: Vec<u8> = (0..STREAM_WINDOW / 2)
+                .map(|j| pattern(sent + j))
+                .collect();
+            stream.write(&chunk).await.expect("client writes chunk");
+            sent += chunk.len();
+        }
+        sent
+    });
+
+    // 对端不消费：门控若启用则必然挂起，3× 窗口的写入必须在有界时间内
+    // 完成（旧行为：无门控，直接灌入 TCP 缓冲）。
+    let sent = tokio::time::timeout(Duration::from_secs(10), writer)
+        .await
+        .expect("ungated writes must complete despite tiny window")
+        .expect("writer joins");
+    assert_eq!(sent, STREAM_WINDOW * 3);
+
+    // 顺带把客户端发出的字节读出来，确认对端确实收到了 3× 窗口的量。
+    let mut received = 0usize;
+    let mut count = 0usize;
+    while received < STREAM_WINDOW * 3 && count < 1000 {
+        let n = server_read.read(&mut read_buf).await.expect("raw server reads");
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&read_buf[..n]);
+        while let Some(frame) = crate::frame::Frame::decode(&mut buf) {
+            if frame.cmd == crate::frame::CMD_PSH {
+                received += frame.payload.len();
+            }
+        }
+        count += 1;
+    }
+    assert_eq!(
+        received,
+        STREAM_WINDOW * 3,
+        "对端必须收到全部字节（未启用门控）"
+    );
+
+    super::STREAM_WINDOW_OVERRIDE_BYTES.store(0, Ordering::Relaxed);
+    client.force_close();
+}
+
+// 客户端对真实 CMD_SETTINGS 的首条应答必须是 33 字节 SETTINGS-ACK
+// （`h2_opening_size(C2S, 0)`）——此前由 SETTINGS 尺寸的填充请求触发，
+// 现在服务端开场 flight 首条就是真 SETTINGS，客户端按真实 H2 语义作答。
+#[tokio::test]
+async fn client_answers_real_server_settings_with_a_settings_ack() {
+    use kanotls_tunnel::control_size::SETTINGS_ACK_WIRE;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _wire_lock = WIRE_OBSERVATION_LOCK.lock().await;
+
+    let (client_tunnel, mut raw_server, mut server_noise) = client_stream_with_raw_server().await;
+    let mut config = test_session_config(true);
+    config.post_script_off = true;
+    let client = Arc::new(Session::new(client_tunnel, config, None));
+    let read_loop = client.clone();
+    tokio::spawn(async move {
+        let _ = read_loop.run_read_loop().await;
+    });
+
+    let settings = crate::frame::Frame::cmd_settings()
+        .encode()
+        .expect("settings encodes");
+    let record = seal_control_record(&mut server_noise, &settings, 47);
+    raw_server
+        .write_all(&record)
+        .await
+        .expect("raw server sends its settings");
+
+    let mut wire = Vec::new();
+    let mut buf = vec![0u8; 16384];
+    let mut ack = None;
+    let collect = async {
+        while ack.is_none() {
+            let n = raw_server.read(&mut buf).await.expect("raw server reads");
+            assert!(n > 0, "tunnel closed before the settings ack arrived");
+            wire.extend_from_slice(&buf[..n]);
+            for (size, payload) in drain_wire_records(&mut wire, &mut server_noise) {
+                let mut cursor = bytes::BytesMut::from(payload.as_slice());
+                while let Some(frame) = crate::frame::Frame::decode(&mut cursor) {
+                    // flag=1 的 33 字节应答记录即 SETTINGS-ACK 角色。
+                    if frame.cmd == crate::frame::CMD_PADDING
+                        && frame.payload.first() == Some(&1)
+                    {
+                        ack = Some(size);
+                    }
+                }
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(3), collect)
+        .await
+        .expect("settings-ack arrives before timeout");
+
+    assert_eq!(
+        ack,
+        Some(SETTINGS_ACK_WIRE),
+        "首条服务端 SETTINGS 必须换来 33 字节 SETTINGS-ACK"
+    );
+
+    client.force_close();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1029,6 +1262,9 @@ async fn high_throughput_bulk_transfer_preserves_stream_integrity() {
                     break;
                 }
             }
+            // 模拟中继：字节交付即回补窗口，否则发送方（client）会被
+            // 2 MiB 每流窗口门控，4 MiB 传输永远走不完。
+            server_stream.note_consumed(chunk.len());
             received += chunk.len();
             if !ok {
                 break;
@@ -1190,6 +1426,8 @@ async fn concurrent_bidirectional_bulk_transfer_keeps_session_usable() {
                 }
             }
             received += data.len();
+            // 模拟中继：消费即回补窗口（发送方被每流窗口门控）。
+            up_server_stream.note_consumed(data.len());
             if !ok || received >= EACH_WAY {
                 break;
             }
@@ -1488,6 +1726,11 @@ async fn auto_write_returns_before_shaped_emission_completes() {
 // 全部消费后计数器必须精确归零，不允许下溢回绕或滞留。
 #[tokio::test(flavor = "current_thread")]
 async fn buffered_stream_bytes_returns_to_zero_after_pending_drain() {
+    // 4.25 MB 一次性灌入，超过默认 2 MiB 每流窗口：放大窗口让本用例只测
+    // 「channel + pending 双账都算进去」，流控本身由专门用例覆盖。
+    let _wire_lock = WIRE_OBSERVATION_LOCK.lock().await;
+    const WINDOW_OVERRIDE: usize = 6 * 1024 * 1024;
+    super::STREAM_WINDOW_OVERRIDE_BYTES.store(WINDOW_OVERRIDE, Ordering::Relaxed);
     let (client, server) = session_pair().await;
 
     let mut stream = client.open_stream().await.expect("stream opens");
@@ -1541,6 +1784,7 @@ async fn buffered_stream_bytes_returns_to_zero_after_pending_drain() {
     assert_eq!(client.buffered_stream_bytes(), 0);
     send_task.await.expect("server send task completes");
 
+    super::STREAM_WINDOW_OVERRIDE_BYTES.store(0, Ordering::Relaxed);
     client.force_close();
     server.session.force_close();
 }
@@ -1768,8 +2012,11 @@ async fn raw_server_session_with_open_stream(
 // W3(a)：bulk 接收端按分发字节数回注 WINDOW_UPDATE 尺寸的 flag=1 padding；
 // 在 bulk 发送方（裸 server 端）统计到的 reply 帧数量必须达到阈值/块数
 // 推算出的预期量级，且流数据完好。
+// W3(b)：消费驱动的回补不再由读循环注入假填充，而是中继消费后回吐真实
+// WINDOW_UPDATE 信贷帧（flag=3）——每流 1 MiB、连接级 6 MiB 的 nghttp2
+// 半窗口规则，线速尺寸恒为 WINDOW_UPDATE_WIRE。
 #[tokio::test]
-async fn bulk_transfer_triggers_window_update_padding_on_sender_side() {
+async fn bulk_consumption_emits_real_window_update_frames() {
     use super::H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES;
     use std::sync::atomic::Ordering;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1820,6 +2067,9 @@ async fn bulk_transfer_triggers_window_update_padding_on_sender_side() {
                     break;
                 }
             }
+            // 模拟中继：消费即回补窗口——正是真实 WINDOW_UPDATE 信贷帧
+            // 的触发点（此前是读循环的假填充）。
+            stream.note_consumed(data.len());
             received += data.len();
             if !ok {
                 break;
@@ -1828,19 +2078,28 @@ async fn bulk_transfer_triggers_window_update_padding_on_sender_side() {
         (received, ok)
     });
 
-    // 每收到 CHUNK(=THRESHOLD) 字节，client 读循环恰好越过一次阈值，
-    // 预期恰好 CHUNKS 条 flag=1 padding；留少量余量防计时边界。
-    let mut replies = 0usize;
+    // 每消费 CHUNK(=THRESHOLD) 字节，client 恰好越过一次连接级回补阈值，
+    // 预期恰好 CHUNKS 条 flag=3 WINDOW_UPDATE（stream_id=0、增量=THRESHOLD）；
+    // 留少量余量防计时边界。每流阈值（默认 1 MiB）未被 256 KB 总传输越过，
+    // 不应出现每流 WU。
+    let mut updates = 0usize;
+    let mut stream_updates = 0usize;
     let collect = async {
-        while replies < CHUNKS {
+        while updates < CHUNKS {
             let n = server_read.read(&mut read_buf).await.expect("server reads");
             if n == 0 {
                 break;
             }
             buf.extend_from_slice(&read_buf[..n]);
             while let Some(frame) = crate::frame::Frame::decode(&mut buf) {
-                if frame.cmd == crate::frame::CMD_PADDING && frame.payload.first() == Some(&1) {
-                    replies += 1;
+                if frame.cmd == crate::frame::CMD_PADDING
+                    && frame.payload.first() == Some(&crate::frame::PADDING_FLAG_WINDOW_UPDATE)
+                {
+                    if frame.stream_id == 0 {
+                        updates += 1;
+                    } else {
+                        stream_updates += 1;
+                    }
                 }
             }
         }
@@ -1853,13 +2112,17 @@ async fn bulk_transfer_triggers_window_update_padding_on_sender_side() {
         .expect("bulk reader completes");
     send_task.await.expect("bulk sender joins");
 
-    assert!(ok, "bulk payload corrupted under h2 skeleton injection");
+    assert!(ok, "bulk payload corrupted under flow control");
     assert_eq!(received, TOTAL, "received byte count must equal sent");
     assert!(
-        replies >= CHUNKS * 3 / 4,
-        "expected ~{} window-update padding frames on the bulk sender side, got {}",
+        updates >= CHUNKS * 3 / 4,
+        "expected ~{} connection-level window-update frames, got {}",
         CHUNKS,
-        replies
+        updates
+    );
+    assert_eq!(
+        stream_updates, 0,
+        "256 KiB 传输不得越过 1 MiB 每流回补阈值"
     );
 
     H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES.store(0, Ordering::Relaxed);
@@ -2069,6 +2332,7 @@ fn prune_removes_read_closed_orphan_without_double_decrement() {
             synack_tx: Some(synack_tx),
             read_closed: true,
             pending_notify: Arc::new(tokio::sync::Notify::new()),
+            send_credit: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         },
     );
 
@@ -2104,6 +2368,7 @@ fn prune_removes_open_orphan_and_decrements_once() {
             synack_tx: None,
             read_closed: false,
             pending_notify: Arc::new(tokio::sync::Notify::new()),
+            send_credit: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         },
     );
 
@@ -2131,6 +2396,7 @@ fn prune_keeps_handles_with_live_channels() {
             synack_tx: None,
             read_closed: true,
             pending_notify: Arc::new(tokio::sync::Notify::new()),
+            send_credit: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         },
     );
 
@@ -2145,6 +2411,7 @@ fn prune_keeps_handles_with_live_channels() {
             synack_tx: Some(synack_tx2),
             read_closed: false,
             pending_notify: Arc::new(tokio::sync::Notify::new()),
+            send_credit: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         },
     );
 
@@ -5223,8 +5490,13 @@ async fn client_first_write_still_gathers_target_and_first_chunk() {
     const TARGET: &[u8] = b"gather.example:443";
     // 内层 ClientHello 量级（带 ML-KEM 的 Firefox）。
     const FIRST_CHUNK: usize = 1884;
-    // SETTINGS(23) + SYN(7) + PSH 帧头(7) + 目标(18)。
-    const OPEN_PREFIX_LEN: usize = 23 + 7 + 7 + TARGET.len();
+    // SETTINGS + SYN + PSH 帧头 + 目标。SETTINGS 长度随 fc 声明变化，
+    // 不硬编码。
+    let settings_len = crate::frame::Frame::cmd_settings()
+        .encode()
+        .expect("settings encodes")
+        .len();
+    let open_prefix_len = settings_len + 7 + 7 + TARGET.len();
 
     let (client_tunnel, mut raw_peer, mut peer_noise) = client_stream_with_raw_server().await;
     // 不启读循环：对端是裸 socket，不会应答。首条记录的 `quiet_gap` 于是等满
@@ -5269,15 +5541,15 @@ async fn client_first_write_still_gathers_target_and_first_chunk() {
 
     let (_wire_len, plaintext) = &records[0];
     assert!(
-        plaintext.len() > OPEN_PREFIX_LEN,
+        plaintext.len() > open_prefix_len,
         "gather 退化：首条记录明文只有 {} 字节（= SETTINGS+SYN+PSH(target) 的 {} 字节），\
          首块没有与目标同批提交",
         plaintext.len(),
-        OPEN_PREFIX_LEN
+        open_prefix_len
     );
     // 紧随其后的是首块自己的 PSH 帧头（cmd=PSH、sid、len=1884），再往后全是
     // 首块的填充字节 —— 这就是「目标与首块在同一次提交里」的直接证据。
-    let data_frame = &plaintext[OPEN_PREFIX_LEN..];
+    let data_frame = &plaintext[open_prefix_len..];
     assert_eq!(data_frame[0], crate::frame::CMD_PSH, "首块必须紧跟目标帧");
     assert_eq!(
         u16::from_be_bytes([data_frame[5], data_frame[6]]) as usize,

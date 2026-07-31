@@ -3,11 +3,11 @@ use crate::frame::{coalesce_encoded_frames, encode_psh_frames, Frame, MAX_PAYLOA
 use crate::session::{
     mark_stream_read_closed_locked, peer_never_processed, remember_closing_stream_sync,
     unregister_stream_locked, BufferedPayload, FlushBehavior, PendingData, PendingWrite,
-    SharedTunnelWriter, StreamHandle, TrafficClass,
+    SharedTunnelWriter, StreamHandle, TrafficClass, WindowState,
 };
 use anyhow::Error;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::{mpsc, oneshot, Notify, RwLock};
@@ -108,6 +108,10 @@ pub(crate) struct StreamInit {
     pub pending_fin: Arc<Mutex<std::collections::HashSet<u32>>>,
     pub closing_streams: Arc<Mutex<std::collections::HashSet<u32>>>,
     pub pending_notify: Arc<Notify>,
+    /// 本流发送方向剩余信贷（与句柄中的同一 Arc，见 StreamHandle::send_credit）。
+    pub send_credit: Arc<AtomicI64>,
+    /// 会话级流控状态（连接级窗口 + 回补记账）。
+    pub windows: Arc<WindowState>,
     pub peer_goaway_last_stream_id: Arc<AtomicU64>,
     pub open_state: StreamOpenState,
 }
@@ -125,6 +129,14 @@ pub struct Stream {
     pending_fin: Arc<Mutex<std::collections::HashSet<u32>>>,
     closing_streams: Arc<Mutex<std::collections::HashSet<u32>>>,
     pending_notify: Arc<Notify>,
+    /// 本流发送方向剩余信贷（H2 每流窗口；与句柄共享，见
+    /// `WindowState::acquire_credit`）。
+    send_credit: Arc<AtomicI64>,
+    /// 会话级流控状态：连接级窗口、fc 协商与回补记账。
+    windows: Arc<WindowState>,
+    /// 本流**接收**方向已消费、尚未回补的字节（单消费者：本端中继独占，
+    /// fetch_add/fetch_sub 安全）。
+    consumed_since_wu: AtomicU64,
     /// 对端 GOAWAY 的 `last_stream_id`（见 `Session::peer_never_processed`）：
     /// 本流 id 高于它 ⇒ 对端从未处理过这条流。
     peer_goaway_last_stream_id: Arc<AtomicU64>,
@@ -155,6 +167,9 @@ impl Stream {
             pending_fin: init.pending_fin,
             closing_streams: init.closing_streams,
             pending_notify: init.pending_notify,
+            send_credit: init.send_credit,
+            windows: init.windows,
+            consumed_since_wu: AtomicU64::new(0),
             peer_goaway_last_stream_id: init.peer_goaway_last_stream_id,
             open_state: init.open_state,
             deferred_target: None,
@@ -280,6 +295,12 @@ impl Stream {
         if let Some(msg) = &self.open_failed {
             anyhow::bail!(msg.clone());
         }
+        // 发送侧流控门（H2 语义，见 WindowState::acquire_credit）：窗口不足
+        // 即挂起等对端 WINDOW_UPDATE，接收缓冲被窗口界定，此前的
+        // 「超限丢数据 + 杀流」结构性不可达。对未声明 fc 的对端整体旁路。
+        self.windows
+            .acquire_credit(&self.send_credit, &self.pending_notify, data.len())
+            .await;
         if self.has_deferred_open() {
             return self.write_pending_open_with_data(data).await;
         }
@@ -302,6 +323,10 @@ impl Stream {
             anyhow::bail!(msg.clone());
         }
 
+        self.windows
+            .acquire_credit(&self.send_credit, &self.pending_notify, data.len())
+            .await;
+
         if let Some(target) = self.deferred_target.take() {
             return self.write_gather_open(&target, data).await;
         }
@@ -312,6 +337,14 @@ impl Stream {
 
         self.finish_pending_open_submission().await?;
         self.write_data_frame(data).await
+    }
+
+    /// 接收侧回补入账：中继在字节真正交付本地应用后调用（H2 语义，见
+    /// `WindowState::note_consumed`）。每流与连接级消费过半窗口即向对端
+    /// 回吐一条真实 WINDOW_UPDATE，对端据此放行被窗口门控的发送。
+    pub fn note_consumed(&self, len: usize) {
+        self.windows
+            .note_consumed(self.stream_id, &self.consumed_since_wu, len);
     }
 
     async fn write_data_frame(&mut self, data: &[u8]) -> Result<(), anyhow::Error> {

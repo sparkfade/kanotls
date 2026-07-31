@@ -5,6 +5,7 @@ use crate::session::{
     PendingData, Session, SessionConfig, StreamHandle, TrafficClass,
 };
 use kanotls_tunnel::SnowyStream;
+use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::warn;
@@ -57,6 +58,9 @@ impl ServerSessionHandler {
         let (data_tx, data_rx) = mpsc::channel(128);
         let (fin_tx, fin_rx) = mpsc::channel(1);
         let pending_notify = Arc::new(Notify::new());
+        // 本流发送方向信贷（H2 每流窗口，与句柄共享）：注册即满窗，对端
+        // WINDOW_UPDATE 帧入账，写路径（Session::write_data）扣减。
+        let send_credit = Arc::new(AtomicI64::new(self.session.windows.stream_window()));
 
         let handle = StreamHandle {
             data_tx: data_tx.clone(),
@@ -64,6 +68,7 @@ impl ServerSessionHandler {
             synack_tx: None,
             read_closed: false,
             pending_notify: pending_notify.clone(),
+            send_credit: send_credit.clone(),
         };
 
         register_stream_locked(
@@ -95,6 +100,7 @@ impl ServerSessionHandler {
                 closed: matches!(flush_result, PendingAcceptFlushResult::ClosedLocally),
                 pending_data: self.session.pending_data.clone(),
                 pending_notify,
+                consumed_since_wu: AtomicU64::new(0),
             },
         ))
     }
@@ -114,6 +120,8 @@ pub struct ServerStream {
     closed: bool,
     pending_data: Arc<Mutex<PendingData>>,
     pending_notify: Arc<Notify>,
+    /// 本流**接收**方向已消费、尚未回补的字节（单消费者：本端中继独占）。
+    consumed_since_wu: AtomicU64,
 }
 
 impl ServerStream {
@@ -158,6 +166,14 @@ impl ServerStream {
             anyhow::bail!("stream write side is closed");
         }
         self.session.write_data(self.sid, data).await
+    }
+
+    /// 接收侧回补入账：中继在字节真正交付远端后调用（H2 语义，见
+    /// `WindowState::note_consumed`）。
+    pub fn note_consumed(&self, len: usize) {
+        self.session
+            .windows
+            .note_consumed(self.sid, &self.consumed_since_wu, len);
     }
 
     pub async fn close_write(&mut self) -> Result<(), anyhow::Error> {
