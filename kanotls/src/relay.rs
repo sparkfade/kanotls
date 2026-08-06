@@ -17,99 +17,121 @@ const UDP_CHANNEL_CAPACITY: usize = 128;
 const UDP_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// 客户端 TCP 中继：本地连接 ↔ 隧道流，返回 (tx, rx) 字节数。
+///
+/// 上行与下行跑在两个独立任务里（流经 `into_split` 拆半）：写方向在流控门
+/// （等 WINDOW_UPDATE）挂起时，读方向的交付与回补照常进行。拆分前的单任务
+/// `select!` 里 `write().await` 一旦挂起会连带冻住 `read()`——读方向停摆、
+/// 反向回补中断，双向饱和时两端互等形成无定时器的死锁环。
 pub async fn relay_tcp_client(
-    mut local_reader: impl AsyncReadExt + Unpin,
+    mut local_reader: impl AsyncReadExt + Unpin + Send + 'static,
     mut local_writer: impl AsyncWriteExt + Unpin,
-    mut remote: Stream,
+    remote: Stream,
 ) -> Result<(u64, u64), anyhow::Error> {
-    let mut tx_total: u64 = 0;
-    let mut rx_total: u64 = 0;
-    let mut read_buf = vec![0u8; RELAY_CHUNK_SIZE];
-    let mut local_eof = false;
-    let mut remote_eof = false;
+    let (mut remote_read, mut remote_write) = remote.into_split();
 
-    while !local_eof || !remote_eof {
-        tokio::select! {
-            result = local_reader.read(&mut read_buf), if !local_eof => {
-                match result {
-                    Ok(0) => {
-                        let _ = remote.close_write().await;
-                        local_eof = true;
-                    }
-                    Ok(n) => {
-                        remote.write(&read_buf[..n]).await?;
-                        tx_total += n as u64;
-                    }
-                    Err(_) => {
-                        let _ = remote.close_write().await;
-                        local_eof = true;
+    let up = tokio::spawn(async move {
+        let mut tx_total = 0u64;
+        let mut read_buf = vec![0u8; RELAY_CHUNK_SIZE];
+        // 开流宽限期（服务端先说话的协议，见 stream.rs 的
+        // DEFERRED_OPEN_GRACE）：本地一直不写也要把 SYN+目标冲刷出去。
+        // 一次性计时器；若首写已先行把开流发出，触发时是空操作。
+        let grace_deadline = remote_write.open_grace_deadline();
+        let grace = tokio::time::sleep_until(
+            grace_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)),
+        );
+        tokio::pin!(grace);
+        let mut grace_armed = grace_deadline.is_some();
+        loop {
+            tokio::select! {
+                result = local_reader.read(&mut read_buf) => {
+                    match result {
+                        Ok(0) => {
+                            remote_write.close_write().await?;
+                            break;
+                        }
+                        Ok(n) => {
+                            remote_write.write(&read_buf[..n]).await?;
+                            tx_total += n as u64;
+                        }
+                        Err(_) => {
+                            remote_write.close_write().await?;
+                            break;
+                        }
                     }
                 }
-            }
-            data = remote.read(), if !remote_eof => {
-                match data {
-                    Some(d) => {
-                        local_writer.write_all(&d).await?;
-                        rx_total += d.len() as u64;
-                        // 字节已交付本地应用：回补对端窗口（H2 流控语义）。
-                        remote.note_consumed(d.len());
-                    }
-                    None => {
-                        local_writer.shutdown().await?;
-                        remote_eof = true;
-                    }
+                _ = &mut grace, if grace_armed => {
+                    grace_armed = false;
+                    remote_write.flush_unsent_open_if_pending().await?;
                 }
             }
         }
-    }
+        Ok::<u64, anyhow::Error>(tx_total)
+    });
 
-    let _ = remote.close().await;
+    let mut rx_total = 0u64;
+    let down_result: Result<(), anyhow::Error> = async {
+        while let Some(d) = remote_read.read().await {
+            local_writer.write_all(&d).await?;
+            rx_total += d.len() as u64;
+            // 字节已交付本地应用：回补对端每流窗口（H2 流控语义）。
+            remote_read.note_consumed(d.len());
+        }
+        local_writer.shutdown().await?;
+        Ok(())
+    }
+    .await;
+
+    // 两个方向都终结后汇总。任一出错时两半句柄随任务/作用域先后
+    // drop，拆除协调器（StreamTeardown）保证整流清理恰好执行一次。
+    let tx_total = up.await??;
+    down_result?;
     Ok((tx_total, rx_total))
 }
 
 /// 服务端 TCP 中继：隧道流 ↔ 远端连接。
+///
+/// 上行（源站 → 隧道）经 `write_handle` 独立成任务，与客户端拆半同一
+/// 目的：写方向在流控门挂起时读方向不被冻结。
 pub async fn relay_tcp_server(
     stream: &mut ServerStream,
-    remote: &mut TcpStream,
+    remote: TcpStream,
 ) -> Result<(), anyhow::Error> {
-    let mut buf = vec![0u8; RELAY_CHUNK_SIZE];
-    let mut stream_eof = false;
-    let mut remote_eof = false;
-    while !stream_eof || !remote_eof {
-        tokio::select! {
-            data = stream.read(), if !stream_eof => {
-                match data {
-                    Some(d) => {
-                        remote.write_all(&d).await?;
-                        // 字节已交付远端：回补对端窗口（H2 流控语义）。
-                        stream.note_consumed(d.len());
-                    }
-                    None => {
-                        let _ = remote.shutdown().await;
-                        stream_eof = true;
-                    }
+    let (mut remote_reader, mut remote_writer) = remote.into_split();
+    let stream_write = stream.write_handle();
+
+    let up = tokio::spawn(async move {
+        let mut buf = vec![0u8; RELAY_CHUNK_SIZE];
+        loop {
+            match remote_reader.read(&mut buf).await {
+                Ok(0) => {
+                    stream_write.close_write().await?;
+                    return Ok::<(), anyhow::Error>(());
                 }
-            }
-            result = remote.read(&mut buf), if !remote_eof => {
-                match result {
-                    Ok(0) => {
-                        let _ = stream.close_write().await;
-                        remote_eof = true;
-                    }
-                    Ok(n) => {
-                        stream.write(&buf[..n]).await?;
-                    }
-                    Err(e) => {
-                        debug!("remote read error: {}", e);
-                        let _ = stream.close_write().await;
-                        remote_eof = true;
-                    }
+                Ok(n) => {
+                    stream_write.write(&buf[..n]).await?;
+                }
+                Err(e) => {
+                    debug!("remote read error: {}", e);
+                    stream_write.close_write().await?;
+                    return Ok::<(), anyhow::Error>(());
                 }
             }
         }
+    });
+
+    let down_result: Result<(), anyhow::Error> = async {
+        while let Some(d) = stream.read().await {
+            remote_writer.write_all(&d).await?;
+            // 字节已交付远端：回补对端每流窗口（H2 流控语义）。
+            stream.note_consumed(d.len());
+        }
+        remote_writer.shutdown().await?;
+        Ok(())
     }
-    let _ = stream.close().await;
-    Ok(())
+    .await;
+
+    up.await??;
+    down_result
 }
 
 /// 服务端 UoT 中继：隧道流 ↔ 出站 UDP 通道（直连或 socks5 中继，
@@ -147,12 +169,18 @@ pub async fn relay_udp_server(
                 match data {
                     Some(d) => {
                         if let Some((addr, payload)) = decode_udp_packet(&d) {
+                            // 回补口径必须与发送方扣费一致：对端按编码后整包
+                            // （d）扣信贷，故按 d.len() 回补，而不是剥掉 UoT
+                            // 头后的 payload——每个包漏 9/21 字节会在长 QUIC
+                            // 流上把窗口慢慢漏干。被拦截的包同样已占过窗口，
+                            // 一样要补。
                             if is_blocked_destination(&addr) {
                                 debug!("udp blocked: private addr {}", addr);
+                                stream.note_consumed(d.len());
                                 continue;
                             }
                             let _ = relay.send_to(&payload, &addr).await;
-                            stream.note_consumed(payload.len());
+                            stream.note_consumed(d.len());
                         }
                     }
                     None => break,
@@ -241,7 +269,9 @@ pub async fn relay_udp_client_mode(
                             if let Some(peer_addr) = *peer.lock().await {
                                 let packet = kanotls_proto::uot::encode_socks5_udp(&payload, &addr);
                                 let _ = local.send_to(&packet, peer_addr).await;
-                                stream.note_consumed(payload.len());
+                                // 与服务端同口径：按编码后整包回补（对端按
+                                // 整包扣信贷），避免每包 9/21 字节的慢性泄漏。
+                                stream.note_consumed(d.len());
                             }
                         }
                     }

@@ -356,9 +356,9 @@ async fn handle_server_stream_inner(
             relay::relay_udp_server(stream, relay).await?;
         }
         Network::Tcp => {
-            let mut remote = outbound.connect(&target).await?;
+            let remote = outbound.connect(&target).await?;
             stream.send_synack().await?;
-            relay::relay_tcp_server(stream, &mut remote).await?;
+            relay::relay_tcp_server(stream, remote).await?;
         }
     }
 

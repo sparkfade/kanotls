@@ -317,19 +317,22 @@ const MAX_PENDING_STREAMS: usize = 1024;
 const STREAM_CHANNEL_CAPACITY: usize = 128;
 const MAX_SESSION_REASSEMBLY_BYTES: usize = 1024 * 1024;
 const WRITE_CHANNEL_CAPACITY: usize = 64;
-const MAX_STREAM_OVERFLOW_BYTES: usize = 2 * 1024 * 1024;
+
+/// 每流接收缓冲上限的基值，与 `STREAM_WINDOW_BYTES` 同义同值：fc 对端的
+/// 实际上限是它的 2 倍（窗口 + 首 RTT 越界余量，见 `store_pending_data`），
+/// 非 fc 旧对端沿用基值本身。聚合缓冲另受 `MAX_PENDING_STREAM_BYTES` 封顶。
+const MAX_STREAM_OVERFLOW_BYTES: usize = 16 * 1024 * 1024;
 
 /// 每流发送窗口（H2 的 `SETTINGS_INITIAL_WINDOW_SIZE` 语义）：发送方在同一条
 /// 流的在途字节超过此值前可自由发送，之后挂起等对端回补 WINDOW_UPDATE。
 ///
-/// **取值与 `MAX_STREAM_OVERFLOW_BYTES` 同值（2 MiB）**：接收方为 fc 对端
-/// 保留的缓冲上限 = 窗口 + 首 RTT 越界余量（见 `store_pending_data`），于是
-/// 「窗口耗尽 ⇒ 发送方停发」让接收缓冲**结构性**无法触限——此前的
-/// 「超限丢数据 + 杀流」对 fc 对端彻底不可达。
-///
-/// 2 MiB 同时覆盖典型高 BDP 路径（200 Mbps × 150 ms ≈ 3.75 MB 的在途需求由
-/// 连接级 12 MiB 窗口承接，每流窗口只管单流停滞不拖死其他流）。
-const STREAM_WINDOW_BYTES: usize = 2 * 1024 * 1024;
+/// **取值**：16 MiB。窗口/RTT 是单流吞吐的硬上限，而无停顿速率是
+/// `(窗口 − 回补阈值)/RTT`（接收方消费满阈值才回补，补回路上要 1 RTT）。
+/// 500 Mbps × 175 ms 的 BDP ≈ 10.9 MB：2 MiB 旧值把单流钉死在 ~96 mbps
+/// （无停顿 48），16 MiB + 1/8 窗口回补阈值（2 MiB）给出
+/// (16−2) MiB/175ms ≈ 640 mbps 的单流无停顿余量。窗口值不上链
+/// （WINDOW_UPDATE 记录尺寸恒定 37 字节），唯一可观测变化是回补节奏。
+const STREAM_WINDOW_BYTES: usize = 16 * 1024 * 1024;
 
 /// 测试覆写点：0 表示使用上面的生产常量。窗口只影响**本端发送**的门控与
 /// 回补节奏，不改任何线上字节形态（WINDOW_UPDATE 记录本身尺寸恒定）。
@@ -341,29 +344,30 @@ pub(crate) static STREAM_WINDOW_OVERRIDE_BYTES: AtomicUsize = AtomicUsize::new(0
 const STICKY_BULK_FLUSH_MAX_RECORDS: usize = 8;
 const STICKY_BULK_FLUSH_MAX_BYTES: usize = 128 * 1024;
 
-/// 稳态 H2 行为骨架（post-script steady state）：真实 HTTP/2 接收端按消费
-/// 字节数回发 WINDOW_UPDATE，并对收到的 PING 回 PING-ACK。内容加密不可见，
-/// 只需复刻尺寸/时序语义。两者都以 CMD_PADDING 帧实现：flag=1 被对端静默
-/// 吸收（等价 WINDOW_UPDATE 的“无回复”语义），flag=0 m=1 会换来一条 reply
+/// 稳态 H2 行为骨架（post-script steady state）：真实 HTTP/2 接收端回发
+/// WINDOW_UPDATE，并对收到的 PING 回 PING-ACK。内容加密不可见，只需复刻
+/// 尺寸/时序语义。两者都以 CMD_PADDING 帧实现：flag=1 被对端静默吸收
+/// （等价 WINDOW_UPDATE 的“无回复”语义），flag=0 m=1 会换来一条 reply
 /// （等价 PING/PING-ACK 对）。客户端不做空闲探活 PING（用户明确不需要
 /// 保活），flag=0 m=1 的请求只来自脚本 fake 交互与合成 H2 交换。
 ///
 /// WINDOW_UPDATE 的触发阈值是**逐进程常量**，不逐次重采样。此前是
 /// `gen_range(1MB..=4MB)` 且每越过一次就重新采样一个新阈值 ⇒ 全随机，而
 /// 真实 H2 接收端的规则是确定的：窗口是实现里的编译期常量，消费字节越过
-/// 窗口的某个固定比例就回补一条 WINDOW_UPDATE。取值依据（Firefox，与本
-/// 项目的 TLS 指纹同源）：
-/// * `ASpdySession::kInitialRwin = 12 * 1024 * 1024`（12MB）——Firefox 在
-///   `SendHello` 里把连接级接收窗口从 65535 抬到这个值，源码注释原文
-///   *"This is roughly the amount of data a suspended channel will have to
-///   buffer before h2 flow control kicks in."*；
-/// * 「已消费量达到本地窗口的一半即回补」是 H2 接收端的通行规则（nghttp2 的
-///   `session_update_recv_connection_window_size`：`local_window_size / 2 <
-///   consumed_size` 时提交 WINDOW_UPDATE）。
+/// 窗口的某个固定比例就回补一条 WINDOW_UPDATE。
 ///
-/// 两者相乘 = 6 MiB。用 `OnceLock` 而不是 `const`：语义是「进程内解析一次、
-/// 此后恒定」，与真实实现的编译期常量同一口径，同时保留测试覆写点。
-const H2_FIREFOX_SESSION_WINDOW_BYTES: usize = 12 * 1024 * 1024;
+/// **取值：连接级窗口 32 MiB、回补阈值 = 窗口的 1/8（4 MiB）。** 窗口值的
+/// 原型是 Firefox 的 `ASpdySession::kInitialRwin = 12 MiB`，回补规则的原型
+/// 是 nghttp2 的「消费达本地窗口一半即回补」。但窗口决定吞吐上限：无停顿
+/// 速率 = `(窗口 − 阈值)/RTT`，12 MiB 窗口 + 半窗回补在 175 ms RTT 下只剩
+/// (12−6) MiB/0.175s ≈ 288 mbps，把 500 mbps 链路活活钉死。窗口值与阈值
+/// 都不上链（WU 记录尺寸恒定 37 字节），可观测的只有回补节奏从「每 6 MiB
+/// 一条」变为「每 4 MiB 一条」，仍落在真实 H2 端点的合理区间。32/4 MiB
+/// 给出 (32−4)/0.175s ≈ 1.3 gbps 的无停顿余量，覆盖目标链路。
+///
+/// 用 `OnceLock` 而不是 `const`：语义是「进程内解析一次、此后恒定」，与
+/// 真实实现的编译期常量同一口径，同时保留测试覆写点。
+const H2_SESSION_WINDOW_BYTES: usize = 32 * 1024 * 1024;
 static H2_WINDOW_UPDATE_THRESHOLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// 论文（USENIX Sec'24, Xue et al.）的观测窗口 `Wo`：25 个承载数据的 TCP 包。
@@ -647,7 +651,7 @@ fn h2_window_update_threshold() -> usize {
     if override_bytes > 0 {
         return override_bytes;
     }
-    *H2_WINDOW_UPDATE_THRESHOLD.get_or_init(|| H2_FIREFOX_SESSION_WINDOW_BYTES / 2)
+    *H2_WINDOW_UPDATE_THRESHOLD.get_or_init(|| H2_SESSION_WINDOW_BYTES / 8)
 }
 
 /// 下一次合成 H2 交换的间隔：开场窗口内是数十毫秒量级，之后是浏览量级。
@@ -676,17 +680,21 @@ fn sample_h2_exchange_request_wire() -> usize {
 
 /// H2 流控状态：发送侧窗口（连接级 + 每流）与接收侧回补记账（消费 → WU）。
 ///
-/// **为什么这是修复而不是新机制**：真实 H2 接收方按消费字节数回补窗口、发送
-/// 方在窗口耗尽后停发，接收缓冲由窗口自身界定——此前 KanoTLS 的「缓冲超限 →
-/// 丢数据 + 杀流」正是没有窗口语义的产物。现在把已有的两条 Firefox 常量
-/// （连接窗口 12 MiB、半窗口回补）从「假填充」变成真信贷：
+/// **为什么这是修复而不是新机制**：真实 H2 接收方回补窗口、发送方在窗口
+/// 耗尽后停发，接收缓冲由窗口自身界定——此前 KanoTLS 的「缓冲超限 →
+/// 丢数据 + 杀流」正是没有窗口语义的产物。这里把伪装常量（连接窗口、
+/// 回补阈值）从「假填充」变成真信贷：
 ///
 /// * 发送侧：`acquire_credit` 在提交前检查（连接信贷 && 每流信贷），不足则
 ///   挂起；WINDOW_UPDATE 帧到达（读循环帧层处理，纯记账）后放行。挂起即
 ///   背压：中继不再读源站，源站 TCP 窗口自然填满——与真实 H2 逐字节同构。
-/// * 接收侧：`note_consumed` 由中继在字节真正交付本地/远端后调用，按
-///   「消费过半窗口」的 nghttp2 规则回吐 WINDOW_UPDATE（每流 1 MiB、
-///   连接 6 MiB，尺寸恒为 37 字节的 `WINDOW_UPDATE_WIRE`）。
+/// * 接收侧连接级：读循环**收到**数据帧即入账回补（`note_conn_received`）。
+///   连接级窗口管的是接收缓冲：字节到达即占缓冲，无论随后交付还是丢弃都
+///   已释放，故按收到回补才不会有泄漏路径。
+/// * 接收侧每流：`note_consumed` 由中继在字节真正交付本地/远端后调用
+///   （每流窗口保留交付语义 = 应用背压，nghttp2 规则），越过 1/8 窗口
+///   阈值（2 MiB）回吐一条 WINDOW_UPDATE（尺寸恒为 37 字节的
+///   `WINDOW_UPDATE_WIRE`）。
 ///
 /// **旧对端兼容**：本端只在收到对端 SETTINGS 携带 `fc=1` 后才启用发送侧
 /// 门控（SETTINGS 本就是 H2 协商窗口语义的载体）；对未声明 fc 的对端，门控
@@ -706,23 +714,26 @@ pub(crate) struct WindowState {
     conn_consumed_since_wu: AtomicU64,
     stream_window: i64,
     stream_wu_threshold: u64,
-    /// 连接级信贷到达信号。用 `notify_one`（留 permit）而不是
-    /// `notify_waiters`：信贷在「检查 → 挂起」的间隙到达时，permit 会留给
-    /// 下一个挂起者，杜绝丢唤醒。
+    /// 连接级信贷到达信号。所有等待者都在「醒了再查一次」的幂等循环里，
+    /// 故用 `notify_waiters` 全量唤醒：一条 WU 到账要放行所有够格的流，
+    /// `notify_one` 会让其余流睡到下一条 WU（并发崩塌成锯齿）。
     credit_notify: Notify,
 }
 
 impl WindowState {
     pub(crate) fn new(writer: SharedTunnelWriter) -> Self {
-        // 连接窗口 = 2 × 半窗口回补阈值（Firefox 12 MiB 连接窗口，/2 即
-        // nghttp2 的「消费达本地窗口一半即回补」规则）。测试覆写点
+        // 连接窗口 = 8 × 回补阈值（论证见 `H2_SESSION_WINDOW_BYTES`：无停顿
+        // 速率 = (窗口−阈值)/RTT，半窗回补会把可用速率砍半）。测试覆写点
         // `H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES` 沿用在阈值上，窗口
         // 随之缩放。
         let conn_wu_threshold = h2_window_update_threshold() as u64;
-        let conn_window = (conn_wu_threshold as i64).saturating_mul(2);
-        let stream_window = STREAM_WINDOW_OVERRIDE_BYTES
-            .load(Ordering::Relaxed)
-            .max(STREAM_WINDOW_BYTES) as i64;
+        let conn_window = (conn_wu_threshold as i64).saturating_mul(8);
+        let stream_override = STREAM_WINDOW_OVERRIDE_BYTES.load(Ordering::Relaxed);
+        let stream_window = if stream_override > 0 {
+            stream_override
+        } else {
+            STREAM_WINDOW_BYTES
+        } as i64;
         Self {
             writer,
             peer_flow_control: AtomicBool::new(false),
@@ -730,7 +741,7 @@ impl WindowState {
             conn_wu_threshold,
             conn_consumed_since_wu: AtomicU64::new(0),
             stream_window,
-            stream_wu_threshold: (stream_window as u64).saturating_div(2).max(1),
+            stream_wu_threshold: (stream_window as u64).saturating_div(8).max(1),
             credit_notify: Notify::new(),
         }
     }
@@ -753,6 +764,14 @@ impl WindowState {
     /// `pending_notify`：每流 WU 到达时由帧层单独唤醒，连接级 WU 唤醒
     /// `credit_notify`——两者都只做「再查一次」的提示，误唤醒无害。
     /// 会话关闭时立即放行，让后续提交在 writer 的既有失败路径上报错。
+    ///
+    /// 扣减是两阶段 CAS：先连接级、再流级，流级不足则回滚连接级后等待。
+    /// 此前的「先 load 检查、再各自 fetch_sub」不是原子的——并发流可同时
+    /// 通过检查再双双扣减，把信贷打成负值，制造无必要的挂起毛刺。
+    ///
+    /// 等待侧用「先 `enable` 注册、再检查、后 park」的顺序：`notify_waiters`
+    /// 不留 permit，若先检查后注册，信贷在间隙到达会丢唤醒（挂起者睡到
+    /// 下一条 WU）；先注册则间隙到达的唤醒必然命中已注册的我们。
     pub(crate) async fn acquire_credit(
         &self,
         stream_credit: &AtomicI64,
@@ -767,16 +786,34 @@ impl WindowState {
             if self.writer.is_closed() {
                 return;
             }
-            if self.conn_credit.load(Ordering::Relaxed) >= len
-                && stream_credit.load(Ordering::Relaxed) >= len
+            let conn_notified = self.credit_notify.notified();
+            let stream_notified = stream_notify.notified();
+            tokio::pin!(conn_notified);
+            tokio::pin!(stream_notified);
+            let _ = conn_notified.as_mut().enable();
+            let _ = stream_notified.as_mut().enable();
+
+            let conn = self.conn_credit.load(Ordering::Relaxed);
+            if conn >= len
+                && self
+                    .conn_credit
+                    .compare_exchange(conn, conn - len, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
             {
-                self.conn_credit.fetch_sub(len, Ordering::Relaxed);
-                stream_credit.fetch_sub(len, Ordering::Relaxed);
-                return;
+                let stream = stream_credit.load(Ordering::Relaxed);
+                if stream >= len
+                    && stream_credit
+                        .compare_exchange(stream, stream - len, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    return;
+                }
+                // 流级不足：回滚连接级，等任一方向的新信贷再重试。
+                self.conn_credit.fetch_add(len, Ordering::Relaxed);
             }
             tokio::select! {
-                _ = self.credit_notify.notified() => {}
-                _ = stream_notify.notified() => {}
+                _ = conn_notified => {}
+                _ = stream_notified => {}
             }
         }
     }
@@ -784,12 +821,15 @@ impl WindowState {
     fn add_conn_credit(&self, increment: u32) {
         self.conn_credit
             .fetch_add(i64::from(increment), Ordering::Relaxed);
-        self.credit_notify.notify_one();
+        self.credit_notify.notify_waiters();
     }
 
     fn add_stream_credit(&self, credit: &AtomicI64, notify: &Arc<Notify>, increment: u32) {
         credit.fetch_add(i64::from(increment), Ordering::Relaxed);
-        notify.notify_one();
+        // `pending_notify` 同时服务读侧（pending 数据到达）与写侧（本流信贷
+        // 到达）：`notify_one` 可能唤醒错误的一侧把 permit 消耗掉，另一侧
+        // 睡到下一个无关事件。两侧都是幂等再查循环，全量唤醒无害。
+        notify.notify_waiters();
     }
 
     /// 连接级消费记账：跨流并发安全（CAS），越过阈值的那一方独占回补，
@@ -812,34 +852,53 @@ impl WindowState {
         }
     }
 
-    /// 接收侧回补入账：中继在字节真正交付应用层后调用。每流与连接级各自
-    /// 累计，越过半窗口阈值即回吐一条真实 WINDOW_UPDATE（flag=3）。
-    ///
-    /// `stream_consumed_since_wu` 在流对象上（单消费者，fetch_add/fetch_sub
-    /// 安全）；连接级计数器在这里（多流并发，CAS）。
-    ///
-    /// 回补帧走 `try_write_packets`（fire-and-forget）：控制队列满时丢弃是
-    /// **保守且自愈**的——发送方少拿一次信贷只会更早停发，而接收缓冲
-    /// （≥ 窗口 ≥ 阈值）仍在被中继排空，下一次越过阈值必会再发一条。
+    /// 接收侧连接级回补：读循环每收到一个数据帧即按载荷长度入账（连接级
+    /// 窗口管的是接收缓冲，字节到达即占/即释，与应用是否已交付无关）。
+    /// 因此 Closing/NotFound/溢出杀流/拆除丢弃等一切「收到但未交付」路径
+    /// 自动回补——若按交付回补，这些路径上的每个字节都会从发送方连接级
+    /// 信贷里永久流失（窗口只减不增，表现为传输越跑越慢）。
+    pub(crate) fn note_conn_received(&self, len: usize) {
+        if let Some(conn_total) = self.bump_conn_consumed(len as u64) {
+            if !self.send_window_update(0, conn_total) {
+                // 入队失败（控制队列满）：把消费量加回去，后续入账会再次
+                // 越过阈值补发这条 WU。丢信贷是永久泄漏，恢复只是让回补
+                // 迟到；并发 bump 下可能多补一次（≤ 阈值量级），方向是
+                // 多给对端信贷，有界且良性。
+                self.conn_consumed_since_wu
+                    .fetch_add(conn_total as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// 接收侧每流回补入账：中继在字节真正交付应用层后调用（每流窗口保留
+    /// 交付语义 = 应用背压）。`stream_consumed_since_wu` 在流对象上（单
+    /// 消费者，fetch_add/fetch_sub 安全）。越过阈值即回吐一条真实
+    /// WINDOW_UPDATE（flag=3，尺寸恒为 37 字节的 `WINDOW_UPDATE_WIRE`）。
     pub(crate) fn note_consumed(&self, sid: u32, stream_consumed_since_wu: &AtomicU64, len: usize) {
         let len_u64 = len as u64;
         let stream_total = stream_consumed_since_wu.fetch_add(len_u64, Ordering::Relaxed) + len_u64;
         if stream_total >= self.stream_wu_threshold {
             stream_consumed_since_wu.fetch_sub(stream_total, Ordering::Relaxed);
-            self.send_window_update(sid, stream_total.min(u32::MAX as u64) as u32);
-        }
-        if let Some(conn_total) = self.bump_conn_consumed(len_u64) {
-            self.send_window_update(0, conn_total);
+            if !self.send_window_update(sid, stream_total.min(u32::MAX as u64) as u32) {
+                // 与 note_conn_received 同理：恢复计数，下次消费补发，
+                // 不让一次控制队列拥塞变成永久信贷泄漏。
+                stream_consumed_since_wu.fetch_add(stream_total, Ordering::Relaxed);
+            }
         }
     }
 
-    fn send_window_update(&self, sid: u32, increment: u32) {
+    /// 入队一条 WINDOW_UPDATE（fire-and-forget：读循环绝不因写端排队而
+    /// 阻塞）。返回是否成功入队；失败时调用方负责恢复对应消费计数。
+    fn send_window_update(&self, sid: u32, increment: u32) -> bool {
         let packet = encode_padding_window_update_sized(sid, increment, PADDING_WINDOW_UPDATE_WIRE);
         if let Err(e) =
             self.writer
                 .try_write_packets(vec![packet], FlushBehavior::Auto, TrafficClass::Control)
         {
-            debug!("window update dropped (control queue full): {}", e);
+            debug!("window update deferred (control queue full): {}", e);
+            false
+        } else {
+            true
         }
     }
 }
@@ -1632,9 +1691,9 @@ impl Session {
         tokio::pin!(idle_timeout);
 
         // 稳态 H2 骨架状态：post_script_off 时整体关闭（定时器取禁用姿态，
-        // 分支被 guard 屏蔽）。消费驱动的 WINDOW_UPDATE 不再由读循环注入
-        // 假填充——真实信贷帧由中继的 `note_consumed` 路径回吐（见
-        // WindowState），与骨架开关无关（流控是正确性机制，不是伪装帧）。
+        // 分支被 guard 屏蔽）。真实信贷帧（WINDOW_UPDATE）由读循环按收到
+        // 回补（连接级）与中继 `note_consumed` 按交付回补（每流），两者都
+        // 与骨架开关无关（流控是正确性机制，不是伪装帧）。
         let h2_skeleton_enabled = !self.post_script_off;
 
         // 合成共存流：仅客户端方向（真实 H2 的请求由客户端发起）。
@@ -1871,6 +1930,11 @@ impl Session {
     ) -> Result<(), anyhow::Error> {
         match frame.cmd {
             CMD_PSH => {
+                // 连接级信贷按「收到」回补（WindowState::note_conn_received）：
+                // 字节一进会话即占/即释接收缓冲，与下面 dispatch 到交付、
+                // 缓冲还是丢弃无关——一切丢弃路径由此自动回补，发送方连接级
+                // 信贷不会因本地丢帧而永久流失。
+                self.windows.note_conn_received(frame.payload.len());
                 if self.is_pending_open_stream(frame.stream_id).await
                     && self
                         .store_pending_open_data(frame.stream_id, frame.payload.clone())
@@ -1930,7 +1994,9 @@ impl Session {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(payload)) => {
                                     if self.store_pending_data(frame.stream_id, payload).await {
-                                        notify.notify_one();
+                                        // 读/写两侧等待者都已先注册再检查，
+                                        // 全量唤醒无副作用（幂等再查）。
+                                        notify.notify_waiters();
                                     } else {
                                         warn!(
                                             stream_id = frame.stream_id,
@@ -1948,7 +2014,7 @@ impl Session {
                             }
                         } else {
                             if self.store_pending_data(frame.stream_id, payload).await {
-                                notify.notify_one();
+                                notify.notify_waiters();
                             } else {
                                 warn!(
                                     stream_id = frame.stream_id,
@@ -2239,10 +2305,10 @@ impl Session {
             return false;
         }
 
-        // fc 对端的每流缓冲上限 = 窗口 + 首 RTT 越界余量（对端 SETTINGS
-        // 确认前本端可能已超发一个 RTT 的字节，见 WindowState）。窗口本身
-        // 界定在途字节，故此限对正常 fc 对端结构性不可达；旧对端沿用
-        // 2 MiB 原值，行为与旧版一致。
+        // fc 对端的每流缓冲上限 = 2 × 窗口基值 = 窗口 + 一个窗口量级的
+        // 越界余量（对端 SETTINGS 确认前本端可能已超发，见 WindowState）。
+        // 窗口本身界定在途字节，故此限对正常 fc 对端结构性不可达；非 fc
+        // 旧对端用基值本身（16 MiB），聚合另受 MAX_PENDING_STREAM_BYTES 封顶。
         let overflow_limit = if self.windows.peer_supports_flow_control() {
             MAX_STREAM_OVERFLOW_BYTES.saturating_mul(2)
         } else {
@@ -2510,7 +2576,7 @@ impl Session {
                 pending.push_back(sid, item);
             }
             drop(pending);
-            notify.notify_one();
+            notify.notify_waiters();
         }
 
         if pending_fin {
@@ -2526,7 +2592,7 @@ impl Session {
                 // 数据未全部投递时 FIN 不能丢：重新挂回 pending_fin，由消费者
                 // 排空 pending_data 后在 read 路径补投为 EOF。
                 self.pending_fin.lock().await.insert(sid);
-                notify.notify_one();
+                notify.notify_waiters();
             }
         }
     }

@@ -17,7 +17,7 @@ pub const RELAY_CHUNK_SIZE: usize = frame::MAX_PAYLOAD_LEN;
 pub(crate) const MAX_PENDING_FLUSH_SIZE: usize = 256 * 1024;
 
 pub use session::{Session, SessionConfig};
-pub use stream::{Stream, PEER_NEVER_PROCESSED_ERROR};
+pub use stream::{Stream, StreamReadHalf, StreamWriteHalf, PEER_NEVER_PROCESSED_ERROR};
 
 #[cfg(test)]
 mod tests {

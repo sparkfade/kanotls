@@ -682,6 +682,6 @@ len_lo=162: 162×0.85=137.70 → as usize 137 → 线速 161 → L2
 
 它们**应该**是常量（原则 2：真实实现的尺寸决策代码就是编译期常量）。问题因此不是「要不要随机化」，而是：**这套硬编码分布看起来像某个真实实现，还是像不存在的东西？**
 
-所以每一处硬编码取值都必须能指认一个真实来源：Firefox 的 keepalive 600 s / 1 s / 4 probes、nginx 的 `keepalive_time 1h`、Firefox 的 `ping-threshold = 58 s`、Firefox 的 `kInitialRwin = 12 MiB`（取半得 WINDOW_UPDATE 阈值）、H2 的 SETTINGS / WINDOW_UPDATE / PING / GOAWAY 帧尺寸、捕获的 Firefox 15 个扩展。**「全球统一」在这里不是缺陷，只要它统一到的是真实的东西。**
+所以每一处硬编码取值都必须能指认一个真实来源：Firefox 的 keepalive 600 s / 1 s / 4 probes、nginx 的 `keepalive_time 1h`、Firefox 的 `ping-threshold = 58 s`、Firefox 的 `kInitialRwin = 12 MiB`（连接窗口的原型——为让无停顿速率 `(窗口 − 阈值)/RTT` 覆盖高 BDP 链路，窗口提到 32 MiB、WINDOW_UPDATE 阈值取窗口的 1/8）、H2 的 SETTINGS / WINDOW_UPDATE / PING / GOAWAY 帧尺寸、捕获的 Firefox 15 个扩展。**「全球统一」在这里不是缺陷，只要它统一到的是真实的东西。**
 
 同理，`H2_GHOST_VARIANTS` 的变体选择改为**逐进程**而非逐连接：真实 Firefox 的 SETTINGS 是编译期固定的，同一浏览器的每条连接都发相同尺寸；逐连接抖动等于在一个真实恒定的维度上制造方差。它也**不**按 PSK 派生——那会让线速长度变成密钥材料的函数，且把一个部署的全部客户端塌到同一变体。

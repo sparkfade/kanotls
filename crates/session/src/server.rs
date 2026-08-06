@@ -5,7 +5,7 @@ use crate::session::{
 };
 use bytes::Bytes;
 use kanotls_tunnel::SnowyStream;
-use std::sync::atomic::{AtomicI64, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::warn;
@@ -96,7 +96,7 @@ impl ServerSessionHandler {
                     flush_result,
                     PendingAcceptFlushResult::PeerClosed | PendingAcceptFlushResult::PeerHalfClosed
                 ),
-                write_closed: false,
+                write_closed: Arc::new(AtomicBool::new(false)),
                 closed: matches!(flush_result, PendingAcceptFlushResult::ClosedLocally),
                 pending_data: self.session.pending_data.clone(),
                 pending_notify,
@@ -116,12 +116,43 @@ pub struct ServerStream {
     fin_rx: mpsc::Receiver<()>,
     session: Arc<Session>,
     read_closed: bool,
-    write_closed: bool,
+    /// 写侧关闭标志与写句柄共享（`write_handle`）：上行任务里的
+    /// `close_write` 与本体上的 `close` 通过同一个原子位去重 FIN。
+    write_closed: Arc<AtomicBool>,
     closed: bool,
     pending_data: Arc<Mutex<PendingData>>,
     pending_notify: Arc<Notify>,
     /// 本流**接收**方向已消费、尚未回补的字节（单消费者：本端中继独占）。
     consumed_since_wu: AtomicU64,
+}
+
+/// 服务端隧道流的写半句柄：`ServerStream::write`/`close_write` 本就是无
+/// 内部可变状态的操作，抽成 Arc 句柄后上行中继任务可独立持有——与客户
+/// 端 `Stream::into_split` 同一目的：写方向在流控门（等 WINDOW_UPDATE）
+/// 挂起时，读方向的交付与回补照常进行，双向饱和不再互等成死锁环。
+pub struct ServerStreamWriter {
+    sid: u32,
+    session: Arc<Session>,
+    write_closed: Arc<AtomicBool>,
+}
+
+impl ServerStreamWriter {
+    pub async fn write(&self, data: &[u8]) -> Result<(), anyhow::Error> {
+        if self.write_closed.load(std::sync::atomic::Ordering::Relaxed) {
+            anyhow::bail!("stream write side is closed");
+        }
+        self.session.write_data(self.sid, data).await
+    }
+
+    pub async fn close_write(&self) -> Result<(), anyhow::Error> {
+        if self
+            .write_closed
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        self.session.shutdown_stream(self.sid).await
+    }
 }
 
 impl ServerStream {
@@ -130,6 +161,11 @@ impl ServerStream {
             if let Ok(payload) = self.data_rx.try_recv() {
                 return Some(payload.into_bytes());
             }
+            // 先注册再检查：pending 数据到达用 `notify_waiters`（不留
+            // permit），若先检查后注册，间隙到达的通知会被丢掉。
+            let pending_notified = self.pending_notify.notified();
+            tokio::pin!(pending_notified);
+            let _ = pending_notified.as_mut().enable();
             if let Some(data) = self.try_drain_pending_data() {
                 return Some(data);
             }
@@ -141,7 +177,7 @@ impl ServerStream {
                 payload = self.data_rx.recv() => {
                     return payload.map(BufferedPayload::into_bytes);
                 }
-                _ = self.pending_notify.notified() => {
+                _ = pending_notified => {
                     continue;
                 }
                 _ = self.fin_rx.recv() => {
@@ -162,10 +198,19 @@ impl ServerStream {
     }
 
     pub async fn write(&self, data: &[u8]) -> Result<(), anyhow::Error> {
-        if self.write_closed || self.closed {
+        if self.write_closed.load(std::sync::atomic::Ordering::Relaxed) || self.closed {
             anyhow::bail!("stream write side is closed");
         }
         self.session.write_data(self.sid, data).await
+    }
+
+    /// 抽出一个可独立持有的写半句柄（论证见 `ServerStreamWriter`）。
+    pub fn write_handle(&self) -> ServerStreamWriter {
+        ServerStreamWriter {
+            sid: self.sid,
+            session: self.session.clone(),
+            write_closed: self.write_closed.clone(),
+        }
     }
 
     /// 接收侧回补入账：中继在字节真正交付远端后调用（H2 语义，见
@@ -177,13 +222,14 @@ impl ServerStream {
     }
 
     pub async fn close_write(&mut self) -> Result<(), anyhow::Error> {
-        if self.closed || self.write_closed {
+        if self.closed || self.write_closed.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(());
         }
 
         let result = self.session.shutdown_stream(self.sid).await;
         if result.is_ok() {
-            self.write_closed = true;
+            self.write_closed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         result
     }
@@ -205,7 +251,7 @@ impl ServerStream {
             return Ok(());
         }
 
-        let result = if self.write_closed {
+        let result = if self.write_closed.load(std::sync::atomic::Ordering::Relaxed) {
             Ok(())
         } else {
             self.close_write().await

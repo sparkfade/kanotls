@@ -284,6 +284,17 @@ async fn session_pair_with_config(
     (client, server)
 }
 
+/// 等待对端 SETTINGS（fc=1）到达、发送侧流控门生效。
+async fn wait_fc_negotiated(session: &Session) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !session.windows.peer_supports_flow_control() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fc negotiation should complete");
+}
+
 #[tokio::test]
 async fn dropped_first_stream_does_not_poison_next_open() {
     let (client, server) = session_pair().await;
@@ -908,8 +919,9 @@ async fn flow_control_gates_sender_until_consumption_grants_credit() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let _wire_lock = WIRE_OBSERVATION_LOCK.lock().await;
 
-    // 每流窗口 256 KiB（回补阈值 128 KiB），连接级窗口 128 KiB
-    // （阈值覆写 64 KiB × 2）：总量 1 MiB 必须靠回补才能走完。
+    // 每流窗口覆写 256 KiB（回补阈值 1/8 = 32 KiB），连接级窗口
+    // 512 KiB（阈值覆写 64 KiB × 8）：总量 1 MiB 必须靠回补才能走完。
+    // 门控来自每流窗口（按交付回补）；连接级按收到回补，不构成持久门控。
     const STREAM_WINDOW: usize = 256 * 1024;
     const CHUNK: usize = 64 * 1024;
     const TOTAL: usize = 1024 * 1024;
@@ -1062,6 +1074,174 @@ async fn no_flow_control_gating_without_peer_fc_declaration() {
 
     super::STREAM_WINDOW_OVERRIDE_BYTES.store(0, Ordering::Relaxed);
     client.force_close();
+}
+
+// 回归：WU 入队失败（写端关闭/控制队列满）时消费计数必须恢复——此前计数
+// 先清零再发送，丢一条 WU 就永久漏掉一等份信贷（连接窗口只减不增，
+// 吞吐随时间单调下降）。
+#[tokio::test]
+async fn window_update_enqueue_failure_restores_consumed_counters() {
+    use super::H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES;
+    use std::sync::atomic::Ordering;
+    let _wire_lock = WIRE_OBSERVATION_LOCK.lock().await;
+
+    const CONN_THRESHOLD: usize = 64 * 1024;
+    H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES.store(CONN_THRESHOLD, Ordering::Relaxed);
+
+    let (client, server) = session_pair().await;
+    let windows = client.windows.clone();
+
+    // 关掉写端 ⇒ try_write_packets 必败 ⇒ send_window_update 返回 false。
+    client.writer.close();
+
+    // 连接级：越过阈值 → 发送失败 → 计数恢复；再入账后继续累计并再次尝试。
+    windows.note_conn_received(80 * 1024);
+    assert_eq!(
+        windows.conn_consumed_since_wu.load(Ordering::Relaxed),
+        80 * 1024,
+        "WU 发送失败后连接级消费计数必须恢复"
+    );
+    windows.note_conn_received(16 * 1024);
+    assert_eq!(
+        windows.conn_consumed_since_wu.load(Ordering::Relaxed),
+        96 * 1024,
+        "恢复后的计数必须继续累计（再次越过阈值、再次恢复）"
+    );
+
+    // 每流：默认阈值 2 MiB（16 MiB 窗口 / 8）。
+    let consumed = std::sync::atomic::AtomicU64::new(0);
+    windows.note_consumed(7, &consumed, 3 * 1024 * 1024);
+    assert_eq!(
+        consumed.load(Ordering::Relaxed),
+        3 * 1024 * 1024,
+        "WU 发送失败后每流消费计数必须恢复"
+    );
+
+    H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES.store(0, Ordering::Relaxed);
+    client.force_close();
+    server.session.force_close();
+}
+
+// 回归：acquire_credit 两阶段 CAS——并发流不得把信贷扣成负值；且一条
+// 连接级 WU 必须唤醒所有挂起者（notify_waiters），而不是只放走一个
+// （notify_one 曾让其余流睡到下一条 WU，并发崩塌成相位化锯齿）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acquire_credit_is_atomic_and_conn_credit_wakes_all_waiters() {
+    use super::H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    let _wire_lock = WIRE_OBSERVATION_LOCK.lock().await;
+
+    const CONN_THRESHOLD: usize = 8 * 1024;
+    H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES.store(CONN_THRESHOLD, Ordering::Relaxed);
+    // 连接窗口 = 8 × 8 KiB = 64 KiB。
+    let (client, server) = session_pair().await;
+    // fc 协商要等首笔写入带出客户端 SETTINGS、服务端回 SETTINGS 才完成：
+    // 先用一条热身流触发交换。
+    let mut warmup = client.open_stream().await.expect("warmup stream opens");
+    warmup
+        .write_early(b"warmup.example:443")
+        .await
+        .expect("warmup write triggers settings exchange");
+    wait_fc_negotiated(&client).await;
+    let windows = client.windows.clone();
+    assert!(
+        windows.peer_supports_flow_control(),
+        "session_pair 之后 fc 应已协商"
+    );
+
+    // 先占满连接信贷（流级信贷给足，只让连接级成为瓶颈）。抽干当前
+    // 可用量而不是写死 64 KiB：热身写入可能已扣过零头。
+    let seed_credit = std::sync::Arc::new(AtomicI64::new(1 << 40));
+    let seed_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let available = windows.conn_credit.load(Ordering::Relaxed);
+    windows
+        .acquire_credit(&seed_credit, &seed_notify, available as usize)
+        .await;
+    assert_eq!(windows.conn_credit.load(Ordering::Relaxed), 0);
+
+    // 4 个等待者各要 16 KiB：全部必须挂起。
+    let mut waiters = Vec::new();
+    for _ in 0..4 {
+        let windows = windows.clone();
+        waiters.push(tokio::spawn(async move {
+            let credit = std::sync::Arc::new(AtomicI64::new(1 << 40));
+            let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+            windows.acquire_credit(&credit, &notify, 16 * 1024).await;
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        waiters.iter().all(|w| !w.is_finished()),
+        "连接信贷为零时所有等待者必须挂起"
+    );
+
+    // 一条 WU 补足全部等待者：必须放走全部 4 个，且信贷不归负。
+    windows.add_conn_credit(64 * 1024);
+    for w in waiters {
+        tokio::time::timeout(Duration::from_secs(2), w)
+            .await
+            .expect("一条 WU 必须唤醒全部等待者")
+            .expect("waiter joins");
+    }
+    assert!(
+        windows.conn_credit.load(Ordering::Relaxed) >= 0,
+        "并发扣减不得把连接信贷打成负值"
+    );
+
+    H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES.store(0, Ordering::Relaxed);
+    client.force_close();
+    server.session.force_close();
+}
+
+// 回归：defer_target 之后的首写走 write_gather_open，目标地址 + 数据
+// 只扣一次信贷。此前 write() 统一预扣、终态路径再扣，开场首写被双倍
+// 扣费，每条流的首块数据永久漏一份窗口信贷。
+#[tokio::test]
+async fn gather_open_first_write_debits_credit_exactly_once() {
+    use std::sync::atomic::Ordering;
+    let _wire_lock = WIRE_OBSERVATION_LOCK.lock().await;
+
+    let (client, server) = session_pair().await;
+    // fc 协商要等首笔写入带出客户端 SETTINGS、服务端回 SETTINGS 才完成：
+    // 先用一条热身流触发交换（被测流的信贷在这之后才开始计量）。
+    let mut warmup = client.open_stream().await.expect("warmup stream opens");
+    warmup
+        .write_early(b"warmup.example:443")
+        .await
+        .expect("warmup write triggers settings exchange");
+    wait_fc_negotiated(&client).await;
+    let mut stream = client.open_stream().await.expect("stream opens");
+    let sid = stream.stream_id;
+    let before = client
+        .streams
+        .read()
+        .await
+        .get(&sid)
+        .expect("handle exists")
+        .send_credit
+        .load(Ordering::Relaxed);
+
+    const TARGET: &[u8] = b"gather.example:443";
+    const DATA: &[u8] = b"first-payload";
+    stream.defer_target(TARGET);
+    stream.write(DATA).await.expect("gather write succeeds");
+
+    let after = client
+        .streams
+        .read()
+        .await
+        .get(&sid)
+        .expect("handle exists")
+        .send_credit
+        .load(Ordering::Relaxed);
+    assert_eq!(
+        before - after,
+        (TARGET.len() + DATA.len()) as i64,
+        "开场首写必须恰好扣一次（目标 + 数据）"
+    );
+
+    client.force_close();
+    server.session.force_close();
 }
 
 // 客户端对真实 CMD_SETTINGS 的首条应答必须是 33 字节 SETTINGS-ACK
@@ -1263,8 +1443,8 @@ async fn high_throughput_bulk_transfer_preserves_stream_integrity() {
                     break;
                 }
             }
-            // 模拟中继：字节交付即回补窗口，否则发送方（client）会被
-            // 2 MiB 每流窗口门控，4 MiB 传输永远走不完。
+            // 模拟中继：字节交付即回补每流窗口——无论窗口常量取值如何
+            // （含并发测试的覆写点压窗），发送方都不会被门控钉死。
             server_stream.note_consumed(chunk.len());
             received += chunk.len();
             if !ok {
@@ -1315,6 +1495,9 @@ async fn high_throughput_bulk_transfer_preserves_stream_integrity() {
 
 #[tokio::test]
 async fn concurrent_bidirectional_bulk_transfer_keeps_session_usable() {
+    // 其他测试会用进程级覆写点压窗口/阈值；本测试不打锁会被波及
+    // （窗口被压小后，不回补的方向会被门控钉死）。
+    let _wire_lock = WIRE_OBSERVATION_LOCK.lock().await;
     let (client, server) = session_pair().await;
 
     async fn open_test_stream(
@@ -1388,6 +1571,9 @@ async fn concurrent_bidirectional_bulk_transfer_keeps_session_usable() {
                 }
             }
             received += data.len();
+            // 模拟中继：消费即回补每流窗口——与 up_reader 同口径，窗口
+            // 被并发测试的覆写点压小时本方向也不会被门控钉死。
+            down_client_stream.note_consumed(data.len());
             if !ok || received >= EACH_WAY {
                 break;
             }
@@ -2025,9 +2211,9 @@ async fn raw_server_session_with_open_stream(
 // W3(a)：bulk 接收端按分发字节数回注 WINDOW_UPDATE 尺寸的 flag=1 padding；
 // 在 bulk 发送方（裸 server 端）统计到的 reply 帧数量必须达到阈值/块数
 // 推算出的预期量级，且流数据完好。
-// W3(b)：消费驱动的回补不再由读循环注入假填充，而是中继消费后回吐真实
-// WINDOW_UPDATE 信贷帧（flag=3）——每流 1 MiB、连接级 6 MiB 的 nghttp2
-// 半窗口规则，线速尺寸恒为 WINDOW_UPDATE_WIRE。
+// W3(b)：连接级回补由读循环按「收到」字节数回吐真实 WINDOW_UPDATE 信贷帧
+// （flag=3，1/8 窗口阈值），与应用是否交付无关；每流回补仍由中继消费驱动。
+// 线速尺寸恒为 WINDOW_UPDATE_WIRE。
 #[tokio::test]
 async fn bulk_consumption_emits_real_window_update_frames() {
     use super::H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES;
@@ -2091,10 +2277,10 @@ async fn bulk_consumption_emits_real_window_update_frames() {
         (received, ok)
     });
 
-    // 每消费 CHUNK(=THRESHOLD) 字节，client 恰好越过一次连接级回补阈值，
-    // 预期恰好 CHUNKS 条 flag=3 WINDOW_UPDATE（stream_id=0、增量=THRESHOLD）；
-    // 留少量余量防计时边界。每流阈值（默认 1 MiB）未被 256 KB 总传输越过，
-    // 不应出现每流 WU。
+    // 每收到 CHUNK(=THRESHOLD) 字节，client 读循环恰好越过一次连接级回补
+    // 阈值，预期恰好 CHUNKS 条 flag=3 WINDOW_UPDATE（stream_id=0、增量=
+    // THRESHOLD）；留少量余量防计时边界。每流阈值（默认 2 MiB）未被
+    // 256 KiB 总传输越过，不应出现每流 WU。
     let mut updates = 0usize;
     let mut stream_updates = 0usize;
     let collect = async {
@@ -2133,13 +2319,15 @@ async fn bulk_consumption_emits_real_window_update_frames() {
         CHUNKS,
         updates
     );
-    assert_eq!(stream_updates, 0, "256 KiB 传输不得越过 1 MiB 每流回补阈值");
+    assert_eq!(stream_updates, 0, "256 KiB 传输不得越过 2 MiB 每流回补阈值");
 
     H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES.store(0, Ordering::Relaxed);
     client.force_close();
 }
 
-// W3(c)：post_script_off=true 时阈值覆写也不得引出任何注入帧。
+// W3(c)：post_script_off=true 时阈值覆写也不得引出任何骨架注入帧。
+// 注意区分：真实 WINDOW_UPDATE 信贷帧（flag=3）是流控的正确性机制，
+// 由读循环按收到字节数回吐，与骨架开关无关，不计入此断言。
 #[tokio::test]
 async fn post_script_off_disables_h2_skeleton_injection() {
     use super::H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES;
@@ -2186,7 +2374,8 @@ async fn post_script_off_disables_h2_skeleton_injection() {
         received
     });
 
-    // 从建流后即开始统计任何 CMD_PADDING；bulk 收完后再空闲 500ms 收尾。
+    // 从建流后即开始统计任何骨架 CMD_PADDING（flag=3 的真实流控信贷帧
+    // 除外——那是正确性机制，不是注入）；bulk 收完后再空闲 500ms 收尾。
     let counter = tokio::spawn(async move {
         let mut padding_frames = 0usize;
         loop {
@@ -2197,7 +2386,10 @@ async fn post_script_off_disables_h2_skeleton_injection() {
                 Ok(Ok(n)) => {
                     buf.extend_from_slice(&read_buf[..n]);
                     while let Some(frame) = crate::frame::Frame::decode(&mut buf) {
-                        if frame.cmd == crate::frame::CMD_PADDING {
+                        if frame.cmd == crate::frame::CMD_PADDING
+                            && frame.payload.first()
+                                != Some(&crate::frame::PADDING_FLAG_WINDOW_UPDATE)
+                        {
                             padding_frames += 1;
                         }
                     }
