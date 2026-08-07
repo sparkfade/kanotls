@@ -260,6 +260,7 @@ pub async fn server_accept(
     // 正确（客户端 socket 上的 IO 错误，无任何运维价值），但可被对端触发的只有后者。
     tcp.set_nodelay(true).map_err(ServerAcceptError::pre_auth)?;
     let _ = apply_tcp_keepalive(&tcp);
+    crate::common::tune_tunnel_socket_buffers(&tcp);
     let handshake_permit = match HANDSHAKE_LIMITER.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {

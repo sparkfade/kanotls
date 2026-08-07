@@ -192,6 +192,72 @@ pub fn apply_tcp_keepalive(tcp: &TcpStream) -> io::Result<()> {
     Ok(())
 }
 
+/// 单条隧道连接承载全部流量，吞吐的一个硬上限是**本端 TCP 缓冲**：
+/// 窗口/RTT 是天花板，500 Mbps × 175 ms 的 BDP ≈ 10.9 MB。不显式设置时
+/// Linux 自动调优封顶于宿主 `net.ipv4.tcp_{r,w}mem` max（常见默认 4/6
+/// MiB ⇒ 单连接 ~180–270 mbps 封顶）；显式 setsockopt 则封顶于
+/// `net.core.{r,w}mem_max`（常见默认 208 KiB ⇒ 更糟，且会**关闭**自动
+/// 调优）。因此策略是：先读 `net.core.*_max`，仅当设置后能明显超过常见
+/// 自动调优封顶（≥ 8 MiB）才动手，否则保持自动调优并 warn 引导调宿主机。
+/// 只改内核缓冲，线上字节零变化。
+#[cfg(target_os = "linux")]
+const TUNNEL_SOCKET_BUFFER_TARGET: usize = 16 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const TUNNEL_SOCKET_BUFFER_FLOOR: usize = 8 * 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+fn read_core_mem_max(name: &str) -> Option<usize> {
+    let content = std::fs::read_to_string(format!("/proc/sys/net/core/{}", name)).ok()?;
+    content.trim().parse().ok()
+}
+
+/// 尽量放大隧道 socket 的发送/接收缓冲。任一端不满足下限则该方向保持
+/// 自动调优不动；被宿主封顶不是错误（内核静默 clamp），只需读回记录。
+#[cfg(target_os = "linux")]
+pub fn tune_tunnel_socket_buffers(tcp: &TcpStream) {
+    let sock_ref = socket2::SockRef::from(tcp);
+    for name in ["wmem_max", "rmem_max"] {
+        // 内核把请求值翻倍记账（min(2R, *_max)），可用量 ≈ min(R, *_max/2)。
+        let usable_cap = read_core_mem_max(name).map(|m| m / 2).unwrap_or(0);
+        let request = TUNNEL_SOCKET_BUFFER_TARGET.min(usable_cap);
+        if request < TUNNEL_SOCKET_BUFFER_FLOOR {
+            warn!(
+                "net.core.{} too small ({} B); keeping TCP autotuning. For high-BDP paths raise net.core.{} and net.ipv4.tcp_*mem to >= 32 MiB",
+                name,
+                usable_cap * 2,
+                name
+            );
+            continue;
+        }
+        let (set_result, effective) = if name == "wmem_max" {
+            (
+                sock_ref.set_send_buffer_size(request),
+                sock_ref.send_buffer_size().unwrap_or(0),
+            )
+        } else {
+            (
+                sock_ref.set_recv_buffer_size(request),
+                sock_ref.recv_buffer_size().unwrap_or(0),
+            )
+        };
+        if let Err(e) = set_result {
+            warn!("failed to set tunnel socket buffer ({}): {}", name, e);
+            continue;
+        }
+        // 读回的是翻倍后的记账值；可用量按其一半折算。
+        tracing::info!(
+            "tunnel socket buffer via setsockopt: {} effective ~{} MiB",
+            name,
+            effective / 2 / (1024 * 1024)
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn tune_tunnel_socket_buffers(_tcp: &TcpStream) {
+    // 非 Linux 平台不读 /proc，保持系统自动调优（自动调优封顶由宿主决定）。
+}
+
 /// Noise 传输态：无状态 cipher + **外部** nonce 计数器。
 ///
 /// **为什么不用 `snow::TransportState`**：它把两个方向的 nonce 藏在

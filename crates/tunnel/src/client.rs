@@ -132,6 +132,7 @@ pub async fn client_tunnel(
     let mut tcp = TcpStream::connect(server_addr).await?;
     tcp.set_nodelay(true)?;
     let _ = apply_tcp_keepalive(&tcp);
+    common::tune_tunnel_socket_buffers(&tcp);
 
     let derived_psk = common::derive_psk(psk);
     let builder = snow::Builder::new(common::NOISE_PARAMS.clone()).psk(0, &derived_psk)?;
