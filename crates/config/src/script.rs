@@ -391,8 +391,8 @@ pub fn lint_traffic_script(script: &ParsedScript) -> Vec<String> {
         // 160，仍在 L1 内；162 才是第一个安全值（137 + 24 = 161）。
         //
         // 一条 L1 类的**本端**数据记录紧跟对端大 burst，就精确复现论文判别力
-        // 第 1 的 3-gram `(L2, −L4, L1)`（Distinc 7.226）。Markov 机的数据记录
-        // 有硬编码下界 `MIN_DATA_RECORD_PAYLOAD` 挡着，**脚本路径没有**：
+        // 第 1 的 3-gram `(L2, −L4, L1)`（Distinc 7.226）。交互采样路径的数据
+        // 记录有硬编码下界 `MIN_DATA_RECORD_PAYLOAD` 挡着，**脚本路径没有**：
         // `script_policy` 直接 `gen_range(len_lo..=len_hi)`，不做任何 L1 钳制。
         let min_wire = min_randomized_wire_len(rule.len_lo);
         if min_wire <= L1_MAX_WIRE_LEN {
@@ -490,8 +490,8 @@ pub fn lint_traffic_script(script: &ParsedScript) -> Vec<String> {
 /// * TCP 分段边界由 `drive_shaper` 的批量 flush 决定（连续 `D:0` 的记录会被攒进
 ///   同一次 `write()`，最多 8 条一批）——脚本能影响它的**唯一**手段是 `D:` 非零
 ///   （非零延迟强制先 flush 再 sleep），而这是个副作用，不是可以精确编排的旋钮；
-/// * `stop` 之后的记录交给 Markov 机，尺寸来自 `control_size.rs` 里硬编码的
-///   截断正态，脚本管不到。
+/// * `stop` 之后的记录交给确定性两态稳态（bulk 闩锁 / 交互采样），尺寸来自
+///   `control_size.rs` 里硬编码的截断正态或满载记录，脚本管不到。
 ///
 /// 结论：在 25 包的观测窗口里，脚本实际只管辖头几条**本端数据记录**的尺寸与
 /// 记录间时距。**脚本写错只会更差，写对也不会更好。**

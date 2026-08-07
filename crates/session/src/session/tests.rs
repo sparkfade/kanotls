@@ -1406,6 +1406,9 @@ async fn close_write_preserves_peer_to_local_tail_delivery() {
 // slice/truncate path many times over.
 #[tokio::test]
 async fn high_throughput_bulk_transfer_preserves_stream_integrity() {
+    // 其他测试会用进程级覆写点压窗口/阈值；本测试不打锁会被波及
+    // （窗口被压小后，大于覆写窗口的写块会永远等不到足够信贷，writer 死锁）。
+    let _wire_lock = WIRE_OBSERVATION_LOCK.lock().await;
     let (client, server) = session_pair().await;
 
     let mut stream = client.open_stream().await.expect("stream opens");
@@ -1488,6 +1491,72 @@ async fn high_throughput_bulk_transfer_preserves_stream_integrity() {
 
     assert!(ok, "byte pattern corrupted during high-throughput transfer");
     assert_eq!(received, TOTAL, "received byte count must equal sent");
+
+    client.force_close();
+    server.session.force_close();
+}
+
+/// 吞吐回归：32 MiB 饱和传输必须在宽松上界内完成（防止数据面引入
+/// 停等/慢路径回归）。整形默认开启，与生产同构；时间界放宽以避免 CI
+/// 抖动——它抓的是「停摆/每记录一个 RTT」级别的回归，不追求基准值。
+#[tokio::test]
+async fn saturated_bulk_transfer_completes_within_generous_bound() {
+    let _wire_lock = WIRE_OBSERVATION_LOCK.lock().await;
+    let (client, server) = session_pair().await;
+
+    let mut stream = client.open_stream().await.expect("stream opens");
+    stream
+        .write_early(b"throughput.example:443")
+        .await
+        .expect("client sends target");
+    let (_sid, mut server_stream) =
+        tokio::time::timeout(Duration::from_secs(1), server.accept_stream())
+            .await
+            .expect("server accepts stream")
+            .expect("server accepts stream");
+    assert_eq!(
+        server_stream.read().await,
+        Some(Bytes::from(b"throughput.example:443".to_vec()))
+    );
+    server_stream
+        .send_synack()
+        .await
+        .expect("server sends synack");
+    stream.wait_open().await.expect("stream opens");
+
+    const TOTAL: usize = 32 * 1024 * 1024;
+    let reader = tokio::spawn(async move {
+        let mut received = 0usize;
+        while let Some(chunk) = server_stream.read().await {
+            server_stream.note_consumed(chunk.len());
+            received += chunk.len();
+        }
+        received
+    });
+
+    let writer = tokio::spawn(async move {
+        let buf = vec![0x5Au8; 65535];
+        let mut off = 0usize;
+        while off < TOTAL {
+            let want = buf.len().min(TOTAL - off);
+            stream
+                .write(&buf[..want])
+                .await
+                .expect("client writes bulk chunk");
+            off += want;
+        }
+        stream.close_write().await.expect("client half-closes");
+    });
+
+    tokio::time::timeout(Duration::from_secs(30), writer)
+        .await
+        .expect("writer stalled: throughput regression")
+        .expect("writer task joins");
+    let received = tokio::time::timeout(Duration::from_secs(30), reader)
+        .await
+        .expect("reader stalled: throughput regression")
+        .expect("reader task joins");
+    assert_eq!(received, TOTAL);
 
     client.force_close();
     server.session.force_close();
@@ -2794,6 +2863,7 @@ async fn drive_shaper_flushed(
     pinned_sids: std::collections::HashSet<u32>,
 ) -> std::io::Result<(Vec<u8>, Vec<super::WriteRequest>)> {
     let mut batch = super::FlushBatch::default();
+    let mut stats = super::DataPlaneStats::default();
     let out = super::SessionWriter::drive_shaper(
         pending,
         shaper,
@@ -2804,6 +2874,7 @@ async fn drive_shaper_flushed(
         inbound,
         pinned_sids,
         &mut batch,
+        &mut stats,
     )
     .await?;
     batch.flush(write_half).await?;

@@ -27,68 +27,9 @@ const SCRIPT_LEN_SCALE_HI: f64 = 1.20;
 const SCRIPT_DELAY_LOG_SHIFT: f64 = 0.15;
 
 /// The blend window width: over this many packets after the script is
-/// exhausted, the probability of falling through to the Markov machine
-/// ramps from 0% to 100%.
+/// exhausted, the probability of falling through to the interactive
+/// sampler ramps from 0% to 100%.
 const SCRIPT_BLEND_WINDOW: usize = 6;
-
-/// `markov_policy` 的 IAT 模型：15% 的记录后插一次对数正态间隔，中位数
-/// 1.5ms。`mu` 逐连接平移 ±`SCRIPT_DELAY_LOG_SHIFT`（见 `markov_delay_mu`）；
-/// `sigma` 与触发概率不抖动——同一实现在同一类路径上的 IAT **形状**是相近的，
-/// 在真实实现近似恒定的维度上引入方差本身就是判别特征。
-const MARKOV_DELAY_MU: f64 = 0.405_465_108_108_164_4; // ln 1.5
-const MARKOV_DELAY_SIGMA: f64 = 0.8;
-const MARKOV_DELAY_PROBABILITY: f64 = 0.15;
-
-/// 观测窗口之后，`markov_policy` 的 IAT 注入按这个宽度（单位：包）线性衰减
-/// 到 0。窗口本身取论文的 `Wo = 25`（见
-/// `crate::session::PAPER_OBSERVATION_WINDOW_PACKETS`）。
-///
-/// **放松什么**：只放松「记录之间人为插入的间隔」，尺寸模型一条不动。
-///
-/// 为什么这是向真实 H2 收敛而不是妥协：真实 TLS 端点把已经排队的记录**一次
-/// `write()` 全部交给内核**，记录之间没有毫秒级间隔——间隔来自应用层什么时候
-/// 产生下一批数据，不来自 TLS 层。此前每条 `InteractiveControl` 记录有 15%
-/// 概率被插入一个中位数 1.5ms 的对数正态间隔，而 `drive_shaper` 在 delay 非零
-/// 时必须**先 flush 再 sleep**（否则延迟作用不到线上），于是每一次注入都强制
-/// 切出一个 TCP 分段。一次 16 KB 的中等写入约切成 36 条记录 ⇒ 期望多出 5.4 次
-/// 「flush + sleep」≈ 11ms，并且额外制造 5 个本可合并的分段。
-///
-/// 为什么窗口内**必须**保留：论文的 burst 定义里，`IAT ≥ 3×RTT` 与方向改变
-/// 并列，是唯一两种能打断 burst 的事件；出生窗口内的 IAT 结构因此是有观测
-/// 意义的。窗口之外分类器早已判完，IAT 只剩性能成本。
-///
-/// 为什么要衰减带而不是硬开关：整形在第 N 包戛然而止会在 N±ε 处留下分布
-/// 断层，而断层本身就是特征（本项目已两次为此付出代价，见
-/// `SCRIPT_BLEND_WINDOW` 与 control 态的确定性开场序列）。带宽取 12 包，
-/// 比 `SCRIPT_BLEND_WINDOW` 更宽——这里没有「必须尽快切换」的压力。
-///
-/// ---
-/// **为什么窗口外只放松 IAT、不放松尺寸切分**（中等积压 1400–16382 字节仍被
-/// 切成多条采样尺寸的记录）：
-///
-/// 「精确尺寸」在两种情形下含义完全相反，边界就是**同一次排空里此前有没有
-/// 发出过满载记录**——也就是现有的 `bulk_run` 判据：
-///
-/// * **保真**：`bulk_run` 为真时的尾记录。真实端点 `SSL_write(100 KB)` 在
-///   16 KB 缓冲下产出 6 条满载记录 + 1 条恰好 `n mod 16384` 的尾记录，这是
-///   record 层**必然**的形态；此时观测者从满载连跑已经知道「发生了一次大
-///   写入」，尾记录只多告诉他 14 bit 的余数。不复刻它反而异常——一个下行
-///   永远没有满 MSS 连跑的 TLS 连接比原问题更显眼（见
-///   `bulk_downstream_still_produces_full_mss_runs_like_real_https`）。
-/// * **1:1 泄漏**：`bulk_run` 为假时按积压精确出记录。此时没有满载连跑作
-///   前缀，`n mod 16384` 就是 `n` 本身，而这个 `n` 是**内层协议的消息长度**
-///   （内层 ClientHello、一条 HTTP 请求、一个 UoT 包）。这正是 §3.1/§3.3
-///   声称已消除的那条映射。
-///
-/// 把中等积压改成「一条记录直接发完」等于让所有 `n < 16384` 的写入落进第二
-/// 类。折中方案也都不成立：向上取整到量化档要按目标补白（5 KB 积压补成 8 KB
-/// 记录 = 60% 纯浪费），向下取整则把余数原样留给下一条记录，尾记录仍是精确
-/// 值。因此这条不变量**不随窗口放松**——它保护的是内层长度，而内层长度在
-/// 连接的一生里都同样敏感，与观测窗口无关。
-///
-/// 代价是每条记录 24 字节固定开销（中等积压约 5%）；`flush_or_merge` 已经把
-/// syscall 与分段边界合并掉，真正省不掉的只有这 5%。
-const POST_WINDOW_RELAX_BAND: u64 = 12;
 
 /// 连接第一条整形数据记录的载荷窗口（均匀采样）：线速尺寸
 /// `data_record_wire_len(152..=248)` = 176..272 字节，严格小于 300。
@@ -114,16 +55,45 @@ const POST_WINDOW_RELAX_BAND: u64 = 12;
 const FIRST_RECORD_PAYLOAD_LO: usize = 152;
 const FIRST_RECORD_PAYLOAD_HI: usize = 248;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MacroState {
-    HandshakeShaping,
-    InteractiveControl,
-    AsymmetricBulk,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FakeSpec {
     pub responses: u8,
+}
+
+/// 稳态记录尺寸模型（脚本窗口之后）：**确定性两态**，无任何掷硬币。
+///
+/// * **bulk 闩锁**：`next_data_policy` 见到积压 ≥ `BULK_FAST_PATH_THRESHOLD`
+///   （或 ≥ 单记录容量）即发出满载 16 KB 记录，同轮 drain 内的尾记录按精确
+///   长度收尾（`bulk_run` 迟滞，见 `begin_drain`）。积压低于阈值即解锁。
+/// * **交互采样**：积压低于阈值时按 `next_data_record_payload` 的截断正态
+///   采样尺寸（137–1400 B），零延迟、不注入任何帧。
+///
+/// 这一模型取代旧的两态 Markov 机（按 `pending/256KiB` 逐条掷硬币在两态间
+/// 跳转）+ 观测窗外 IAT 注入衰减带。被替换掉的随机性从来不是真实端点的
+/// 可观测属性：真实 TLS 栈（nginx / Cloudflare 的 dynamic record sizing）的
+/// 记录切分由**数据可得性**驱动——缓冲够大就出 16 KB 满载记录，否则出小
+/// 记录——是确定性的；逐条掷硬币反而把吞吐变成了队列深度与 RNG 的函数
+/// （弱 CPU 上小记录态的每字节开销约 20 倍于满载态，发送端沦为
+/// app-limited，cwnd 随负载波动）。闩锁模型与真实实现对齐到同一驱动量，
+/// 同时让吞吐只取决于路径本身。
+///
+/// 观测窗（论文 `Wo = 25`）内的形态不变：首记录（<300 B + 让出方向）、
+/// 脚本尺寸与脚本自带的 IAT 规则全部保留；脚本与交互采样同属一个尺寸
+/// 族，融合窗口仍在两者间平滑过渡，无分布断层。
+pub(crate) struct TrafficShaper {
+    direction: FlowDirection,
+    packet_seq: u64,
+    script: Vec<ScriptRule>,
+    script_stop: u64,
+    /// Deferred fake responses from positive `F:n?k` jitter:
+    /// (target packet_seq, responses).
+    deferred_fakes: std::collections::VecDeque<(u64, u8)>,
+    post_script_off: bool,
+    /// 本轮 drain 内是否刚发出过一条满载 bulk 记录。bulk 迟滞（尾记录按精确
+    /// 积压长度发出）**只在 bulk 串的尾部**成立；跨 drain 保留满载语义会让
+    /// 「一次 bulk 传输之后的第一个小写入」按精确长度上链，那是一条明文
+    /// 长度 → 线速长度的 1:1 映射（§3.1/§3.3 声称已消除的正是它）。
+    bulk_run: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -145,32 +115,6 @@ pub(crate) struct ShapePolicy {
     /// 开场 flight（见 `Session::emit_h2_server_opening`），那是一个不经 DNS /
     /// connect 的帧层应答，正常路径上一个 RTT 内必到。
     pub quiet_gap: bool,
-}
-
-pub(crate) struct TrafficShaper {
-    direction: FlowDirection,
-    state: MacroState,
-    packet_seq: u64,
-    script: Vec<ScriptRule>,
-    script_stop: u64,
-    /// Deferred fake responses from positive `F:n?k` jitter:
-    /// (target packet_seq, responses).
-    deferred_fakes: std::collections::VecDeque<(u64, u8)>,
-    post_script_off: bool,
-    /// 本轮 drain 内是否刚发出过一条满载 bulk 记录。bulk 迟滞（尾记录按精确
-    /// 积压长度发出）**只在 bulk 串的尾部**成立；跨 drain 保留 `AsymmetricBulk`
-    /// 会让「一次 bulk 传输之后的第一个小写入」按精确长度上链，那是一条
-    /// 明文长度 → 线速长度的 1:1 映射（§3.1/§3.3 声称已消除的正是它）。
-    bulk_run: bool,
-    /// `markov_policy` 的 IAT 位置参数（对数空间），逐连接采样一次。
-    /// 理由与 `SCRIPT_DELAY_LOG_SHIFT` 完全相同，且影响面更大：Markov 机管辖
-    /// 融合窗口之后的绝大多数记录，`mu` 若原样保留，全世界跑默认配置的实例
-    /// 共享同一个 `ln 1.5`。
-    markov_delay_mu: f64,
-    /// 本连接已出网的承载数据的 TCP 包数**下界**，由写循环每轮 drain 喂入
-    /// （`flush 次数 + 对端到达次数`，论证见 `FlushBatch::flushes`）。
-    /// 仅用于窗口外放松的衰减权重，不参与任何尺寸决策。
-    observed_packets: u64,
 }
 
 /// 内嵌默认脚本。
@@ -269,47 +213,27 @@ impl TrafficShaper {
             .map(|lines| parse_traffic_script(lines).unwrap_or_else(|_| embedded_script()))
             .unwrap_or_else(embedded_script);
         randomize_script(&mut script);
-        use rand::Rng;
-        let markov_delay_mu = MARKOV_DELAY_MU
-            + rand::thread_rng().gen_range(-SCRIPT_DELAY_LOG_SHIFT..=SCRIPT_DELAY_LOG_SHIFT);
         Self {
             direction,
-            state: MacroState::HandshakeShaping,
             packet_seq: 0,
             script,
             script_stop: stop,
             deferred_fakes: std::collections::VecDeque::new(),
             post_script_off,
             bulk_run: false,
-            markov_delay_mu,
-            observed_packets: 0,
         }
-    }
-
-    /// 观测窗口之外的整形权重：`1.0` = 窗口内（整形全额生效），`0.0` = 已完全
-    /// 越过衰减带。线性衰减，论证见 `POST_WINDOW_RELAX_BAND`。
-    fn post_window_shaping_weight(&self) -> f64 {
-        let window = crate::session::PAPER_OBSERVATION_WINDOW_PACKETS;
-        let Some(overshoot) = self.observed_packets.checked_sub(window) else {
-            return 1.0;
-        };
-        1.0 - (overshoot as f64 / POST_WINDOW_RELAX_BAND as f64).min(1.0)
     }
 
     /// 一轮 `drive_shaper` 排空开始：清掉 bulk 串标记。
     ///
-    /// `MacroState::AsymmetricBulk` 会跨 drain 保留，而 bulk 迟滞分支
-    /// （尾记录按精确积压长度发出）只对**同一串**里的尾记录成立。若不清标记，
-    /// 一次 bulk 传输之后的第一个小写入（例如 20 KB 上传后紧跟 80 字节的内层
-    /// Finished）会以 `data_record_wire_len(80)` = 104 字节上链——明文长度 1:1
-    /// 映射到线速长度，而且那是一个紧跟在下行大 burst 之后的 `L1` 本端包，
-    /// 正是判别力最高的 `(L2, −L4, L1)` 的第三个元素。
-    /// `observed_packets`：本连接已出网的承载数据的 TCP 包数**下界**
-    /// （`flush 次数 + 对端到达次数`）。只增不减，故取 `max` 防止调用方的
-    /// 口径抖动把窗口进度倒退。
-    pub(crate) fn begin_drain(&mut self, observed_packets: u64) {
+    /// bulk 闩锁跨 drain 由积压量重新判定（见 `next_data_policy`），而 bulk
+    /// 迟滞分支（尾记录按精确积压长度发出）只对**同一串**里的尾记录成立。
+    /// 若不清标记，一次 bulk 传输之后的第一个小写入（例如 20 KB 上传后紧跟
+    /// 80 字节的内层 Finished）会以 `data_record_wire_len(80)` = 104 字节
+    /// 上链——明文长度 1:1 映射到线速长度，而且那是一个紧跟在下行大 burst
+    /// 之后的 `L1` 本端包，正是判别力最高的 `(L2, −L4, L1)` 的第三个元素。
+    pub(crate) fn begin_drain(&mut self) {
         self.bulk_run = false;
-        self.observed_packets = self.observed_packets.max(observed_packets);
     }
 
     #[cfg(test)]
@@ -318,15 +242,10 @@ impl TrafficShaper {
     }
 
     /// 测试辅助：跳过连接的首条整形数据记录（首发让出方向的那一条），使
-    /// 断言可以直接观察脚本 / Markov 的常态行为。
+    /// 断言可以直接观察脚本 / 稳态两态的常态行为。
     #[cfg(test)]
     pub(crate) fn skip_first_flight(&mut self) {
         self.packet_seq = 1;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn state(&self) -> MacroState {
-        self.state
     }
 
     pub(crate) fn next_data_policy(&mut self, pending_len: usize) -> ShapePolicy {
@@ -365,7 +284,6 @@ impl TrafficShaper {
         }
 
         if pending_len >= BULK_FAST_PATH_THRESHOLD || pending_len >= cap {
-            self.state = MacroState::AsymmetricBulk;
             self.bulk_run = true;
             let mut policy = ShapePolicy {
                 target_wire_len: SnowyStream::max_data_record_wire_len(),
@@ -380,11 +298,10 @@ impl TrafficShaper {
         }
 
         // Bulk hysteresis: the tail of a bulk burst goes out at its exact
-        // size with zero delay and no fake frames — script/Markov delays
-        // must not throttle the end of a throughput burst. `bulk_run` 限定它
-        // 只在**同一轮 drain 内**紧跟满载记录时成立（见 `begin_drain`）。
-        if self.bulk_run && self.state == MacroState::AsymmetricBulk && pending_len < cap {
-            self.state = MacroState::InteractiveControl;
+        // size with zero delay and no fake frames — 任何延迟/注入都不得拖住
+        // 一次吞吐串的收尾。`bulk_run` 限定它只在**同一轮 drain 内**紧跟
+        // 满载记录时成立（见 `begin_drain`）。
+        if self.bulk_run && pending_len < cap {
             self.bulk_run = false;
             let mut policy = ShapePolicy {
                 target_wire_len: SnowyStream::data_record_wire_len(pending_len),
@@ -419,8 +336,8 @@ impl TrafficShaper {
 
         // Smooth blend: when we are within SCRIPT_BLEND_WINDOW packets
         // past the script's stop point, the probability of using the
-        // Markov machine ramps linearly from 0 to 1. Beyond that window,
-        // the script is fully bypassed.
+        // interactive sampler ramps linearly from 0 to 1. Beyond that
+        // window, the script is fully bypassed.
         let script_blend_p = if packet_seq < script_stop {
             1.0_f64
         } else {
@@ -433,7 +350,7 @@ impl TrafficShaper {
         let mut policy = if rng.gen::<f64>() < script_blend_p && !self.script.is_empty() {
             self.script_policy(cap)
         } else {
-            self.markov_policy(pending_len)
+            self.interactive_policy()
         };
         self.release_due_fakes(&mut policy);
         policy
@@ -543,87 +460,23 @@ impl TrafficShaper {
         }
     }
 
-    fn markov_policy(&mut self, pending_len: usize) -> ShapePolicy {
-        use rand::Rng;
+    /// 交互采样策略：脚本窗口之外的常态小记录路径。尺寸来自
+    /// `next_data_record_payload`（H2 HEADERS/DATA 帧尺寸分布），零延迟、
+    /// 不注入任何帧——真实 TLS 端点把已排队的记录一次写出，记录之间没有
+    /// 人为毫秒级间隔（间隔由脚本规则的 `D:` 在开场面层表达，见内嵌脚本）。
+    fn interactive_policy(&mut self) -> ShapePolicy {
+        // 数据记录走 H2 HEADERS/DATA 帧的尺寸分布，**不复用控制帧的离散池**
+        // （旧路径 91% 落在 `{33, 37, 41, 46, 54}`，例行进入论文的 `L1` 类，
+        // 复现判别力第 1 的 `(L2, −L4, L1)`；论证见 `control_size::L1_MAX_WIRE_LEN`）。
         let mut rng = rand::thread_rng();
-
-        // Probabilistic transition to AsymmetricBulk: the probability
-        // scales with the fraction of the pending flush buffer that is
-        // occupied. A nearly-full backlog strongly biases bulk mode to
-        // restore throughput.
-        let p_bulk = (pending_len as f64 / crate::MAX_PENDING_FLUSH_SIZE as f64).min(1.0);
-
-        self.state = match self.state {
-            MacroState::AsymmetricBulk => {
-                // Exit bulk with probability inverse to backlog pressure.
-                let p_exit = 1.0 - p_bulk;
-                if rng.gen_bool(p_exit.min(0.85)) {
-                    MacroState::InteractiveControl
-                } else {
-                    MacroState::AsymmetricBulk
-                }
-            }
-            _ => {
-                if rng.gen_bool(p_bulk) {
-                    MacroState::AsymmetricBulk
-                } else {
-                    MacroState::InteractiveControl
-                }
-            }
-        };
-
-        let (target_wire_len, allow_full_block, delay, fake) = match self.state {
-            MacroState::AsymmetricBulk => {
-                self.bulk_run = true;
-                (
-                    SnowyStream::max_data_record_wire_len(),
-                    true,
-                    Duration::ZERO,
-                    None,
-                )
-            }
-            MacroState::InteractiveControl => {
-                // 数据记录走 H2 HEADERS/DATA 帧的尺寸分布，**不再复用控制帧的
-                // 离散池**。旧路径 `next_control_size(Transport, …)` 约 91% 落在
-                // `{33, 37, 41, 46, 54}`，于是数据记录例行进入论文的 `L1` 类，
-                // 直接复现判别力第 1 的 `(L2, −L4, L1)`（Distinc 7.226）与第 3 的
-                // `(−L4, L1, −L1)`（2.879）；实测一条 4 KB 的下行响应被切成十几条
-                // 33–880 字节的记录，其中 37/41/54 三档在真实 TLS 的响应体中间
-                // 根本不存在。论证见 `control_size::L1_MAX_WIRE_LEN`。
-                let payload = kanotls_tunnel::control_size::next_data_record_payload(
-                    self.direction,
-                    &mut rng,
-                );
-                let size = SnowyStream::data_record_wire_len(payload);
-                // 窗口外放松：注入概率按 `post_window_shaping_weight` 线性衰减
-                // 到 0（论证见 `POST_WINDOW_RELAX_BAND`）。衰减的是**触发
-                // 概率**而不是 `sigma` 或 `mu`——分布的形状与位置在真实实现里
-                // 是恒定的，把它们随窗口位置拉伸等于在一个现实中不变的维度上
-                // 引入变化；而「这一条要不要停一下」本来就是伯努利事件。
-                //
-                // 尺寸模型完全不参与放松：`payload` 仍来自同一个采样器。
-                let delay_p = MARKOV_DELAY_PROBABILITY * self.post_window_shaping_weight();
-                let delay = if delay_p > 0.0 && rng.gen::<f64>() < delay_p {
-                    let sample =
-                        sample_log_normal(self.markov_delay_mu, MARKOV_DELAY_SIGMA).max(0.0);
-                    Duration::from_micros((sample * 1000.0).round() as u64)
-                } else {
-                    Duration::ZERO
-                };
-                (size, false, delay, None)
-            }
-            // 不可达：上面的状态转移把 `_` 分支（含 HandshakeShaping）统一
-            // 重新赋值为 AsymmetricBulk 或 InteractiveControl，执行到这里时
-            // self.state 不可能仍是 HandshakeShaping。
-            MacroState::HandshakeShaping => unreachable!(),
-        };
-
+        let payload =
+            kanotls_tunnel::control_size::next_data_record_payload(self.direction, &mut rng);
         ShapePolicy {
-            target_wire_len,
-            delay,
-            fake,
+            target_wire_len: SnowyStream::data_record_wire_len(payload),
+            delay: Duration::ZERO,
+            fake: None,
             pre_fake: None,
-            allow_full_block,
+            allow_full_block: false,
             quiet_gap: false,
         }
     }
@@ -927,13 +780,13 @@ mod tests {
                     let mut shaper =
                         TrafficShaper::new(direction, Some(&lines(&["stop=32", rule])), false);
                     shaper.skip_first_flight();
-                    // 覆盖脚本窗口与其后的融合/Markov 窗口。每条记录各起一轮
+                    // 覆盖脚本窗口与其后的融合/交互采样窗口。每条记录各起一轮
                     // drain（`begin_drain` 清 bulk 串标记），对应「小写入各自
                     // 排空」这一形态——也正是 L1 记录会成为**孤立小包**的形态。
                     // bulk 迟滞的尾记录不在此不变量内：它只可能紧跟在同方向的
                     // 满载记录之后（论证见 script_policy 的钳制注释）。
                     for _ in 0..40 {
-                        shaper.begin_drain(0);
+                        shaper.begin_drain();
                         let policy = shaper.next_data_policy(64);
                         assert!(
                             policy.target_wire_len > L1_MAX_WIRE_LEN,
@@ -968,12 +821,11 @@ mod tests {
 
     #[test]
     fn bulk_tail_uses_exact_size() {
-        // Bulk hysteresis: the tail of a bulk burst (state=AsymmetricBulk,
+        // Bulk hysteresis: the tail of a bulk burst (bulk_run set,
         // pending < cap) is emitted at its exact wire length, with zero
         // delay and no fake frames, and the shaper leaves bulk mode.
         let mut shaper = TrafficShaper::new(FlowDirection::S2C, None, false);
         shaper.skip_first_flight();
-        shaper.state = MacroState::AsymmetricBulk;
         // 同一轮 drain 内紧跟满载记录：`bulk_run` 是迟滞生效的前提。
         shaper.bulk_run = true;
         let policy = shaper.next_data_policy(1234);
@@ -984,7 +836,7 @@ mod tests {
         assert_eq!(policy.delay, Duration::ZERO);
         assert!(policy.fake.is_none());
         assert!(!policy.allow_full_block);
-        assert_eq!(shaper.state(), MacroState::InteractiveControl);
+        assert!(!shaper.bulk_run, "迟滞只服务同串尾记录，用过即清");
     }
 
     #[test]
@@ -1057,24 +909,50 @@ mod tests {
     }
 
     #[test]
-    fn markov_transitions_to_bulk_with_full_backlog() {
+    fn bulk_latch_engages_on_full_backlog_and_releases_on_drain_out() {
         let mut shaper = TrafficShaper::new(FlowDirection::C2S, None, false);
-        // Advance past the script + blend window so the Markov machine is
-        // active (100% fall-through probability).
+        // 推过脚本 + 融合窗口，确保走的是稳态两态而不是脚本。
         shaper.packet_seq = shaper.script_stop + SCRIPT_BLEND_WINDOW as u64;
-        let full_flush = crate::MAX_PENDING_FLUSH_SIZE;
-        // A full pending buffer makes p_bulk = 1.0 → guaranteed transition.
-        let _ = shaper.next_data_policy(full_flush);
-        assert_eq!(shaper.state(), MacroState::AsymmetricBulk);
+        // 积压 ≥ 阈值 ⇒ 满载闩锁（确定性，不掷硬币）。
+        let policy = shaper.next_data_policy(crate::MAX_PENDING_FLUSH_SIZE);
+        assert!(policy.allow_full_block);
+        assert!(shaper.bulk_run);
+        shaper.advance();
+        // 同轮 drain 内的尾记录：精确尺寸收尾。
+        let tail = shaper.next_data_policy(3000);
+        assert_eq!(
+            tail.target_wire_len,
+            SnowyStream::data_record_wire_len(3000)
+        );
+        assert!(!tail.allow_full_block);
+        shaper.advance();
+        // 新的一轮 drain、小积压 ⇒ 解锁回交互采样：尺寸被采样器夹到
+        // 与积压无关的包络内（≤1400 载荷），且**不等于**精确积压。
+        shaper.begin_drain();
+        for _ in 0..20 {
+            let policy = shaper.next_data_policy(3000);
+            assert!(!policy.allow_full_block);
+            assert!(policy.target_wire_len <= SnowyStream::data_record_wire_len(1400));
+            assert_ne!(
+                policy.target_wire_len,
+                SnowyStream::data_record_wire_len(3000),
+                "小积压不得再沿用满载/精确语义"
+            );
+            shaper.advance();
+        }
     }
 
     #[test]
-    fn markov_stays_interactive_for_small_backlog() {
+    fn interactive_policy_emits_zero_delay_and_no_frames() {
         let mut shaper = TrafficShaper::new(FlowDirection::S2C, None, false);
         shaper.packet_seq = shaper.script_stop + SCRIPT_BLEND_WINDOW as u64;
-        // Tiny backlog → p_bulk ≈ 0 → stays InteractiveControl.
-        let _ = shaper.next_data_policy(4);
-        assert_eq!(shaper.state(), MacroState::InteractiveControl);
+        for _ in 0..50 {
+            let policy = shaper.next_data_policy(64);
+            assert_eq!(policy.delay, Duration::ZERO);
+            assert!(policy.fake.is_none() && policy.pre_fake.is_none());
+            assert!(!policy.quiet_gap);
+            shaper.advance();
+        }
     }
 
     #[test]
@@ -1236,13 +1114,13 @@ mod tests {
     /// C24 验收 3：观测窗口（论文 `Wo = 25`）内的每一条数据记录都必须由 shaper
     /// 定尺寸，**不存在「尺寸直接等于积压」的窗口**。
     ///
-    /// 判据做成确定性的而不是逐样本比对：脚本与 Markov 的尺寸分布有一个**与积压
-    /// 无关**的上界（脚本 `len_hi × 1.20` 最大 720，Markov 上界 1400，两者加
+    /// 判据做成确定性的而不是逐样本比对：脚本与交互采样的尺寸分布有一个**与积压
+    /// 无关**的上界（脚本 `len_hi × 1.20` 最大 720，交互采样上界 1400，两者加
     /// `MIN_DATA_WIRE_LEN`），因此只要每次都喂一个**超过那个上界**的亚容量积压，
     /// 「尺寸 == 积压」就必然越界被抓到；逐样本 `assert_ne!` 反而会因为分布支撑集
     /// 恰好覆盖积压长度而误报。
     ///
-    /// 覆盖三个策略区段：脚本（`packet_seq < stop`）、融合窗口、纯 Markov。唯一
+    /// 覆盖三个策略区段：脚本（`packet_seq < stop`）、融合窗口、纯交互采样。唯一
     /// 允许「尺寸 == 精确积压」的是 bulk 串的尾记录，而那需要同一轮 drain 内刚
     /// 发过一条满载记录——真实 TLS 端点把一次 write 的余量写成一条恰好那么大的
     /// record，那一条是保真而非泄漏。
@@ -1250,15 +1128,15 @@ mod tests {
     fn every_record_in_the_observation_window_is_shaper_sized() {
         const WO: usize = 25;
         let l1_max = kanotls_tunnel::control_size::L1_MAX_WIRE_LEN;
-        // 与积压无关的尺寸上界：脚本的 600 × 1.20 = 720，Markov 的 1400。
+        // 与积压无关的尺寸上界：脚本的 600 × 1.20 = 720，交互采样的 1400。
         let envelope_hi = SnowyStream::data_record_wire_len(1400);
         let full = SnowyStream::max_data_record_wire_len();
         let mut saw_script = false;
-        let mut saw_markov = false;
+        let mut saw_interactive = false;
         for direction in [FlowDirection::C2S, FlowDirection::S2C] {
             for _ in 0..40 {
                 let mut shaper = TrafficShaper::new(direction, None, false);
-                shaper.begin_drain(0);
+                shaper.begin_drain();
                 let mut prev_full_block = false;
                 for seq in 0..WO {
                     // 每条记录的积压都 > envelope_hi 且 < 容量：任何 1:1 映射
@@ -1270,7 +1148,7 @@ mod tests {
                         saw_script = true;
                     }
                     if seq >= shaper.script_stop as usize + SCRIPT_BLEND_WINDOW {
-                        saw_markov = true;
+                        saw_interactive = true;
                     }
                     let exact = SnowyStream::data_record_wire_len(pending);
                     let ok = policy.target_wire_len <= envelope_hi
@@ -1292,13 +1170,16 @@ mod tests {
                 }
             }
         }
-        assert!(saw_script && saw_markov, "必须覆盖脚本段与纯 Markov 段");
+        assert!(
+            saw_script && saw_interactive,
+            "必须覆盖脚本段与纯交互采样段"
+        );
     }
 
     /// C24：bulk 迟滞（尾记录按精确积压长度发出）只在**同一轮 drain 内**紧跟
-    /// 满载记录时成立。跨 drain 保留 `AsymmetricBulk` 会让「一次 bulk 传输之后
-    /// 的第一个小写入」按精确长度上链——那既是一条明文长度 → 线速长度的 1:1
-    /// 映射，也是一个紧跟在下行大 burst 之后的 `L1` 本端包
+    /// 满载记录时成立。跨 drain 保留满载语义会让「一次 bulk 传输之后的第一个
+    /// 小写入」按精确长度上链——那既是一条明文长度 → 线速长度的 1:1 映射，
+    /// 也是一个紧跟在下行大 burst 之后的 `L1` 本端包
     /// （`(L2, −L4, L1)` 的第三个元素）。
     #[test]
     fn bulk_hysteresis_does_not_leak_the_next_drains_small_write() {
@@ -1306,15 +1187,14 @@ mod tests {
         for _ in 0..40 {
             let mut shaper = TrafficShaper::new(FlowDirection::C2S, None, false);
             shaper.skip_first_flight();
-            // 一轮 drain：满载 fast path 把状态推进 AsymmetricBulk。
-            shaper.begin_drain(0);
+            // 一轮 drain：满载闩锁把 bulk_run 置位。
+            shaper.begin_drain();
             assert!(shaper.next_data_policy(cap * 4).allow_full_block);
             shaper.advance();
-            assert_eq!(shaper.state(), MacroState::AsymmetricBulk);
 
             // 新的一轮 drain：80 字节的小写入（内层 Finished 量级）不得按
             // 精确长度上链。
-            shaper.begin_drain(0);
+            shaper.begin_drain();
             let policy = shaper.next_data_policy(80);
             assert_ne!(
                 policy.target_wire_len,
@@ -1327,32 +1207,6 @@ mod tests {
                 policy.target_wire_len
             );
         }
-    }
-
-    /// C24 验收 5：`markov_policy` 的 IAT 位置参数必须逐连接变化且窄幅有界。
-    /// 它管辖融合窗口之后的绝大多数记录，影响面比脚本的 mu 更大；此前是全局
-    /// 常量 `ln 1.5`，全世界跑默认配置的实例共享同一个值，跨连接聚合后可以把
-    /// IAT 拟合到一个精确的参数化对数正态上。`sigma` 与触发概率不抖动——同一
-    /// 实现在同一类路径上的 IAT 形状是相近的。
-    #[test]
-    fn markov_delay_position_varies_per_connection_within_a_narrow_window() {
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..64 {
-            let shaper = TrafficShaper::new(FlowDirection::C2S, None, false);
-            let scale = (shaper.markov_delay_mu - MARKOV_DELAY_MU).exp();
-            assert!(
-                scale >= (-SCRIPT_DELAY_LOG_SHIFT).exp() - 1e-9
-                    && scale <= SCRIPT_DELAY_LOG_SHIFT.exp() + 1e-9,
-                "median scale {} outside the narrow per-connection window",
-                scale
-            );
-            seen.insert(shaper.markov_delay_mu.to_bits());
-        }
-        assert!(seen.len() > 1, "markov IAT 位置参数必须逐连接变化");
-        // 形状参数与触发概率是常量：真实实现在这两个维度上不抖动。
-        assert_eq!(MARKOV_DELAY_SIGMA, 0.8);
-        assert_eq!(MARKOV_DELAY_PROBABILITY, 0.15);
-        assert!((MARKOV_DELAY_MU.exp() - 1.5).abs() < 1e-12, "中位数 1.5ms");
     }
 
     /// C24：内嵌默认脚本不再注入任何 `CMD_PADDING` 请求。`F:n` 会在触发记录后
@@ -1379,108 +1233,6 @@ mod tests {
         assert_eq!(
             shaper.next_data_policy(50).fake.map(|f| f.responses),
             Some(2)
-        );
-    }
-
-    /// 任务 2：窗口外放松只作用在 IAT 上，且必须有衰减带。
-    ///
-    /// 三段断言：
-    /// * 窗口内（`observed <= Wo`）注入概率维持在 `MARKOV_DELAY_PROBABILITY`；
-    /// * 衰减带内单调下降，既不在窗口边界断崖、也不提前归零；
-    /// * 越过衰减带后恒为零延迟。
-    #[test]
-    fn post_window_relaxation_decays_the_iat_injection_monotonically() {
-        let window = crate::session::PAPER_OBSERVATION_WINDOW_PACKETS;
-        let mut shaper = TrafficShaper::new(FlowDirection::S2C, None, false);
-        // 窗口内：权重恒为 1，不因位置变化。
-        for observed in [0u64, 1, window / 2, window] {
-            shaper.begin_drain(observed);
-            assert_eq!(
-                shaper.post_window_shaping_weight(),
-                1.0,
-                "observed={observed} 仍在窗口内，整形必须全额生效"
-            );
-        }
-        // 衰减带：严格单调下降，且带内每一点都在 (0, 1) 开区间——既不断崖也
-        // 不提前归零。
-        let mut prev = 1.0_f64;
-        for step in 1..POST_WINDOW_RELAX_BAND {
-            shaper.begin_drain(window + step);
-            let w = shaper.post_window_shaping_weight();
-            assert!(w < prev, "衰减带内权重必须严格下降：step={step}");
-            assert!(w > 0.0 && w < 1.0, "step={step} 的权重 {w} 越出开区间");
-            prev = w;
-        }
-        // 带外：恒零，且 `begin_drain` 只增不减（进度不得倒退）。
-        shaper.begin_drain(window + POST_WINDOW_RELAX_BAND);
-        assert_eq!(shaper.post_window_shaping_weight(), 0.0);
-        shaper.begin_drain(0);
-        assert_eq!(
-            shaper.post_window_shaping_weight(),
-            0.0,
-            "窗口进度只增不减：调用方的口径抖动不得把连接拉回窗口内"
-        );
-    }
-
-    /// 任务 2 的两条边界，端到端在 `next_data_policy` 上验证：
-    /// * 窗口内必须真的出现非零延迟；带外必须一条都没有；
-    /// * **尺寸模型完全不参与放松**——两段的记录尺寸落在同一个包络里。
-    #[test]
-    fn post_window_relaxation_drops_delays_without_touching_sizes() {
-        let window = crate::session::PAPER_OBSERVATION_WINDOW_PACKETS;
-        let mut inside_delays = 0usize;
-        let mut outside_delays = 0usize;
-        let mut inside_sizes = Vec::new();
-        let mut outside_sizes = Vec::new();
-        for (observed, delays, sizes) in [
-            (0u64, &mut inside_delays, &mut inside_sizes),
-            (
-                window + POST_WINDOW_RELAX_BAND,
-                &mut outside_delays,
-                &mut outside_sizes,
-            ),
-        ] {
-            for _ in 0..300 {
-                let mut shaper = TrafficShaper::new(FlowDirection::S2C, None, false);
-                // 推过脚本 + 融合窗口，确保走的是 Markov 机。
-                shaper.packet_seq = shaper.script_stop + SCRIPT_BLEND_WINDOW as u64;
-                shaper.begin_drain(observed);
-                // 小积压 ⇒ p_bulk ≈ 0 ⇒ 绝大多数落在 InteractiveControl。
-                let policy = shaper.next_data_policy(64);
-                if policy.delay > Duration::ZERO {
-                    *delays += 1;
-                }
-                // 极小概率（p_bulk = 64/256KiB）仍会转进 AsymmetricBulk 出一条
-                // 满载记录——那是 Markov 机本身的模型，与窗口位置无关，不属于
-                // 本用例要比较的「非 bulk 记录尺寸包络」。
-                if !policy.allow_full_block {
-                    sizes.push(policy.target_wire_len);
-                }
-            }
-        }
-        assert!(
-            inside_delays > 0,
-            "窗口内必须保留 IAT 注入（论文的 burst 定义里 IAT ≥ 3×RTT 与方向改变并列）"
-        );
-        assert_eq!(outside_delays, 0, "越过衰减带后不得再注入任何间隔");
-
-        // 尺寸包络必须一致：放松的是节奏，不是尺寸。
-        let l1_max = kanotls_tunnel::control_size::L1_MAX_WIRE_LEN;
-        for (label, sizes) in [("窗口内", &inside_sizes), ("带外", &outside_sizes)] {
-            let lo = *sizes.iter().min().expect("non-empty");
-            let hi = *sizes.iter().max().expect("non-empty");
-            assert!(lo > l1_max, "{label} 的记录 {lo} 落入 L1 类");
-            assert!(
-                hi <= SnowyStream::data_record_wire_len(1400),
-                "{label} 的记录 {hi} 越出非 bulk 数据记录包络"
-            );
-        }
-        // 两段的尺寸分布必须重叠得足够彻底：均值相差不到 15%。
-        let mean = |v: &Vec<usize>| v.iter().sum::<usize>() as f64 / v.len() as f64;
-        let (a, b) = (mean(&inside_sizes), mean(&outside_sizes));
-        assert!(
-            (a - b).abs() / a.max(b) < 0.15,
-            "窗口内外的尺寸分布必须一致（放松只作用在 IAT 上）：{a} vs {b}"
         );
     }
 

@@ -211,6 +211,37 @@ openssl rand -base64 48
 
 The client outbound carries a single `settings.password` matching one of the server's user entries. The authenticated user name is attached to the connection and can be used for per-user routing via `auth_user`.
 
+### Management API
+
+An optional, deliberately small HTTP API for central controllers (multi-region, multi-node panels). It is disabled unless an `api` section is present in the server config:
+
+```json
+"api": {
+  "listen": "127.0.0.1:9090",
+  "token": "<openssl rand -hex 24>"
+}
+```
+
+All endpoints require `Authorization: Bearer <token>` and live under `/api/v1`:
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/v1/node` | Node status `{version, online, enabled, uptime_secs, active_connections, users, enabled_users}`. A controller polls this per node: reachable = online, unreachable = offline. |
+| `PUT /api/v1/node/enabled` | Enable or suspend the node's proxy **service**, body `{"enabled": false}` (POST also accepted). A suspended node keeps listening but every connection falls back to the camouflage site — it looks like a plain web server; the API stays reachable so the controller can re-enable. Persisted to `inbounds[0].enabled`. |
+| `GET /api/v1/users` | List users: `[{name, enabled, uplink_bytes, downlink_bytes}]` |
+| `POST /api/v1/users` | Add a user, body `{"name": "...", "password": "..."}` → `201` |
+| `GET /api/v1/users/:name` | One user with total uplink/downlink bytes |
+| `PUT /api/v1/users/:name/enabled` | Enable or suspend, body `{"enabled": false}` (POST also accepted) |
+| `PUT /api/v1/users/:name/password` | Change password, body `{"password": "..."}`. The PSK rotates immediately: new handshakes with the old password fail; established sessions are unaffected. |
+| `DELETE /api/v1/users/:name` | Remove a user → `204` |
+
+Semantics worth knowing:
+
+- User and node-state mutations are validated against the full server config and then **written back to the config file** (temp file + atomic rename, key order and permissions preserved), so they survive restarts. A mutation that would make the config invalid (e.g. deleting the last user) is rejected and changes nothing.
+- Suspending or deleting a user, changing a password, or suspending the node only affects new handshakes; established sessions run to their natural end (no forced kicks). Process-level start/stop is intentionally not part of the API — a stopped process could not be started again through it; that is systemd's job.
+- `uplink_bytes` is bytes from the client toward the target, `downlink_bytes` the reverse (server-side tunnel payload; UoT includes its 9/21-byte framing). Counters are in-memory and reset on restart — `uptime_secs` lets a controller detect resets.
+- The API speaks plaintext HTTP with a bearer token and intentionally no TLS. Keep `listen` on loopback and reach it through an SSH tunnel (`ssh -L 9090:127.0.0.1:9090`) or a trusted management network; non-loopback binds require a ≥32-char token and log a startup warning. User names in paths are percent-decoded, so names with special characters remain addressable.
+
 ### Log Level
 
 `trace` / `debug` / `info` / `warn` / `error`. Priority: `log.level` → `RUST_LOG` env → default `info`.
@@ -328,14 +359,40 @@ Client fuses `[SETTINGS] [SYN] [PSH(target)] [PSH(data)]` into one coalesced flu
 
 - **Target pool size**: Seeded from fingerprint family, SNI, and time-of-day (default 4–16)
 - **Staggered startup**: Initial connections spawn with jittered delays (50–2500 ms)
-- **Soft TTL rotation**: 120–300 s (seeded), connections stop accepting new streams
-- **Idle drain**: 30 s idle with no active streams → connection closed
-- **Demand-driven scaling**: New connections spawn only when waiters exist
+- **Soft TTL rotation**: 3600 s (matching nginx's `keepalive_time` default), connections enter draining state
+- **Idle drain**: 115 s idle with no active streams (matching Firefox's `network.http.keep-alive.timeout`) → connection closed
+- **Demand-driven scaling**: New connections spawn only when waiters exist (a single connection is the norm, matching real Firefox's one H2 connection per origin)
 - **Load-aware selection**: Connections chosen by stream count and buffered-traffic bytes
 
 ### Idle Teardown (Server)
 
 The session read loop (server-side only; client sessions are lifecycle-managed by the connection pool) uses a pinned `tokio::time::sleep` timer that resets on each successful read. On idle timeout tick, the session checks whether any streams are active; if idle, it sends a Noise-encrypted TLS `close_notify` (0x15) and TCP FIN, tearing down the connection gracefully. Kernel TCP keepalive, matching Firefox's defaults (600 s idle, 1 s interval, 4 probes), serves as dead-peer detection.
+
+## Throughput Tuning
+
+**Architectural fact**: all traffic is multiplexed over (normally) a single tunnel TCP connection — part of the anti-fingerprint design (real Firefox opens one H2 connection per origin). Total throughput therefore equals one TCP flow's throughput between the two hosts, and kernel parameters set the ceiling.
+
+**Host configuration for high-BDP paths** (e.g. 500 Mbps × 175 ms ⇒ BDP ≈ 10.9 MB), required on both client and server:
+
+```bash
+# /etc/sysctl.d/99-kanotls-bdp.conf
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 16384 33554432
+```
+
+kanotls actively requests 16 MiB socket buffers at connect time (only when `net.core.*_max` permits; otherwise it keeps kernel autotuning and logs a warning). Autotuning itself is capped by the third column of `net.ipv4.tcp_*mem` (common defaults 4/6 MiB ⇒ ~180–270 Mbps per connection); no application-layer tuning can cross that wall without the sysctl changes.
+
+**Triage when throughput disappoints** (three bottleneck classes):
+
+1. Set `log.level` to `debug`, reproduce the slow case, then check three log lines:
+   - `tunnel socket buffer via setsockopt` / `net.core.* too small` — **kernel buffers insufficient**: apply the sysctls above; afterwards you should see `effective ~16 MiB`.
+   - `session flow-control summary: N send-side stalls, M ms total` — **window stalls**: a high stall-time share means tunnel flow control is throttling (slow peer consumption, or path BDP exceeding the window configuration).
+   - `session writer data plane: bulk X records/Y bytes, shaped U records/V bytes` — **CPU/record overhead**: an abnormally high shaped (small-record) byte share means traffic was misclassified as interactive; per-byte crypto cost is ~20× the full-record mode and weak CPUs throttle on it.
+2. A/B with `post_script_shaping = "off"`: full speed returns with shaping off ⇒ bottleneck is the shaping path (CPU); still slow ⇒ kernel buffers or the path itself (loss/queueing).
+
+Note: a single TCP flow on a high-BDP path is extremely loss-sensitive (cwnd recovery from one loss at 175 ms RTT takes minutes); do not add unintended loss rates in netem lab setups.
 
 ## Camouflage Endpoint Caching
 
@@ -424,6 +481,8 @@ Routing rules select the outbound, optionally per authenticated user:
 |-------|------|-------------|
 | `log.level` | both | `trace` / `debug` / `info` / `warn` / `error` (default `info`) |
 | `routing.rules` | both | sing-box-style routing rules |
+| `api.listen` | server | Optional. Management API bind address (see Management API; absent = disabled) |
+| `api.token` | server | Optional. Bearer token for the management API (min 16 chars; min 32 on non-loopback binds) |
 
 Each routing rule:
 
@@ -441,8 +500,9 @@ Each routing rule:
 | `listen`                                   | both   | Bind address (client: must be loopback IP literal) |
 | `port`                                     | both   | Bind port                            |
 | `protocol`                                 | server | `"kanotls"`                          |
+| `enabled`                                  | server | Optional (default `true`). `false` suspends the proxy service: every connection falls back to camouflage. Written by the management API |
 | `protocol`                                 | client | `"socks5"` / `"socks"` / `"http"`    |
-| `settings.users`                           | server | User list: `[{name, password}]`; names and passwords unique, password min 32 bytes |
+| `settings.users`                           | server | User list: `[{name, password, enabled?}]`; names and passwords unique, password min 32 bytes; `enabled` defaults to `true` (written by the management API on suspend) |
 | `settings.camouflage.host`                 | server | Reference TLS 1.3 endpoint hostname (DNS name; IP literals rejected) |
 | `settings.camouflage.port`                 | server | Reference endpoint port              |
 | `settings.session.max_streams_per_session` | both   | Optional. Max streams per tunnel (default 256) |

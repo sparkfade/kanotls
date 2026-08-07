@@ -117,7 +117,7 @@ v1.0 原始双模分布（§3.1–3.4）被动地在 `BLOCK_DATA_CAPACITY`（163
 - **承载 `CMD_SYN` / `CMD_FIN` 的记录例外**：它们改用与数据记录相同的采样器（`next_data_record_payload`），**不取控制离散池**。原因见 §9.3 的实测：控制池的 5 个尺寸全部落在 `L1`（≤160），而关流时本端 FIN 与对端 FIN 各占一个分段、紧跟响应体最后一段之后 ⇒ 实测**每 4~5 次关流就精确复现 `(−L4, L1, −L1)`**。真实 H2 里开流是 `HEADERS`、半关是挂在 `DATA` 上的 `END_STREAM`，都不是孤立小帧。
   `CMD_SYNACK` **刻意不在此列**：把它放大会让服务端开场 flight 超过 1211 字节，与客户端合法的 33 字节 SETTINGS-ACK 配成 `(L2, −L4, L1)`（判别力 7.226）——SYNACK 的「小」在出生窗口内是保护性的。
 
-每个控制帧递增 TrafficShaper 内部的控制帧计数器（`note_control_frame()`），影响 Markov 状态机的握手到传输转换（§3.4）。
+每个控制帧递增写半内部的控制帧计数器，掌管控制记录自身的握手到传输转换（§3.2）。
 
 ### 3.3 TrafficShaper 架构
 
@@ -127,22 +127,23 @@ v1.0 原始双模分布（§3.1–3.4）被动地在 `BLOCK_DATA_CAPACITY`（163
 2. **切分截断**: 若 `pending` 超出 `target_wire_len` 所能承载的载荷容量，仅取走对应字节数，其余保留在 `pending` 中供后续迭代处理。如 5000 字节待处理 vs 800 字节目标 → 发出 800 字节记录，保留 4200 字节。
 3. **精确填充**: 若 `pending` 小于目标容量，以零字节填充至精确 `target_wire_len` 后发出。
 4. **加密**: `SnowyStream::prepare_data_record(slice, target_wire_len)` 加密唯一一条线速尺寸等于 `target_wire_len` 的记录。
-5. **Flush** + **delay** + **advance**: 记录刷新，若 delay 非零则注入 `tokio::time::sleep(delay)`，随后 shaper 的包序列号和 Markov 状态推进。
+5. **Flush** + **delay** + **advance**: 记录刷新，若 delay 非零则注入 `tokio::time::sleep(delay)`，随后 shaper 的包序列号推进。
 6. **虚假交互**: 若策略携带 `fake`，在当前切片发出后向控制队列排队一个 `CMD_PADDING` 请求帧。
 
 以上抹除了被动尺寸痕迹包络：同一应用写入在不同策略下产生完全不同的记录边界，仅取决于 shaper 策略而非内部载荷结构。
 
-### 3.4 Markov 宏状态机
+### 3.4 确定性两态稳态
 
-shaper 维护三个覆盖连接全生命周期的宏状态（无硬切分"前 N 包"断崖）：
+越过开场（首条记录 + 脚本 + 融合窗口，§3.5）之后，shaper 只有两种尺寸模式，由积压压力**确定性地**切换——不掷硬币、无隐状态：
 
-| 状态　　　　　　　　　 | 尺寸策略　　　　　　　　　　　　　　 | 延迟 | 说明 |
+| 模式　　　　　　　　　 | 进入条件 | 尺寸策略 | 延迟 |
 |---|---|---|---|
-| `HandshakeShaping`　　　 | 最小拟合（精确匹配载荷）　　　　　 | 无 | Noise 握手阶段；紧密耦合以避免影响认证组帧。 |
-| `InteractiveControl`　　| 复用 `control_size` HTTP/2 离散 + HEADERS 分布采样 | 15% 概率对数正态 IAT | 模拟 Web 应用请求/响应模式，记录尺寸可变。 |
-| `AsymmetricBulk`　　　　 | 满载 MTU 锚定记录（`max_data_record_wire_len` ≈ 16406） | 无 | 持续大流量传输；解除碎片化封顶，将尺寸锚定至 Web 组帧边界。 |
+| bulk 闩锁 | `pending_len ≥ 128 KiB`（或 ≥ 单记录容量） | 满载 MTU 锚定记录（`max_data_record_wire_len` ≈ 16406）；同一轮 drain 内的尾记录按精确尺寸收尾（`bulk_run` 迟滞） | 无 |
+| 交互采样 | 积压低于阈值 | 按 H2 HEADERS/DATA 截断正态分布采样（`next_data_record_payload`，载荷 137–1400 B） | 无 |
 
-**转换逻辑**：每次发出包后，通过**概率平滑**评估状态转换。概率值 `p_bulk = pending_len / max_pending_flush_size` 驱动转换：几乎满载的待发送缓冲区强力推动进入 `AsymmetricBulk`，而接近排空的缓冲区则推动退出至 `InteractiveControl`（退出概率上限 85%）。这替代了 v1.1 的确定性阈值，通过连续概率渐变避免状态边界振荡。
+策略查询一旦见到低于阈值的积压即解锁，因此一次 bulk 传输之后的第一个小写入必然回到采样尺寸（真实端点绝不会在大流量串之后发出一条恰好 80 字节的记录——那是内层消息长度的 1:1 泄漏）。
+
+**为什么是确定性的**：真实 TLS 栈的记录切分由**数据可得性**驱动（nginx 的 `ssl_buffer_size`；Cloudflare 的 dynamic record sizing——开场小记录、持续数据后满载 16 KB），而不是随机数。此前的两态 Markov 机按 `p_bulk = pending/256KiB` 逐条掷硬币在同一对记录族之间跳转；那份随机性在任何真实端点上都不可观测，却把吞吐变成了队列深度竞争与 RNG 的函数——弱 CPU 上小记录态的每字节加密开销约为满载态的 20 倍，发送端沦为 app-limited，逐轮次波动。闩锁产出与旧 bulk/interactive 模式逐字节相同的记录族，同时让**序列**确定。
 
 ### 3.5 声明式流量脚本引擎
 
@@ -162,11 +163,11 @@ ScriptRule { len_lo, len_hi, delay: DelaySpec, expect_responses: u8, fake_jitter
 
 **脚本生命周期与融合窗口：**
 
-脚本运行 `stop` 个数据包（`stop` 默认等于规则数；更大的 `stop` 会重复循环规则）。最后一个脚本包发出后，引擎进入长度为 `SCRIPT_BLEND_WINDOW = 6` 包的**平滑融合窗口**。在此窗口内，切入 Markov 状态机（§3.4）的概率从 0% 线性渐变至 100%，消除 "前 N 包后突变" 的硬切分断崖，产生在线速尺寸分布上不可指纹的平滑切换。
+脚本运行 `stop` 个数据包（`stop` 默认等于规则数；更大的 `stop` 会重复循环规则）。最后一个脚本包发出后，引擎进入长度为 `SCRIPT_BLEND_WINDOW = 6` 包的**平滑融合窗口**。在此窗口内，切入交互采样器（§3.4）的概率从 0% 线性渐变至 100%，消除 "前 N 包后突变" 的硬切分断崖，产生在线速尺寸分布上不可指纹的平滑切换。
 
-融合窗口结束后，TrafficShaper 的 Markov 状态机接管连接剩余生命周期。Markov 转换参数无配置暴露——它完全由待发送缓冲区压力通过概率 `p_bulk` 渐变推导（§3.4）。
+融合窗口结束后，确定性两态稳态（§3.4）接管连接剩余生命周期。其参数无配置暴露——完全由待发送缓冲区压力推导。
 
-**脚本后整形开关（`post_script_shaping`）：** 可选配置字段 `session.post_script_shaping` 选择脚本用尽后的行为。默认 `"markov"` 如上所述（融合窗口 → Markov 机）。`"off"` 关闭脚本后的全部整形：`packet_seq` 达到 `stop` 后，后续每条记录精确承载当前积压载荷（线速尺寸 = 积压 + 固定 record 开销），零延迟、无 Fake 帧、无融合窗口——从此刻起明文尺寸直接映射至线速尺寸。两种模式下 bulk fast path 与 bulk 迟滞（§3.4）均保持优先。除 `"markov"`/`"off"` 外的取值在启动时触发非致命警告并按未设置处理。
+**脚本后整形开关（`post_script_shaping`）：** 可选配置字段 `session.post_script_shaping` 选择脚本用尽后的行为。默认 `"markov"`（为配置兼容保留此名）如上所述（融合窗口 → 确定性两态）。`"off"` 关闭脚本后的全部整形：`packet_seq` 达到 `stop` 后，后续每条记录精确承载当前积压载荷（线速尺寸 = 积压 + 固定 record 开销），零延迟、无 Fake 帧、无融合窗口——从此刻起明文尺寸直接映射至线速尺寸。两种模式下 bulk 闩锁与 bulk 迟滞（§3.4）均保持优先。除 `"markov"`/`"off"` 外的取值在启动时触发非致命警告并按未设置处理。
 
 **数据包收发示例——客户端→服务端，3 规则脚本：**
 
@@ -187,7 +188,7 @@ ScriptRule { len_lo, len_hi, delay: DelaySpec, expect_responses: u8, fake_jitter
 | 2 | 规则 1 | 362 | 362 字节 | `MIN_DATA_WIRE_LEN + 362`（≈ 386） | Flush。`sleep(log_normal(2.0, 0.5))`。随后：在 Control 通道排入 `CMD_PADDING(flag=0, m=1)`。剩余积压：5423。 |
 | 3 | 规则 2 | 197 | 197 字节 | `MIN_DATA_WIRE_LEN + 197`（≈ 221） | Flush。`sleep(log_normal(1.5, 0.6))`。剩余积压：5226。 |
 
-第 3 包后脚本耗尽。第 4–9 包在**6 包融合窗口**中发出：每包有递增概率（≈17%, 33%, 50%, 67%, 83%, 100%）由 Markov 机控制而非循环脚本。第 10 包起完全由 Markov 控制。
+第 3 包后脚本耗尽。第 4–9 包在**6 包融合窗口**中发出：每包有递增概率（≈17%, 33%, 50%, 67%, 83%, 100%）由交互采样器控制而非循环脚本。第 10 包起完全由两态稳态控制。
 
 **服务端在线速上看到的内容（以第 2 包序列为例）：**
 
@@ -211,11 +212,11 @@ ScriptRule { len_lo, len_hi, delay: DelaySpec, expect_responses: u8, fake_jitter
 
 ### 3.6 IAT 延迟建模
 
-记录间延迟的非零延迟规格如下（`DelaySpec::None` 表示零延迟）：
+记录间延迟只存在于开场（脚本规则）之内，非零延迟规格如下（`DelaySpec::None` 表示零延迟）：
 
 - **`DelaySpec::LogNormal { mu_ms, sigma_ms }`**：对数正态分布（Box-Muller 正态采样 → `sample_log_normal(mu, sigma)` → `Duration::from_micros`），匹配真实 TCP 包间时距的右偏正定分布，优于均匀或指数抖动。
 
-Markov `InteractiveControl` 状态以 15% 概率施加延迟；脚本引擎按规则逐条施加。`AsymmetricBulk` 状态零延迟（背靠背发送）以保持吞吐量。
+稳态记录（两种模式，§3.4）一律**零延迟**：真实 TLS 端点把已排队的记录一次 `write()` 全部交给内核——记录间隔来自应用层何时产生下一批数据，不来自 TLS 层。（旧 Markov 模型曾在观测窗外衰减注入 15% 的对数正态间隔；它是脚本之外唯一的注入 IAT，其代价——每次注入强制一次 `flush` + `sleep`——在窗口过后纯粹变成吞吐波动。真正塑造出生窗口的开场延迟由脚本规则的 `D:` 承担，保持不变。）
 
 ### 3.7 记录填充
 
@@ -254,18 +255,10 @@ Markov `InteractiveControl` 状态以 15% 概率施加延迟；脚本引擎按�
 
 #### 永久层（连接终生，近乎零成本）
 
-1. **数据记录永不落 `L1`**（线速 ≤160）。`markov_policy` 与 `script_policy` 都受此约束；后者是硬钳制，因为配置期的 lint 警告拦不住已经发出的记录（§9.6）。
+1. **数据记录永不落 `L1`**（线速 ≤160）。`interactive_policy` 与 `script_policy` 都受此约束；后者是硬钳制，因为配置期的 lint 警告拦不住已经发出的记录（§9.6）。
 2. **记录尺寸不得是积压大小的确定性函数**——但**真实 bulk run 的精确尾包是保真的**（真实 TLS 写 100 KB = 6 条满记录 + 1 条精确尾包）。边界即 `bulk_run` 谓词：同一次 drain 内已发出过满容量记录时，尾包只多给出 `n mod 16384`；没有该前缀时 `n mod 16384` **就是** `n`，也就是内层协议的消息长度。**这条保护的是内层消息长度，不是窗口范围的。**
 3. **flush 合并**：control/bulk 通道都空时才冲刷，否则并进下一次 `write()`。TCP_NODELAY 下 flush 边界就是分段边界，也就是分类器观测的单位；真实 NSS/BoringSSL 会把 nghttp2 队列里的全部内容排进一次 `write()`。实测对论文特征**无可测量收益**（§9.8），保留是因为它更接近真实实现。
 4. **承载 `CMD_SYN` / `CMD_FIN` 的记录不取控制离散池**（§3.2 末段）。
-
-#### 窗口外放松
-
-观测窗口结束后（度量用 `flush 次数 + inbound.arrivals()`，是双向数据包数的**下界**，所以只会更晚放松），`markov_policy` 的 15% 对数正态延迟注入在 `POST_WINDOW_RELAX_BAND = 12` 包内线性衰减到零。衰减的是 **Bernoulli 触发概率**，不是 `mu`/`sigma`——形状与位置在真实实现里是常量。
-
-**必须有衰减带、不许断崖**：整形在第 N 包戛然而止会在 N±5 处留下分布断层，那是本项目已解决过两次的同一类问题（脚本融合窗口、control 态开场序列）。
-
-实测收益：960 KB 的 8 KB 写入从 876 ms 降到 86 ms（约 10×）。**中等积压的尺寸切分不放松**，理由见永久层第 2 条。
 
 ---
 
@@ -515,8 +508,8 @@ Noise 认证提交之前的**每一种**失败，都会把客户端流量透明�
 |---|---|---|---|
 | `max_streams_per_session` | usize　　　 | 256　　　　　　　| 每个隧道 Session 最大并发多路复用流数。 |
 | `idle_timeout_secs`　　　| u64　　　　 | 75　　　　　　　 | Session 空闲拆除超时，**常量、无抖动**（nginx `keepalive_timeout` 默认值）。 |
-| `traffic_script`　　　　　| optional string array |（嵌入式默认）　 | 声明式流量脚本，控制握手完成后数据包的行为（§3.5）：一个可选的 `stop=N` 条目加带索引的规则 `i=L:lo-hi,D:d,F:f`。规则按 `packet_seq % N` 循环应用直到 `stop`，随后以 6 包平滑融合窗口过渡至 Markov 机。示例：`["stop=4", "0=L:200-250,D:0,F:0", "1=L:300-400,D:2.0-0.5,F:0"]`。`D:` 的第一个数字是**中位数毫秒**。格式错误的脚本在启动时触发非致命警告并回退至嵌入式默认；另有五类语义警告（`F:m>0`、规则可能落入 `L1`、跨 MTU、`stop` 周期性、`post_script_shaping="off"`）见 §8。参考脚本见 `REFERENCE_TRAFFIC_SCRIPT`。 |
-| `post_script_shaping` | optional string | `"markov"` | 脚本后整形模式（§3.5）。`"markov"`（默认）：融合窗口 → Markov 机。`"off"`：脚本用尽后按积压精确尺寸发出，零延迟、无 Fake 帧。非法取值在启动时触发非致命警告并按未设置处理。 |
+| `traffic_script`　　　　　| optional string array |（嵌入式默认）　 | 声明式流量脚本，控制握手完成后数据包的行为（§3.5）：一个可选的 `stop=N` 条目加带索引的规则 `i=L:lo-hi,D:d,F:f`。规则按 `packet_seq % N` 循环应用直到 `stop`，随后以 6 包平滑融合窗口过渡至交互采样器。示例：`["stop=4", "0=L:200-250,D:0,F:0", "1=L:300-400,D:2.0-0.5,F:0"]`。`D:` 的第一个数字是**中位数毫秒**。格式错误的脚本在启动时触发非致命警告并回退至嵌入式默认；另有五类语义警告（`F:m>0`、规则可能落入 `L1`、跨 MTU、`stop` 周期性、`post_script_shaping="off"`）见 §8。参考脚本见 `REFERENCE_TRAFFIC_SCRIPT`。 |
+| `post_script_shaping` | optional string | `"markov"` | 脚本后整形模式（§3.5）。`"markov"`（默认，为兼容保留此名）：融合窗口 → 确定性两态稳态。`"off"`：脚本用尽后按积压精确尺寸发出，零延迟、无 Fake 帧。非法取值在启动时触发非致命警告并按未设置处理。 |
 
 嵌入式默认脚本（以 `traffic_script` 配置语法展示）：
 ```
@@ -555,7 +548,7 @@ stop=6
 
 **它是模板，不是标准答案。** 脚本的价值在于**跨部署的群体去聚类**（§9.10）——如果所有人照抄这一份，它立刻变成新的群体特征，与内嵌默认没有区别。而论文的判别量（首 burst、burst 结构、TCP 分段边界、往返次数）由 shaper 的硬编码逻辑保证，**不受脚本控制**：脚本写错只会更差，写对也不会更好。
 
-脚本规则用尽后（通过平滑融合窗口衔接进入 Markov 机），TrafficShaper 的 Markov 状态机（§3.4）在连接剩余生命周期中掌管尺寸与延迟策略。Markov 转换参数无配置暴露——它们源自待发送缓冲区压力通过概率 `p_bulk` 渐变且方向对称。
+脚本规则用尽后（通过平滑融合窗口衔接进入稳态），TrafficShaper 的确定性两态策略（§3.4）在连接剩余生命周期中掌管尺寸。其参数无配置暴露——源自待发送缓冲区压力且方向对称。
 
 ---
 
@@ -654,7 +647,7 @@ len_lo=162: 162×0.85=137.70 → as usize 137 → 线速 161 → L2
 
 ### 9.9 数据记录与控制记录按尺寸**刻意**不可区分
 
-曾有一个论证以「所有小于约 194 字节的记录都可被无歧义判定为控制类」为前提。该前提不成立：`markov_policy` 的 `InteractiveControl` 分支**故意**让数据记录复用控制帧的尺寸池，bulk 迟滞尾包与 `post_script_shaping = "off"` 也能产出任意小的数据记录。
+曾有一个论证以「所有小于约 194 字节的记录都可被无歧义判定为控制类」为前提。该前提不成立：交互采样路径**故意**让数据记录的尺寸分布与控制帧尺寸重叠，bulk 迟滞尾包与 `post_script_shaping = "off"` 也能产出任意小的数据记录。
 
 观察者无法按尺寸干净地划分 control/data——**这正是设计目标**。任何依赖「按尺寸区分两类记录」的论证都是无效的。
 
@@ -678,7 +671,7 @@ len_lo=162: 162×0.85=137.70 → as usize 137 → 线速 161 → L2
 
 ### 9.12 硬编码取值的正确处理不是随机化，而是对齐到真实来源
 
-`FIRST_RECORD_PAYLOAD_LO/HI`、`next_data_record_payload` 的分布参数、`MARKOV_DELAY_SIGMA`、H2 开场 flight 的尺寸序列、WINDOW_UPDATE 阈值、PING 空闲阈值——这些全是全球统一的常量。
+`FIRST_RECORD_PAYLOAD_LO/HI`、`next_data_record_payload` 的分布参数、脚本延迟参数、H2 开场 flight 的尺寸序列、WINDOW_UPDATE 阈值、PING 空闲阈值——这些全是全球统一的常量。
 
 它们**应该**是常量（原则 2：真实实现的尺寸决策代码就是编译期常量）。问题因此不是「要不要随机化」，而是：**这套硬编码分布看起来像某个真实实现，还是像不存在的东西？**
 

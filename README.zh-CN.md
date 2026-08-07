@@ -211,6 +211,37 @@ openssl rand -base64 48
 
 客户端出站携带单个 `settings.password`，对应服务端某个用户的密码。认证通过后，用户名会附加到连接上，可通过路由规则的 `auth_user` 字段按用户分流。
 
+### 管理 API
+
+一个刻意保持小型的可选 HTTP API，为后续「一台中控管多个节点」的面板做准备。服务端配置中不存在 `api` 段时完全关闭：
+
+```json
+"api": {
+  "listen": "127.0.0.1:9090",
+  "token": "<openssl rand -hex 24>"
+}
+```
+
+所有端点都要求 `Authorization: Bearer <token>`，路径都在 `/api/v1` 下：
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/v1/node` | 节点状态 `{version, online, enabled, uptime_secs, active_connections, users, enabled_users}`。中控逐节点轮询：可达即在线，不可达即离线。 |
+| `PUT /api/v1/node/enabled` | 节点代理**服务**的启停，请求体 `{"enabled": false}`（也接受 POST）。停用后端口照常监听，但所有连接都回落到伪装站点——对外就是一台普通 Web 服务器；API 保持可达以便重新启用。状态持久化到 `inbounds[0].enabled`。 |
+| `GET /api/v1/users` | 用户列表：`[{name, enabled, uplink_bytes, downlink_bytes}]` |
+| `POST /api/v1/users` | 添加用户，请求体 `{"name": "...", "password": "..."}` → `201` |
+| `GET /api/v1/users/:name` | 单个用户，含总上行/下行字节数 |
+| `PUT /api/v1/users/:name/enabled` | 启用/暂停，请求体 `{"enabled": false}`（也接受 POST） |
+| `PUT /api/v1/users/:name/password` | 修改密码，请求体 `{"password": "..."}`。PSK 即刻轮换：旧密码的新握手失败，已建立会话不受影响。 |
+| `DELETE /api/v1/users/:name` | 删除用户 → `204` |
+
+需要了解的语义：
+
+- 用户与节点状态变更先经过完整的服务端配置校验，再**回写配置文件**（临时文件 + 原子 rename，保持键序与文件权限），重启后不丢失。会让配置变成非法状态的变更（比如删掉最后一个用户）会被拒绝，内存与磁盘都不变。
+- 暂停/删除用户、修改密码、停用节点都只影响新握手；已建立的会话自然跑到结束（不做强制踢线）。进程级的 start/stop 刻意不在 API 里——进程停了就再没有东西能把它启起来，那是 systemd 的职责。
+- `uplink_bytes` 是客户端发往目标方向的字节数，`downlink_bytes` 相反（服务端隧道载荷口径；UoT 含 9/21 字节封装头）。计数器在内存中，重启归零——`uptime_secs` 可供中控发现重置。
+- API 是明文 HTTP + Bearer 令牌，刻意不带 TLS。`listen` 请保持回环，通过 SSH 隧道（`ssh -L 9090:127.0.0.1:9090`）或受信管理网访问；绑非回环地址时令牌强制 ≥32 字符并在启动时告警。路径中的用户名会做 percent 解码，含特殊字符的名字同样可以寻址。
+
 ### 日志级别
 
 `trace` / `debug` / `info` / `warn` / `error`。优先级：`log.level` → 环境变量 `RUST_LOG` → 默认 `info`。
@@ -328,14 +359,40 @@ ClientHello 保持正常 TLS record 结构。TLS 1.3 中预期为随机的字段
 
 - **目标池大小**：由指纹族、SNI 和时段种子决定（默认 4–16）
 - **错峰启动**：初始连接以抖动延迟（50–2500 ms）错峰建立
-- **Soft TTL 轮换**：120–300 秒（种子决定），连接停止接受新 stream
-- **空闲排干**：30 秒无活跃 stream → 连接关闭
-- **按需扩容**：仅在有等待者时创建新连接
+- **Soft TTL 轮换**：3600 秒（对齐 nginx `keepalive_time` 默认值），连接转入排干状态
+- **空闲排干**：115 秒无活跃 stream（对齐 Firefox `network.http.keep-alive.timeout`）→ 连接关闭
+- **按需扩容**：仅在有等待者时创建新连接（常态为单连接，与真实 Firefox 对同一 origin 只开一条 H2 连接一致）
 - **负载感知选择**：按 stream 数和缓冲流量选择连接
 
 ### 空闲拆除（服务端）
 
 Session 读取循环（仅服务端；客户端由连接池管理）使用 pinned `tokio::time::sleep` 定时器，每次成功读取时重置。空闲超时 tick 时，session 检查是否存在活跃流；若无活跃流，则发送 Noise 加密的 TLS `close_notify`（0x15）和 TCP FIN，优雅拆除连接。内核 TCP keepalive 对齐 Firefox 默认值（空闲 600 秒、间隔 1 秒、4 次探测）作为死端检测。
+
+## 吞吐调优
+
+**架构事实**：全部流量复用在（常态下）一条隧道 TCP 连接上——这是防指纹设计的一部分（真实 Firefox 对同一 origin 只开一条 H2 连接）。因此总吞吐 = 单条 TCP 流在两端主机之间的吞吐，内核参数直接决定上限。
+
+**高 BDP 路径（如 500 Mbps × 175 ms ⇒ BDP ≈ 10.9 MB）需要的宿主机配置**（客户端与服务端两侧都要）：
+
+```bash
+# /etc/sysctl.d/99-kanotls-bdp.conf
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 16384 33554432
+```
+
+kanotls 在建连时会主动请求 16 MiB 的 socket 缓冲（仅当 `net.core.*_max` 允许，否则保持内核自动调优并打出 warn 日志）。自动调优的封顶由 `net.ipv4.tcp_*mem` 的第三列决定（常见默认 4/6 MiB ⇒ 单连接约 180–270 Mbps 封顶）；不改内核参数，任何应用层优化都越不过这道墙。
+
+**吞吐不达预期时的定位步骤**（三类瓶颈对号入座）：
+
+1. 把 `log.level` 设为 `debug`，复现慢速场景，然后看三条日志：
+   - `tunnel socket buffer via setsockopt` / `net.core.* too small` —— **内核缓冲不足**：按上面的 sysctl 调整；调完应看到 `effective ~16 MiB`。
+   - `session flow-control summary: N send-side stalls, M ms total` —— **窗口停等**：stall 总时长占比高说明隧道内流控在限流（对端消费慢或路径 BDP 超窗口配置）。
+   - `session writer data plane: bulk X records/Y bytes, shaped U records/V bytes` —— **CPU/记录开销**：shaped（小记录）字节占比异常高说明流量形态被误判成交互式，每字节加密开销约为满载态的 20 倍，弱 CPU 会因此限流。
+2. 用 `post_script_shaping = "off"` 做 A/B 对照：off 下恢复满速 ⇒ 瓶颈在整形路径（CPU）；off 下仍慢 ⇒ 瓶颈在内核缓冲或路径本身（丢包/排队）。
+
+注意：单条 TCP 流在高 BDP 路径上对丢包极其敏感（一次丢包的 cwnd 恢复在 175 ms RTT 下以分钟计），实验室 netem 环境请勿叠加非预期的丢包率。
 
 ## 伪装端点缓存
 
@@ -424,6 +481,8 @@ SOCKS5 出站示例：
 |------|------|------|
 | `log.level` | 双方 | `trace` / `debug` / `info` / `warn` / `error`（默认 `info`） |
 | `routing.rules` | 双方 | sing-box 风格路由规则 |
+| `api.listen` | 服务端 | 可选。管理 API 监听地址（见「管理 API」一节；缺省即关闭） |
+| `api.token` | 服务端 | 可选。管理 API 的 Bearer 令牌（最少 16 字符；非回环监听时最少 32 字符） |
 
 每条路由规则：
 
@@ -441,8 +500,9 @@ SOCKS5 出站示例：
 | `listen` | 双方 | 监听地址（客户端：必须为 loopback IP 字面量） |
 | `port` | 双方 | 监听端口 |
 | `protocol` | 服务端 | `"kanotls"` |
+| `enabled` | 服务端 | 可选（默认 `true`）。`false` 停用代理服务：所有连接回落到伪装站点。由管理 API 写入 |
 | `protocol` | 客户端 | `"socks5"` / `"socks"` / `"http"` |
-| `settings.users` | 服务端 | 用户列表 `[{name, password}]`；用户名与密码均须唯一，密码最少 32 字节 |
+| `settings.users` | 服务端 | 用户列表 `[{name, password, enabled?}]`；用户名与密码均须唯一，密码最少 32 字节；`enabled` 默认 `true`（暂停时由管理 API 写入） |
 | `settings.camouflage.host` | 服务端 | 参考 TLS 1.3 端点主机名（DNS 名称；不接受 IP 字面量） |
 | `settings.camouflage.port` | 服务端 | 参考端点端口 |
 | `settings.session.max_streams_per_session` | 双方 | 可选。单 session 最大并发 stream 数（默认 256） |

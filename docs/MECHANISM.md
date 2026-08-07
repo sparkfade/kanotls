@@ -117,7 +117,7 @@ Protocol frames (CMD_SYN, CMD_FIN, CMD_SETTINGS, CMD_SYNACK, CMD_PADDING) use `e
 - **Records carrying `CMD_SYN` / `CMD_FIN` are the exception**: they are sized from the same sampler as data records (`next_data_record_payload`), **not** from the control discrete pool. Measured rationale in §9.3: all five control-pool sizes fall in `L1` (≤160), and at close the local FIN and the peer FIN each occupy their own segment directly after the response body's last segment ⇒ **`(−L4, L1, −L1)` reproduced once every 4–5 closes**. In real H2 a stream opens with `HEADERS` and half-closes via `END_STREAM` on a `DATA` frame; neither is a tiny standalone frame.
   `CMD_SYNACK` is **deliberately excluded**: enlarging it pushes the server's opening flight past 1211 bytes, which then pairs with the client's legitimately 33-byte SETTINGS-ACK to form `(L2, −L4, L1)` (distinctiveness 7.226) — SYNACK's smallness is protective inside the birth window.
 
-Each control record increments the TrafficShaper's internal control-frame counter (`note_control_frame()`), which governs the handshake-to-transport transition used by the shaper's Markov machine (§3.4).
+Each control record increments the write half's internal control-frame counter, which governs the control records' own handshake-to-transport transition (§3.2).
 
 ### 3.3 TrafficShaper Architecture
 
@@ -127,22 +127,23 @@ The `TrafficShaper` (per-connection, owned by `SessionWriter::run`) intercepts a
 2. **Slice / truncate**: if `pending` exceeds the payload capacity implied by `target_wire_len`, only that many bytes are taken; the remainder stays in `pending` for subsequent iterations. E.g. 5000 bytes of backlog against an 800-byte target → one 800-byte record emitted, 4200 bytes retained.
 3. **Precise pad**: if `pending` is smaller than the target capacity, the record is emitted at the exact `target_wire_len` with zero padding.
 4. **Encrypt**: `SnowyStream::prepare_data_record(slice, target_wire_len)` encrypts exactly one record whose on-wire size equals `target_wire_len`.
-5. **Flush** + **delay** + **advance**: the record is flushed, `tokio::time::sleep(delay)` injected if non-zero, then the shaper's packet sequence number and Markov state advance.
+5. **Flush** + **delay** + **advance**: the record is flushed, `tokio::time::sleep(delay)` injected if non-zero, then the shaper's packet sequence number advances.
 6. **Fake response**: if the policy carries `fake`, a `CMD_PADDING` request frame is queued on the control path before the next slice.
 
 This erases the passive trace: the same application write produces different record boundaries depending solely on the shaper's policy, not on the inner payload structure.
 
-### 3.4 Markov Macro-State Machine
+### 3.4 Deterministic Two-Mode Steady State
 
-The shaper maintains three macro-states that govern sizing policy over the connection's full lifecycle (no hard "first-N-packet" cliff):
+Past the opening (first-flight record + script + blend window, §3.5), the shaper has exactly two sizing modes, switched **deterministically on backlog pressure** — no coins, no hidden state:
 
-| State | Sizing | Delay | Description |
+| Mode | Entered when | Sizing | Delay |
 |---|---|---|---|
-| `HandshakeShaping` | Min-size (exact payload fit) | None | Active during the Noise handshake phase; tight coupling to avoid interference with auth framing. |
-| `InteractiveControl` | Sampled from HTTP/2 discrete + HEADERS distributions (reuses `control_size`) | 15% chance Log-Normal IAT | Mimics web-application request/response patterns with variable-sized records. |
-| `AsymmetricBulk` | Full MTU-anchored records (`max_data_record_wire_len` ≈ 16406) | None | Sustained high-throughput transfers; removes fragmentation caps to anchor sizes to realistic web-framing boundaries. |
+| Bulk latch | `pending_len ≥ 128 KiB` (or ≥ single-record capacity) | Full MTU-anchored records (`max_data_record_wire_len` ≈ 16406); within the same drain the final tail record goes out at its exact size (`bulk_run` hysteresis) | None |
+| Interactive | Backlog below the threshold | Sampled from the H2 HEADERS/DATA truncated-normal distribution (`next_data_record_payload`, 137–1400 B payload) | None |
 
-**Transition logic**: state is re-evaluated per emitted packet using **probabilistic smoothing**. The probability `p_bulk = pending_len / max_pending_flush_size` drives transitions: a nearly-full pending backlog strongly biases entry into `AsymmetricBulk`, while a drained buffer biases exit back to `InteractiveControl` (exit probability capped at 85%). This replaces the v1.1 deterministic thresholds with a continuous probability ramp that avoids state oscillation at the boundary.
+The latch releases the moment a policy query sees a below-threshold backlog, so the first small write after a bulk transfer always returns to sampled sizing (a real endpoint would never emit an exactly-80-byte record after a bulk run — that would leak the inner message length 1:1).
+
+**Why deterministic**: a real TLS stack's record sizing is driven by *data availability* (nginx's `ssl_buffer_size`; Cloudflare's dynamic record sizing — small records early, full 16 KB records once data flows continuously), not by randomness. The previous two-state Markov machine flipped between the same two record families by per-record coin toss (`p_bulk = pending/256KiB`); that randomness is unobservable on any real endpoint, and it made throughput a function of queue-depth races and RNG — on weak CPUs the small-record mode costs ~20× more crypto per byte, turning the sender app-limited with run-to-run variance. The latch produces byte-identical record families to the old bulk/interactive modes while making the *sequence* deterministic.
 
 ### 3.5 Declarative Traffic Script Engine
 
@@ -162,11 +163,11 @@ ScriptRule { len_lo, len_hi, delay: DelaySpec, expect_responses: u8, fake_jitter
 
 **Script lifecycle and blend window:**
 
-The script runs for `stop` packets (`stop` defaults to the rule count; a larger `stop` re-cycles the rules). After the last scripted packet, the engine enters a **smooth blend window** of `SCRIPT_BLEND_WINDOW = 6` packets. Within this window the probability of falling through to the Markov state machine (§3.4) ramps linearly from 0% to 100%. This eliminates the abrupt "first‑N‑packets‑then‑Markov" cliff, producing a gradual handover that is not fingerprintable via inter‑record size discontinuities.
+The script runs for `stop` packets (`stop` defaults to the rule count; a larger `stop` re-cycles the rules). After the last scripted packet, the engine enters a **smooth blend window** of `SCRIPT_BLEND_WINDOW = 6` packets. Within this window the probability of falling through to the interactive sampler (§3.4) ramps linearly from 0% to 100%. This eliminates the abrupt "first‑N‑packets‑then‑sampler" cliff, producing a gradual handover that is not fingerprintable via inter‑record size discontinuities.
 
-After the blend window, the TrafficShaper's Markov machine takes over for the remainder of the connection lifetime. No configuration surface exists for the Markov parameters — they are derived solely from the pending-backlog pressure via the probabilistic `p_bulk` ramp (§3.4).
+After the blend window, the deterministic two-mode steady state (§3.4) takes over for the remainder of the connection lifetime. No configuration surface exists for its parameters — they are derived solely from the pending-backlog pressure.
 
-**Post-script shaping switch (`post_script_shaping`):** the optional `session.post_script_shaping` config field selects what happens once the script is exhausted. The default `"markov"` behaves as described above (blend window → Markov machine). `"off"` disables all post-script shaping: once `packet_seq` reaches `stop`, every subsequent record carries exactly the pending payload (wire size = pending + fixed record overhead), with zero delay, no fake frames, and no blend window — plaintext size maps directly to wire size from that point on. The bulk fast path and bulk hysteresis (§3.4) still take priority in both modes. Any value other than `"markov"`/`"off"` triggers a non-fatal startup warning and is treated as unset.
+**Post-script shaping switch (`post_script_shaping`):** the optional `session.post_script_shaping` config field selects what happens once the script is exhausted. The default `"markov"` (the name is kept for config compatibility) behaves as described above (blend window → deterministic two-mode). `"off"` disables all post-script shaping: once `packet_seq` reaches `stop`, every subsequent record carries exactly the pending payload (wire size = pending + fixed record overhead), with zero delay, no fake frames, and no blend window — plaintext size maps directly to wire size from that point on. The bulk latch and bulk hysteresis (§3.4) still take priority in both modes. Any value other than `"markov"`/`"off"` triggers a non-fatal startup warning and is treated as unset.
 
 **Packet flow example — client → server, 3‑rule script:**
 
@@ -187,7 +188,7 @@ Real application data queued: 6000 bytes.
 | 2 | Rule 1 | 362 | 362 bytes | `MIN_DATA_WIRE_LEN + 362` (≈ 386) | Flush. `sleep(log_normal(2.0, 0.5))`. Then: queue `CMD_PADDING(flag=0, m=1)` on Control channel. Backlog remaining: 5423. |
 | 3 | Rule 2 | 197 | 197 bytes | `MIN_DATA_WIRE_LEN + 197` (≈ 221) | Flush. `sleep(log_normal(1.5, 0.6))`. Backlog remaining: 5226. |
 
-After packet 3 the script has exhausted its 3 rules. Packets 4–9 are emitted within the **6‑packet blend window**: each has an increasing probability (≈17%, 33%, 50%, 67%, 83%, 100%) of being governed by the Markov machine instead of re‑cycling the script. Packet 10+ are entirely Markov‑controlled.
+After packet 3 the script has exhausted its 3 rules. Packets 4–9 are emitted within the **6‑packet blend window**: each has an increasing probability (≈17%, 33%, 50%, 67%, 83%, 100%) of being governed by the interactive sampler instead of re‑cycling the script. Packet 10+ are entirely governed by the two-mode steady state.
 
 **What the server sees on the wire (packet 2 sequence):**
 
@@ -211,11 +212,11 @@ Format example:
 
 ### 3.6 IAT Delay Modeling
 
-Inter-record delays use a single non-zero delay specification (`DelaySpec::None` means zero delay):
+Inter-record delays exist only inside the opening (script rules), using a single non-zero delay specification (`DelaySpec::None` means zero delay):
 
 - **`DelaySpec::LogNormal { mu_ms, sigma_ms }`**: Log-normal distribution sourced via Box-Muller normal sampling (`sample_log_normal(mu, sigma)` → `Duration::from_micros`). This fits the right-skewed, positive-definite distribution of real TCP inter-arrival times better than uniform or exponential jitter.
 
-The Markov `InteractiveControl` state applies a 15% delay probability; the script engine applies delays per-rule. `AsymmetricBulk` state uses zero delay (back-to-back emission) to preserve throughput.
+Steady-state records (both modes, §3.4) carry **zero delay**: a real TLS endpoint hands all queued records to the kernel in one `write()` — inter-record gaps come from when the application produces the next batch, not from the TLS layer. (The earlier Markov model injected a 15% log-normal gap that decayed after the observation window; it was the only injected IAT outside the script, and its cost — one forced `flush` + `sleep` per injection — turned into pure throughput variance once the window had passed. The opening delays that actually shape the birth window live in the script's per-rule `D:` specs and are unchanged.)
 
 ### 3.7 Record Padding
 
@@ -254,18 +255,10 @@ This section describes the mechanisms built against the USENIX Security 2024 enc
 
 #### Permanent layer (whole connection lifetime, near-zero cost)
 
-1. **Data records never land in `L1`** (wire ≤160). Both `markov_policy` and `script_policy` are bound by this; the latter is a hard clamp, because a configuration-time lint warning cannot un-send a record (§9.6).
+1. **Data records never land in `L1`** (wire ≤160). Both `interactive_policy` and `script_policy` are bound by this; the latter is a hard clamp, because a configuration-time lint warning cannot un-send a record (§9.6).
 2. **A record's size must not be a deterministic function of the backlog** — but **the exact tail of a genuine bulk run is faithful** (a real TLS write of 100 KB is 6 full records plus one exactly-sized tail). The boundary is the `bulk_run` predicate: when the same drain already emitted a full-capacity record, the tail only adds `n mod 16384`; without that prefix, `n mod 16384` **is** `n` — the inner protocol's message length. **This protects inner message length and is therefore not window-scoped.**
 3. **Flush coalescing**: flush only when both the control and bulk channels are empty, otherwise merge into the next `write()`. Under TCP_NODELAY the flush boundary *is* the segment boundary, which is the unit the classifier observes; real NSS/BoringSSL drain everything nghttp2 has queued into a single `write()`. Measured to yield **no detectable gain** against the paper's features (§9.8); retained because it is closer to a real implementation.
 4. **Records carrying `CMD_SYN` / `CMD_FIN` do not use the control discrete pool** (end of §3.2).
-
-#### Post-window relaxation
-
-Once the observation window has passed (measured as `flush count + inbound.arrivals()`, a **lower bound** on bidirectional data packets, so relaxation always starts later than the true window ends), `markov_policy`'s 15% log-normal delay injection decays linearly to zero over `POST_WINDOW_RELAX_BAND = 12` packets. What decays is the **Bernoulli trigger probability**, not `mu`/`sigma` — shape and location are constants in real implementations.
-
-**A decay band is mandatory; a cliff is not acceptable**: shaping that stops abruptly at packet N leaves a distribution break at N±5, the same class of problem this project has already solved twice (the script blend window, the control-state opening sequence).
-
-Measured benefit: 960 KB written in 8 KB chunks drops from 876 ms to 86 ms (~10×). **Medium-backlog size splitting is not relaxed**, for the reason in permanent-layer item 2.
 
 ---
 
@@ -515,8 +508,8 @@ The `session` block (optional, under `settings` in both client outbounds and ser
 |---|---|---|---|
 | `max_streams_per_session` | usize | 256 | Maximum concurrent multiplexed streams per tunnel session. |
 | `idle_timeout_secs` | u64 | 75 | Session idle teardown timeout — a **constant, no jitter** (nginx's `keepalive_timeout` default). |
-| `traffic_script` | optional string array | (embedded default) | Declarative script controlling post-handshake data packets (§3.5): an optional `stop=N` entry plus indexed rules `i=L:lo-hi,D:d,F:f`. Rules are cycled with `packet_seq % N` until `stop`, then transition to the Markov machine via a 6-packet smooth blend window. Example: `["stop=4", "0=L:200-250,D:0,F:0", "1=L:300-400,D:2.0-0.5,F:0"]`. The first number in `D:` is the **median in milliseconds**. Malformed scripts trigger a non-fatal startup warning and fall back to the embedded default; five further semantic warnings (`F:m>0`, a rule that can land in `L1`, crossing an MTU, `stop` periodicity, `post_script_shaping="off"`) are described in §8. See `REFERENCE_TRAFFIC_SCRIPT` for a template. |
-| `post_script_shaping` | optional string | `"markov"` | Post-script shaping mode (§3.5). `"markov"` (default): blend window → Markov machine. `"off"`: once the script is exhausted, records are emitted at their exact pending size with zero delay and no fake frames. Invalid values trigger a non-fatal startup warning and are treated as unset. |
+| `traffic_script` | optional string array | (embedded default) | Declarative script controlling post-handshake data packets (§3.5): an optional `stop=N` entry plus indexed rules `i=L:lo-hi,D:d,F:f`. Rules are cycled with `packet_seq % N` until `stop`, then transition to the interactive sampler via a 6-packet smooth blend window. Example: `["stop=4", "0=L:200-250,D:0,F:0", "1=L:300-400,D:2.0-0.5,F:0"]`. The first number in `D:` is the **median in milliseconds**. Malformed scripts trigger a non-fatal startup warning and fall back to the embedded default; five further semantic warnings (`F:m>0`, a rule that can land in `L1`, crossing an MTU, `stop` periodicity, `post_script_shaping="off"`) are described in §8. See `REFERENCE_TRAFFIC_SCRIPT` for a template. |
+| `post_script_shaping` | optional string | `"markov"` | Post-script shaping mode (§3.5). `"markov"` (default, name kept for compatibility): blend window → deterministic two-mode steady state. `"off"`: once the script is exhausted, records are emitted at their exact pending size with zero delay and no fake frames. Invalid values trigger a non-fatal startup warning and are treated as unset. |
 
 The embedded default script (shown in `traffic_script` config syntax):
 ```
@@ -555,7 +548,7 @@ Beyond parsing, `validate_traffic_script` checks five classes of configuration t
 
 **It is a template, not a canonical answer.** A script's value is **cross-deployment de-clustering** (§9.10) — if everyone copies this one it immediately becomes the new fleet signature, no better than the embedded default. The paper's discriminating quantities (first burst, burst structure, TCP segment boundaries, round-trip count) are guaranteed by hardcoded shaper logic and are **not script-controlled**: a wrong script only makes things worse, and a right one makes nothing better.
 
-After the script rules are exhausted (with the smooth blend window bridging into the Markov machine), the TrafficShaper's Markov state machine (§3.4) governs sizing and delay for the remainder of the connection lifecycle. No configuration surface exists for the Markov transition parameters — they are derived from the pending backlog pressure via a probabilistic `p_bulk` ramp and are directionally symmetric.
+After the script rules are exhausted (with the smooth blend window bridging into the steady state), the TrafficShaper's deterministic two-mode policy (§3.4) governs sizing for the remainder of the connection lifecycle. No configuration surface exists for its parameters — they are derived from the pending backlog pressure and are directionally symmetric.
 
 ---
 
@@ -654,7 +647,7 @@ The mechanism is nonetheless correct (genuinely co-queued content does merge) an
 
 ### 9.9 Data and Control Records Are **Deliberately** Indistinguishable by Size
 
-One argument once rested on the premise that "every record below roughly 194 bytes is unambiguously control-class". The premise is false: `markov_policy`'s `InteractiveControl` branch **deliberately** draws data-record sizes from the control-frame pool, and the bulk-hysteresis tail and `post_script_shaping = "off"` can both emit arbitrarily small data records.
+One argument once rested on the premise that "every record below roughly 194 bytes is unambiguously control-class". The premise is false: the interactive sizing path **deliberately** draws data-record sizes from a distribution overlapping the control-frame sizes, and the bulk-hysteresis tail and `post_script_shaping = "off"` can both emit arbitrarily small data records.
 
 An observer cannot cleanly partition control from data by size — **that is the design goal**. Any argument that depends on separating the two classes by size is invalid.
 
@@ -678,7 +671,7 @@ So whenever the X in "randomization introduced to mask X" is eliminated by some 
 
 ### 9.12 The Right Treatment for Hardcoded Values Is Alignment With a Real Source, Not Randomization
 
-`FIRST_RECORD_PAYLOAD_LO/HI`, the distribution parameters of `next_data_record_payload`, `MARKOV_DELAY_SIGMA`, the H2 opening flight's size sequence, the WINDOW_UPDATE threshold, the PING idle threshold — all are globally uniform constants.
+`FIRST_RECORD_PAYLOAD_LO/HI`, the distribution parameters of `next_data_record_payload`, the script delay parameters, the H2 opening flight's size sequence, the WINDOW_UPDATE threshold, the PING idle threshold — all are globally uniform constants.
 
 They **should** be constants (principle 2: a real implementation's sizing code is a compile-time constant). The question is therefore not whether to randomize them but: **does this hardcoded distribution look like some real implementation, or like nothing that exists?**
 

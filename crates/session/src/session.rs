@@ -1,22 +1,40 @@
 use crate::frame::{
     coalesce_encoded_frames, decode_padding_goaway, decode_padding_window_update,
     encode_padding_goaway_sized, encode_padding_reply_sized, encode_padding_request_sized,
-    encode_padding_window_update_sized, encode_psh_frames, self_sized_padding_wire_len, Frame,
-    CMD_FIN, CMD_PADDING, CMD_PSH, CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CONTROL_RECORD_MIN_OVERHEAD,
-    FRAME_HEADER_SIZE, MAX_PAYLOAD_LEN, MIN_GOAWAY_RECORD_WIRE_LEN, PADDING_FLAG_GOAWAY,
-    PADDING_FLAG_REQUEST, PADDING_FLAG_WINDOW_UPDATE,
+    encode_psh_frames, self_sized_padding_wire_len, Frame, CMD_FIN, CMD_PADDING, CMD_PSH,
+    CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CONTROL_RECORD_MIN_OVERHEAD, FRAME_HEADER_SIZE,
+    MAX_PAYLOAD_LEN, PADDING_FLAG_GOAWAY, PADDING_FLAG_REQUEST, PADDING_FLAG_WINDOW_UPDATE,
 };
 use crate::shaper::{ShapePolicy, TrafficShaper};
 use crate::stream::{Stream, StreamInit, StreamOpenState, StreamParts};
 use bytes::{Bytes, BytesMut};
 use kanotls_tunnel::{ConnectionState, FlowDirection, SnowyStream};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify, RwLock};
 use tracing::{debug, error, trace, warn};
+
+mod h2;
+mod pending;
+mod window;
+
+pub(crate) use h2::{
+    padding_reply_wire_len, peer_never_processed, sample_h2_exchange_interval,
+    sample_h2_exchange_request_wire, GOAWAY_NOT_RECEIVED, H2_EXCHANGE_OPENING_MAX_COUNT,
+    H2_EXCHANGE_OPENING_MIN_COUNT, H2_GOAWAY_WIRE, H2_TIMER_DISABLED, MAX_PADDING_REPLIES,
+    PADDING_REQUEST_WIRE, PADDING_SETTINGS_ACK_WIRE,
+};
+#[cfg(test)]
+pub(crate) use h2::{H2_EXCHANGE_INTERVAL_OVERRIDE_MS, PADDING_ACK_WIRE};
+pub(crate) use pending::{BufferedPayload, PendingData, PendingOpenStreams};
+pub(crate) use window::WindowState;
+#[cfg(test)]
+pub(crate) use window::PADDING_WINDOW_UPDATE_WIRE;
+#[cfg(test)]
+pub(crate) use window::{H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES, STREAM_WINDOW_OVERRIDE_BYTES};
 
 /// 隧道的读半与写半。
 ///
@@ -32,129 +50,6 @@ use tracing::{debug, error, trace, warn};
 /// `kanotls_tunnel::common::NoiseTransport`），那把锁整个消失。
 type SplitReadHalf = kanotls_tunnel::SnowyReadHalf;
 type SplitWriteHalf = kanotls_tunnel::SnowyWriteHalf;
-
-/// 入账缓冲载荷：创建即计入 buffered_stream_bytes，被消费者取走
-/// （into_vec）或被丢弃（Drop）时恰好扣减一次，杜绝手工记账漏减。
-#[derive(Debug)]
-pub(crate) struct BufferedPayload {
-    data: Bytes,
-    counter: Arc<AtomicUsize>,
-    accounted: bool,
-}
-
-impl BufferedPayload {
-    pub(crate) fn new(data: impl Into<Bytes>, counter: &Arc<AtomicUsize>) -> Self {
-        let data = data.into();
-        counter.fetch_add(data.len(), Ordering::Relaxed);
-        Self {
-            data,
-            counter: counter.clone(),
-            accounted: true,
-        }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    /// 数据离开缓冲交付应用层：按口径扣减后返回原始字节。
-    ///
-    /// 返回 `Bytes` 而不是 `Vec<u8>`：载荷自 `Frame::decode` 起就是重组缓冲
-    /// 的一段引用计数切片，一路移交到这里都没有发生过拷贝，交付时再 `to_vec`
-    /// 等于把省下的拷贝重新付掉。中继侧只需要 `&[u8]`（`write_all(&d)`），
-    /// `Bytes` 直接 deref 即可。
-    pub(crate) fn into_bytes(mut self) -> Bytes {
-        self.release();
-        std::mem::take(&mut self.data)
-    }
-
-    fn release(&mut self) {
-        if self.accounted {
-            self.accounted = false;
-            subtract_buffered_stream_bytes(&self.counter, self.data.len());
-        }
-    }
-}
-
-impl Drop for BufferedPayload {
-    fn drop(&mut self) {
-        self.release();
-    }
-}
-
-#[derive(Default)]
-struct StreamQueue {
-    items: VecDeque<BufferedPayload>,
-    bytes: usize,
-}
-
-/// 每流的待投递积压。
-///
-/// 总字节与每流字节都以运行计数维护，入队/出队时同增同减。此前
-/// `total_bytes()` 是对所有队列所有载荷的全量求和，而它在
-/// `store_pending_data` 中每存一帧就要调一次——限额是 1024 流 × 1024 帧，
-/// 于是最坏情况下每帧扫描百万级条目。触发条件恰是它要防的那一个：消费者
-/// 卡住、channel 满、帧开始落到 pending。O(1) 记账消除这条放大路径。
-#[derive(Default)]
-pub(crate) struct PendingData {
-    queues: HashMap<u32, StreamQueue>,
-    total_bytes: usize,
-}
-
-impl PendingData {
-    pub fn contains(&self, sid: u32) -> bool {
-        self.queues.contains_key(&sid)
-    }
-
-    pub fn remove(&mut self, sid: u32) -> Option<VecDeque<BufferedPayload>> {
-        let queue = self.queues.remove(&sid)?;
-        self.total_bytes -= queue.bytes;
-        Some(queue.items)
-    }
-
-    pub fn clear(&mut self) {
-        self.queues.clear();
-        self.total_bytes = 0;
-    }
-
-    /// 有积压的流数量（空队列不会残留：拒绝入队时不创建条目，排空时移除）。
-    pub fn len(&self) -> usize {
-        self.queues.len()
-    }
-
-    pub fn total_bytes(&self) -> usize {
-        self.total_bytes
-    }
-
-    pub fn stream_bytes(&self, sid: u32) -> usize {
-        self.queues.get(&sid).map(|q| q.bytes).unwrap_or(0)
-    }
-
-    pub fn stream_frames(&self, sid: u32) -> usize {
-        self.queues.get(&sid).map(|q| q.items.len()).unwrap_or(0)
-    }
-
-    pub fn push_back(&mut self, sid: u32, payload: BufferedPayload) {
-        let len = payload.len();
-        let queue = self.queues.entry(sid).or_default();
-        queue.items.push_back(payload);
-        queue.bytes += len;
-        self.total_bytes += len;
-    }
-
-    /// 取走队首载荷；队列排空时一并移除条目，使 `contains`/`len` 的口径
-    /// 始终等于「有积压的流」。
-    pub fn pop_front(&mut self, sid: u32) -> Option<BufferedPayload> {
-        let queue = self.queues.get_mut(&sid)?;
-        let payload = queue.items.pop_front()?;
-        queue.bytes -= payload.len();
-        self.total_bytes -= payload.len();
-        if queue.items.is_empty() {
-            self.queues.remove(&sid);
-        }
-        Some(payload)
-    }
-}
 
 pub(crate) type SharedTunnelWriter = Arc<SessionWriter>;
 
@@ -318,25 +213,11 @@ const STREAM_CHANNEL_CAPACITY: usize = 128;
 const MAX_SESSION_REASSEMBLY_BYTES: usize = 1024 * 1024;
 const WRITE_CHANNEL_CAPACITY: usize = 64;
 
-/// 每流接收缓冲上限的基值，与 `STREAM_WINDOW_BYTES` 同义同值：fc 对端的
-/// 实际上限是它的 2 倍（窗口 + 首 RTT 越界余量，见 `store_pending_data`），
-/// 非 fc 旧对端沿用基值本身。聚合缓冲另受 `MAX_PENDING_STREAM_BYTES` 封顶。
-const MAX_STREAM_OVERFLOW_BYTES: usize = 16 * 1024 * 1024;
-
-/// 每流发送窗口（H2 的 `SETTINGS_INITIAL_WINDOW_SIZE` 语义）：发送方在同一条
-/// 流的在途字节超过此值前可自由发送，之后挂起等对端回补 WINDOW_UPDATE。
-///
-/// **取值**：16 MiB。窗口/RTT 是单流吞吐的硬上限，而无停顿速率是
-/// `(窗口 − 回补阈值)/RTT`（接收方消费满阈值才回补，补回路上要 1 RTT）。
-/// 500 Mbps × 175 ms 的 BDP ≈ 10.9 MB：2 MiB 旧值把单流钉死在 ~96 mbps
-/// （无停顿 48），16 MiB + 1/8 窗口回补阈值（2 MiB）给出
-/// (16−2) MiB/175ms ≈ 640 mbps 的单流无停顿余量。窗口值不上链
-/// （WINDOW_UPDATE 记录尺寸恒定 37 字节），唯一可观测变化是回补节奏。
-const STREAM_WINDOW_BYTES: usize = 16 * 1024 * 1024;
-
-/// 测试覆写点：0 表示使用上面的生产常量。窗口只影响**本端发送**的门控与
-/// 回补节奏，不改任何线上字节形态（WINDOW_UPDATE 记录本身尺寸恒定）。
-pub(crate) static STREAM_WINDOW_OVERRIDE_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// 每流接收缓冲上限的基值，与每流发送窗口（`window::STREAM_WINDOW_BYTES`）
+/// 同义同值：fc 对端的实际上限是它的 2 倍（窗口 + 首 RTT 越界余量，见
+/// `store_pending_data`），非 fc 旧对端沿用基值本身。聚合缓冲另受
+/// `MAX_PENDING_STREAM_BYTES` 封顶。
+const MAX_STREAM_OVERFLOW_BYTES: usize = 32 * 1024 * 1024;
 
 /// sticky bulk 批量 flush 双上限（先到先 flush）：连续 prepare 最多 K 条
 /// record 且 write_buffer 累计不超过 ~128KB 后统一冲刷一次。仅合并内部
@@ -344,177 +225,14 @@ pub(crate) static STREAM_WINDOW_OVERRIDE_BYTES: AtomicUsize = AtomicUsize::new(0
 const STICKY_BULK_FLUSH_MAX_RECORDS: usize = 8;
 const STICKY_BULK_FLUSH_MAX_BYTES: usize = 128 * 1024;
 
-/// 稳态 H2 行为骨架（post-script steady state）：真实 HTTP/2 接收端回发
-/// WINDOW_UPDATE，并对收到的 PING 回 PING-ACK。内容加密不可见，只需复刻
-/// 尺寸/时序语义。两者都以 CMD_PADDING 帧实现：flag=1 被对端静默吸收
-/// （等价 WINDOW_UPDATE 的“无回复”语义），flag=0 m=1 会换来一条 reply
-/// （等价 PING/PING-ACK 对）。客户端不做空闲探活 PING（用户明确不需要
-/// 保活），flag=0 m=1 的请求只来自脚本 fake 交互与合成 H2 交换。
-///
-/// WINDOW_UPDATE 的触发阈值是**逐进程常量**，不逐次重采样。此前是
-/// `gen_range(1MB..=4MB)` 且每越过一次就重新采样一个新阈值 ⇒ 全随机，而
-/// 真实 H2 接收端的规则是确定的：窗口是实现里的编译期常量，消费字节越过
-/// 窗口的某个固定比例就回补一条 WINDOW_UPDATE。
-///
-/// **取值：连接级窗口 32 MiB、回补阈值 = 窗口的 1/8（4 MiB）。** 窗口值的
-/// 原型是 Firefox 的 `ASpdySession::kInitialRwin = 12 MiB`，回补规则的原型
-/// 是 nghttp2 的「消费达本地窗口一半即回补」。但窗口决定吞吐上限：无停顿
-/// 速率 = `(窗口 − 阈值)/RTT`，12 MiB 窗口 + 半窗回补在 175 ms RTT 下只剩
-/// (12−6) MiB/0.175s ≈ 288 mbps，把 500 mbps 链路活活钉死。窗口值与阈值
-/// 都不上链（WU 记录尺寸恒定 37 字节），可观测的只有回补节奏从「每 6 MiB
-/// 一条」变为「每 4 MiB 一条」，仍落在真实 H2 端点的合理区间。32/4 MiB
-/// 给出 (32−4)/0.175s ≈ 1.3 gbps 的无停顿余量，覆盖目标链路。
-///
-/// 用 `OnceLock` 而不是 `const`：语义是「进程内解析一次、此后恒定」，与
-/// 真实实现的编译期常量同一口径，同时保留测试覆写点。
-const H2_SESSION_WINDOW_BYTES: usize = 32 * 1024 * 1024;
-static H2_WINDOW_UPDATE_THRESHOLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
 /// 论文（USENIX Sec'24, Xue et al.）的观测窗口 `Wo`：25 个承载数据的 TCP 包。
 ///
 /// 包数用「读循环收到的对端到达次数」近似：一次 `read()` 至少对应一个 TCP
 /// 段，故 arrivals ≤ 实际包数——**低估**方向，只会让窗口判定更晚，是保守的。
-///
-/// `TrafficShaper` 的窗口外放松（见 `shaper::POST_WINDOW_RELAX_BAND`）复用
-/// 同一个常量，但用的是一个更严的下界：`flush 次数 + arrivals`。
+/// 仅测试断言引用（生产路径的窗口内行为由 shaper 的脚本位置模型与
+/// `wait_for_peer_turn` 承担，不直接读这个常量）。
+#[cfg(test)]
 pub(crate) const PAPER_OBSERVATION_WINDOW_PACKETS: u64 = 25;
-
-/// 优雅拆除前那条 H2 GOAWAY 记录的线速尺寸。
-///
-/// 真实 H2 端点在关闭连接前先发 GOAWAY（帧类型 0x07），然后才是
-/// close_notify + FIN。GOAWAY 的最小帧 = 9 字节帧头 + 4 last_stream_id +
-/// 4 error_code = 17 字节载荷，与 PING 帧（9 + 8）完全相同，故线速尺寸就是
-/// `PING_WIRE`（41）。此前拆除时线上只有一条 24 字节的 close_notify，前面
-/// 没有任何控制尺寸的记录——nginx/Firefox 关闭 H2 连接必有 GOAWAY，缺了它
-/// 本身就是一条可观测特征。
-///
-/// 用 `PADDING_FLAG_GOAWAY`（flag=2）的「不换应答」形式：GOAWAY 不换 ACK，
-/// 且旧对端的 `handle_frame` 只对 flag=0 作答、其余 flag 静默丢弃，因此这个
-/// 新 flag 值对未升级的对端**完全无害**（论证见 `PADDING_FLAG_REQUEST`）。
-const H2_GOAWAY_WIRE: usize = kanotls_tunnel::control_size::PING_WIRE;
-
-/// 41 字节的 GOAWAY 记录必须装得下 4 字节 last_stream_id，且**不改变线速
-/// 尺寸**（junk 从 8 字节变成「4 字节 id + 4 字节零」）。这条编译期断言把它
-/// 钉死：任何把 `H2_GOAWAY_WIRE` 调到 37 以下的改动直接编译失败，而不是在
-/// 运行期悄悄退化成一条不带 id 的 GOAWAY。
-const _: () = assert!(H2_GOAWAY_WIRE >= MIN_GOAWAY_RECORD_WIRE_LEN);
-
-/// 「未收到对端 GOAWAY」的哨兵值。
-///
-/// 用 `AtomicU64` 承载一个 `Option<u32>`：`u32` 的全值域都是合法的
-/// last_stream_id（含 0——真实 H2 里「一条都没处理」就写 0），没有可借用的
-/// 带内哨兵，而 `u64::MAX` 落在 u32 值域之外，单次原子读即可无撕裂地区分
-/// 「没收到」与「收到且值为 0」。
-const GOAWAY_NOT_RECEIVED: u64 = u64::MAX;
-
-/// 「对端 GOAWAY 宣告这条流从未被处理」的判据，`Session` 与 `Stream` 共用。
-///
-/// 没收到 GOAWAY ⇒ 恒为 false：本端主动 `force_close`、TCP 直接被打断、旧版本
-/// 对端等所有情形都落在这里，行为与引入 GOAWAY 语义之前逐字节一致。
-pub(crate) fn peer_never_processed(state: &AtomicU64, stream_id: u32) -> bool {
-    match state.load(Ordering::Relaxed) {
-        GOAWAY_NOT_RECEIVED => false,
-        last => u64::from(stream_id) > last,
-    }
-}
-
-/// 合成 H2 请求/响应交换（论文所称的 "synthetic co-existing flows"）。
-///
-/// 论文把 mux 的致命前提写得很直白：*"the effectiveness of multiplexing depends
-/// on the presence of co-existing flows. In situations where there is only a
-/// single flow, or where the co-existing flows are inactive, patterns will
-/// remain as exposed as non-multiplexed proxies."*，并把 "generating synthetic
-/// co-existing flows when they are not naturally present" 列为未来工作。
-///
-/// 这里的合成流量必须以**真实 H2 成因**表达，否则只是用一个新特征换旧特征。
-/// 采用的成因是「浏览器在同一条 H2 连接上继续发请求」：一条 HEADERS 尺寸的
-/// 上行记录换来一条响应尺寸的下行记录。因此
-/// * 请求侧尺寸取 C2S HEADERS 分布（`next_control_size` 的截断正态档，
-///   250–800 载荷 ⇒ 274–824 线速）——不是 PING 尺寸，避免在下行 burst 之后
-///   造出 `(−L4, L1, −L1)`；
-/// * 应答侧尺寸取响应方向的数据记录分布（见 `padding_reply_wire_len`）。
-///
-/// **开场窗口**：真实页面加载会在连接建立后的头 100ms 内连发若干请求，所以
-/// 前 `H2_EXCHANGE_OPENING_*` 次交换按数十毫秒的间隔发出——这恰好落在论文的
-/// `Wo = 25` 包观测窗口内，是「窗口内真的存在共存流」的唯一办法。
-/// **稳态**：此后回落到浏览量级的重尾间隔（中位数 ~20s）。
-///
-/// 触发条件（见读循环）：仅客户端方向、`post_script_off` 关闭时不生效、且必须
-/// 已经收到过对端记录（保证连接的第一个上行 burst 已经出网，合成请求不会挤进
-/// 那个 burst 把它顶过 300 字节）。稳态交换额外要求至少有一条流开着——一条
-/// 完全空闲的 H2 连接本来就该被 idle timeout 拆掉，硬撑着发帧反而是伪装破绽。
-const H2_EXCHANGE_OPENING_MIN_COUNT: u32 = 1;
-const H2_EXCHANGE_OPENING_MAX_COUNT: u32 = 3;
-const H2_EXCHANGE_OPENING_MU_MS: f64 = 3.4; // 中位数 ≈ 30ms
-const H2_EXCHANGE_OPENING_SIGMA: f64 = 0.7;
-const H2_EXCHANGE_STEADY_MU_MS: f64 = 9.9; // 中位数 ≈ 20s
-const H2_EXCHANGE_STEADY_SIGMA: f64 = 1.2;
-/// 稳态交换的间隔上限：超过它就没有观测意义，而且会把 sleep 的 deadline
-/// 推到不现实的远处。
-const H2_EXCHANGE_MAX_INTERVAL_SECS: u64 = 300;
-
-/// 测试覆写点：0 表示使用上面的生产常量。
-pub(crate) static H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES: AtomicUsize = AtomicUsize::new(0);
-pub(crate) static H2_EXCHANGE_INTERVAL_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
-
-/// H2 骨架关闭时的定时器“禁用”姿态：分支被 select guard 屏蔽，deadline
-/// 只需足够遥远。
-const H2_TIMER_DISABLED: Duration = Duration::from_secs(3600);
-
-/// 单条 CMD_PADDING 请求可换取的应答记录上限。
-///
-/// 真实 H2 没有「一问 m 答」这种语义：PING 换恰好一个 PING-ACK，
-/// WINDOW_UPDATE 不换任何应答，SETTINGS 换恰好一个 SETTINGS-ACK。一次交互
-/// 里能站得住脚的第二条应答记录只有一种角色——「接收方本来就要发的窗口
-/// 更新」，故上限压到 2。此前是 16：m=4 在线上就是「一条请求 → 一簇记录」，
-/// 而且（见下方 handle_frame）这一簇还被合并成单条记录，两头都不像 H2。
-const MAX_PADDING_REPLIES: usize = 2;
-
-/// CMD_PADDING 记录的角色尺寸。真实 H2 里这三种帧的尺寸都是确定值
-/// （PING/PING-ACK 恒 8 字节载荷 → 17 字节帧，WINDOW_UPDATE 恒 4 字节载荷
-/// → 13 字节帧，SETTINGS-ACK 恒 9 字节帧），因此这里也取确定值而不是再过一遍
-/// 混合分布采样器：在真实实现恒定的维度上随机化，本身就是一个判别特征。
-const PADDING_REQUEST_WIRE: usize = kanotls_tunnel::control_size::PING_WIRE;
-const PADDING_ACK_WIRE: usize = kanotls_tunnel::control_size::PING_WIRE;
-const PADDING_WINDOW_UPDATE_WIRE: usize = kanotls_tunnel::control_size::WINDOW_UPDATE_WIRE;
-const PADDING_SETTINGS_ACK_WIRE: usize = kanotls_tunnel::control_size::SETTINGS_ACK_WIRE;
-
-/// 一条应答记录的目标线速尺寸，按**请求记录的 H2 角色**决定。
-///
-/// 角色由请求自身的线速尺寸唯一确定（`CMD_PADDING` 的 junk 已按目标尺寸反解，
-/// 故接收端能从帧长复原它）：
-/// * SETTINGS 尺寸的请求 → 一条 `SETTINGS-ACK`（33）；
-/// * HEADERS 量级（越过 `L1` 上界）的请求 → 一条**响应尺寸**的记录，即合成的
-///   H2 请求/响应交换（见 `sample_h2_exchange_request_wire`）；
-/// * 其余（PING 尺寸）→ 一条 `PING-ACK`（41）；
-/// * 第二条应答一律是接收方本来就要发的 `WINDOW_UPDATE`（37）。
-///
-/// 「应答尺寸随请求尺寸变化」在这里是**保真**而不是相关性泄漏：真实 H2 的
-/// PING-ACK 必须回显 PING 的 8 字节载荷、SETTINGS-ACK 恒为 9 字节帧、HEADERS
-/// 请求换来的是响应体。此前被删掉的是另一种做法——`total_junk =
-/// frame.payload.len() - 2`，让应答尺寸成为请求尺寸的**连续**函数，那才是一条
-/// 可观测的相关性。这里是一张 3 项的离散角色表。
-fn padding_reply_wire_len(
-    request_wire_len: usize,
-    index: usize,
-    direction: FlowDirection,
-) -> usize {
-    if index > 0 {
-        return PADDING_WINDOW_UPDATE_WIRE;
-    }
-    if kanotls_tunnel::control_size::is_settings_bearing_wire_size(request_wire_len) {
-        return PADDING_SETTINGS_ACK_WIRE;
-    }
-    if request_wire_len > kanotls_tunnel::control_size::L1_MAX_WIRE_LEN {
-        // 合成交换的应答：按响应侧数据记录的尺寸分布取值。
-        let payload = kanotls_tunnel::control_size::next_data_record_payload(
-            direction,
-            &mut rand::thread_rng(),
-        );
-        return SnowyStream::data_record_wire_len(payload);
-    }
-    PADDING_ACK_WIRE
-}
 
 /// 把一个 control packet 编码成一条或多条 0x17 记录：每条的线速尺寸独立
 /// 决定，载荷不足则零填充，任何一条记录的尺寸都不是载荷长度的函数。
@@ -567,7 +285,7 @@ fn prepare_control_packet_records(
     // 而按控制池取值时，每次关流都会在响应体末段之后放出一对
     // 「本端 L1 → 对端 L1」，实测每 4~5 次关流就精确复现 `(−L4, L1, −L1)`。
     //
-    // 取的是与 `TrafficShaper::markov_policy` **完全相同**的采样器
+    // 取的是与 `TrafficShaper` 交互采样路径**完全相同**的采样器
     // （`next_data_record_payload`），不是另开一个窄区间：若给它们一个专属的
     // 窄窗口，「每条流开/关各有一条 176–272 字节的记录」本身就是一条可跨流
     // 聚合的新特征——在一条最多承载 256 条流的连接上，可聚合的弱特征等于强
@@ -617,7 +335,7 @@ fn prepare_control_packet_records(
             // [PSH(首块)]` 合并成一个 control packet），必须按**数据记录**口径
             // 切分：按 H2 HEADERS/DATA 帧的尺寸分布采样一个 chunk，切走
             // `min(remaining, chunk)` 并零填充至 chunk。记录尺寸只反映这次采样，
-            // 与载荷长度无关。分布与 `TrafficShaper` 的 `InteractiveControl` 共用
+            // 与载荷长度无关。分布与 `TrafficShaper` 的交互采样路径共用
             // 同一个定义（`control_size::next_data_record_payload`），此前是本文件
             // 私有的 200–600 均匀区间——两处对「H2 数据记录量级」各存一份定义。
             let chunk = kanotls_tunnel::control_size::next_data_record_payload(direction, &mut rng);
@@ -641,264 +359,6 @@ fn prepare_control_packet_records(
         records += 1;
         if consumed >= packet.len() {
             return Ok(records);
-        }
-    }
-}
-
-/// WINDOW_UPDATE 阈值：逐进程解析一次，此后恒定（论证见常量定义处）。
-fn h2_window_update_threshold() -> usize {
-    let override_bytes = H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES.load(Ordering::Relaxed);
-    if override_bytes > 0 {
-        return override_bytes;
-    }
-    *H2_WINDOW_UPDATE_THRESHOLD.get_or_init(|| H2_SESSION_WINDOW_BYTES / 8)
-}
-
-/// 下一次合成 H2 交换的间隔：开场窗口内是数十毫秒量级，之后是浏览量级。
-fn sample_h2_exchange_interval(opening_left: u32) -> Duration {
-    let override_ms = H2_EXCHANGE_INTERVAL_OVERRIDE_MS.load(Ordering::Relaxed);
-    if override_ms > 0 {
-        return Duration::from_millis(override_ms);
-    }
-    let (mu, sigma) = if opening_left > 0 {
-        (H2_EXCHANGE_OPENING_MU_MS, H2_EXCHANGE_OPENING_SIGMA)
-    } else {
-        (H2_EXCHANGE_STEADY_MU_MS, H2_EXCHANGE_STEADY_SIGMA)
-    };
-    let ms = kanotls_tunnel::utils::sample_log_normal(mu, sigma).max(1.0);
-    Duration::from_micros((ms * 1000.0).round() as u64)
-        .min(Duration::from_secs(H2_EXCHANGE_MAX_INTERVAL_SECS))
-}
-
-/// 合成 H2 交换的请求记录尺寸：C2S HEADERS 帧量级（不是 PING 量级）。
-fn sample_h2_exchange_request_wire() -> usize {
-    kanotls_tunnel::control_size::next_headers_frame_wire_len(
-        FlowDirection::C2S,
-        &mut rand::thread_rng(),
-    )
-}
-
-/// H2 流控状态：发送侧窗口（连接级 + 每流）与接收侧回补记账（消费 → WU）。
-///
-/// **为什么这是修复而不是新机制**：真实 H2 接收方回补窗口、发送方在窗口
-/// 耗尽后停发，接收缓冲由窗口自身界定——此前 KanoTLS 的「缓冲超限 →
-/// 丢数据 + 杀流」正是没有窗口语义的产物。这里把伪装常量（连接窗口、
-/// 回补阈值）从「假填充」变成真信贷：
-///
-/// * 发送侧：`acquire_credit` 在提交前检查（连接信贷 && 每流信贷），不足则
-///   挂起；WINDOW_UPDATE 帧到达（读循环帧层处理，纯记账）后放行。挂起即
-///   背压：中继不再读源站，源站 TCP 窗口自然填满——与真实 H2 逐字节同构。
-/// * 接收侧连接级：读循环**收到**数据帧即入账回补（`note_conn_received`）。
-///   连接级窗口管的是接收缓冲：字节到达即占缓冲，无论随后交付还是丢弃都
-///   已释放，故按收到回补才不会有泄漏路径。
-/// * 接收侧每流：`note_consumed` 由中继在字节真正交付本地/远端后调用
-///   （每流窗口保留交付语义 = 应用背压，nghttp2 规则），越过 1/8 窗口
-///   阈值（2 MiB）回吐一条 WINDOW_UPDATE（尺寸恒为 37 字节的
-///   `WINDOW_UPDATE_WIRE`）。
-///
-/// **旧对端兼容**：本端只在收到对端 SETTINGS 携带 `fc=1` 后才启用发送侧
-/// 门控（SETTINGS 本就是 H2 协商窗口语义的载体）；对未声明 fc 的对端，门控
-/// 完全旁路，行为与旧版逐字节一致。回补帧（flag=3）对旧对端是静默吸收的
-/// 填充，无害。
-///
-/// **无死锁**：门控挂起等的是**读循环**（非阻塞）收到的 WU 通知，不再依赖
-/// 写端任何 await；写端只可能在 TCP 发送缓冲真满时阻塞（正确背压）。
-pub(crate) struct WindowState {
-    writer: SharedTunnelWriter,
-    /// 对端是否在 SETTINGS 中声明了流控支持（`fc=1`）。为 false 时发送侧
-    /// 门控整体旁路，保持旧行为。
-    peer_flow_control: AtomicBool,
-    conn_credit: AtomicI64,
-    conn_wu_threshold: u64,
-    /// 连接级已消费、尚未回补的字节（CAS 记账，多流并发消费安全）。
-    conn_consumed_since_wu: AtomicU64,
-    stream_window: i64,
-    stream_wu_threshold: u64,
-    /// 连接级信贷到达信号。所有等待者都在「醒了再查一次」的幂等循环里，
-    /// 故用 `notify_waiters` 全量唤醒：一条 WU 到账要放行所有够格的流，
-    /// `notify_one` 会让其余流睡到下一条 WU（并发崩塌成锯齿）。
-    credit_notify: Notify,
-}
-
-impl WindowState {
-    pub(crate) fn new(writer: SharedTunnelWriter) -> Self {
-        // 连接窗口 = 8 × 回补阈值（论证见 `H2_SESSION_WINDOW_BYTES`：无停顿
-        // 速率 = (窗口−阈值)/RTT，半窗回补会把可用速率砍半）。测试覆写点
-        // `H2_WINDOW_UPDATE_THRESHOLD_OVERRIDE_BYTES` 沿用在阈值上，窗口
-        // 随之缩放。
-        let conn_wu_threshold = h2_window_update_threshold() as u64;
-        let conn_window = (conn_wu_threshold as i64).saturating_mul(8);
-        let stream_override = STREAM_WINDOW_OVERRIDE_BYTES.load(Ordering::Relaxed);
-        let stream_window = if stream_override > 0 {
-            stream_override
-        } else {
-            STREAM_WINDOW_BYTES
-        } as i64;
-        Self {
-            writer,
-            peer_flow_control: AtomicBool::new(false),
-            conn_credit: AtomicI64::new(conn_window),
-            conn_wu_threshold,
-            conn_consumed_since_wu: AtomicU64::new(0),
-            stream_window,
-            stream_wu_threshold: (stream_window as u64).saturating_div(8).max(1),
-            credit_notify: Notify::new(),
-        }
-    }
-
-    pub(crate) fn stream_window(&self) -> i64 {
-        self.stream_window
-    }
-
-    pub(crate) fn set_peer_flow_control(&self) {
-        self.peer_flow_control.store(true, Ordering::Relaxed);
-    }
-
-    pub(crate) fn peer_supports_flow_control(&self) -> bool {
-        self.peer_flow_control.load(Ordering::Relaxed)
-    }
-
-    /// 发送侧门控：信贷（连接级 + 每流）充足则扣减并放行，否则挂起。
-    ///
-    /// 对端未声明 fc 时直接放行（旧行为）。`stream_notify` 是本流的
-    /// `pending_notify`：每流 WU 到达时由帧层单独唤醒，连接级 WU 唤醒
-    /// `credit_notify`——两者都只做「再查一次」的提示，误唤醒无害。
-    /// 会话关闭时立即放行，让后续提交在 writer 的既有失败路径上报错。
-    ///
-    /// 扣减是两阶段 CAS：先连接级、再流级，流级不足则回滚连接级后等待。
-    /// 此前的「先 load 检查、再各自 fetch_sub」不是原子的——并发流可同时
-    /// 通过检查再双双扣减，把信贷打成负值，制造无必要的挂起毛刺。
-    ///
-    /// 等待侧用「先 `enable` 注册、再检查、后 park」的顺序：`notify_waiters`
-    /// 不留 permit，若先检查后注册，信贷在间隙到达会丢唤醒（挂起者睡到
-    /// 下一条 WU）；先注册则间隙到达的唤醒必然命中已注册的我们。
-    pub(crate) async fn acquire_credit(
-        &self,
-        stream_credit: &AtomicI64,
-        stream_notify: &Arc<Notify>,
-        len: usize,
-    ) {
-        if !self.peer_flow_control.load(Ordering::Relaxed) {
-            return;
-        }
-        let len = len as i64;
-        loop {
-            if self.writer.is_closed() {
-                return;
-            }
-            let conn_notified = self.credit_notify.notified();
-            let stream_notified = stream_notify.notified();
-            tokio::pin!(conn_notified);
-            tokio::pin!(stream_notified);
-            let _ = conn_notified.as_mut().enable();
-            let _ = stream_notified.as_mut().enable();
-
-            let conn = self.conn_credit.load(Ordering::Relaxed);
-            if conn >= len
-                && self
-                    .conn_credit
-                    .compare_exchange(conn, conn - len, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-            {
-                let stream = stream_credit.load(Ordering::Relaxed);
-                if stream >= len
-                    && stream_credit
-                        .compare_exchange(stream, stream - len, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                {
-                    return;
-                }
-                // 流级不足：回滚连接级，等任一方向的新信贷再重试。
-                self.conn_credit.fetch_add(len, Ordering::Relaxed);
-            }
-            tokio::select! {
-                _ = conn_notified => {}
-                _ = stream_notified => {}
-            }
-        }
-    }
-
-    fn add_conn_credit(&self, increment: u32) {
-        self.conn_credit
-            .fetch_add(i64::from(increment), Ordering::Relaxed);
-        self.credit_notify.notify_waiters();
-    }
-
-    fn add_stream_credit(&self, credit: &AtomicI64, notify: &Arc<Notify>, increment: u32) {
-        credit.fetch_add(i64::from(increment), Ordering::Relaxed);
-        // `pending_notify` 同时服务读侧（pending 数据到达）与写侧（本流信贷
-        // 到达）：`notify_one` 可能唤醒错误的一侧把 permit 消耗掉，另一侧
-        // 睡到下一个无关事件。两侧都是幂等再查循环，全量唤醒无害。
-        notify.notify_waiters();
-    }
-
-    /// 连接级消费记账：跨流并发安全（CAS），越过阈值的那一方独占回补，
-    /// 杜绝两流同时把同一段消费重复计入。
-    fn bump_conn_consumed(&self, len: u64) -> Option<u32> {
-        let threshold = self.conn_wu_threshold;
-        let mut prev = self.conn_consumed_since_wu.load(Ordering::Relaxed);
-        loop {
-            let total = prev.saturating_add(len);
-            let next = if total >= threshold { 0 } else { total };
-            match self.conn_consumed_since_wu.compare_exchange(
-                prev,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return (total >= threshold).then(|| total.min(u32::MAX as u64) as u32),
-                Err(actual) => prev = actual,
-            }
-        }
-    }
-
-    /// 接收侧连接级回补：读循环每收到一个数据帧即按载荷长度入账（连接级
-    /// 窗口管的是接收缓冲，字节到达即占/即释，与应用是否已交付无关）。
-    /// 因此 Closing/NotFound/溢出杀流/拆除丢弃等一切「收到但未交付」路径
-    /// 自动回补——若按交付回补，这些路径上的每个字节都会从发送方连接级
-    /// 信贷里永久流失（窗口只减不增，表现为传输越跑越慢）。
-    pub(crate) fn note_conn_received(&self, len: usize) {
-        if let Some(conn_total) = self.bump_conn_consumed(len as u64) {
-            if !self.send_window_update(0, conn_total) {
-                // 入队失败（控制队列满）：把消费量加回去，后续入账会再次
-                // 越过阈值补发这条 WU。丢信贷是永久泄漏，恢复只是让回补
-                // 迟到；并发 bump 下可能多补一次（≤ 阈值量级），方向是
-                // 多给对端信贷，有界且良性。
-                self.conn_consumed_since_wu
-                    .fetch_add(conn_total as u64, Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// 接收侧每流回补入账：中继在字节真正交付应用层后调用（每流窗口保留
-    /// 交付语义 = 应用背压）。`stream_consumed_since_wu` 在流对象上（单
-    /// 消费者，fetch_add/fetch_sub 安全）。越过阈值即回吐一条真实
-    /// WINDOW_UPDATE（flag=3，尺寸恒为 37 字节的 `WINDOW_UPDATE_WIRE`）。
-    pub(crate) fn note_consumed(&self, sid: u32, stream_consumed_since_wu: &AtomicU64, len: usize) {
-        let len_u64 = len as u64;
-        let stream_total = stream_consumed_since_wu.fetch_add(len_u64, Ordering::Relaxed) + len_u64;
-        if stream_total >= self.stream_wu_threshold {
-            stream_consumed_since_wu.fetch_sub(stream_total, Ordering::Relaxed);
-            if !self.send_window_update(sid, stream_total.min(u32::MAX as u64) as u32) {
-                // 与 note_conn_received 同理：恢复计数，下次消费补发，
-                // 不让一次控制队列拥塞变成永久信贷泄漏。
-                stream_consumed_since_wu.fetch_add(stream_total, Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// 入队一条 WINDOW_UPDATE（fire-and-forget：读循环绝不因写端排队而
-    /// 阻塞）。返回是否成功入队；失败时调用方负责恢复对应消费计数。
-    fn send_window_update(&self, sid: u32, increment: u32) -> bool {
-        let packet = encode_padding_window_update_sized(sid, increment, PADDING_WINDOW_UPDATE_WIRE);
-        if let Err(e) =
-            self.writer
-                .try_write_packets(vec![packet], FlushBehavior::Auto, TrafficClass::Control)
-        {
-            debug!("window update deferred (control queue full): {}", e);
-            false
-        } else {
-            true
         }
     }
 }
@@ -942,124 +402,6 @@ pub struct Session {
     peer_goaway_last_stream_id: Arc<AtomicU64>,
     /// H2 流控状态：发送侧窗口与接收侧回补记账（见 `WindowState`）。
     pub(crate) windows: Arc<WindowState>,
-}
-
-#[derive(Debug, Default)]
-struct PendingOpenStream {
-    buffered_data: Vec<BufferedPayload>,
-    /// buffered_data 的运行字节数，与 `PendingOpenStreams::total_bytes` 同增
-    /// 同减，使整条流的丢弃/取走都是 O(1) 扣减。
-    bytes: usize,
-    buffered_fin: bool,
-    reservation_released: bool,
-}
-
-/// 服务端 pre-accept 缓冲：CMD_SYN 已到、应用层尚未 accept 期间落下的
-/// PSH/FIN。
-///
-/// 总字节以运行计数维护，入队 + / 取走・丢弃 −，四个限额检查全部 O(1)。
-/// 此前 `store_pending_open_data` 每存一帧都要
-/// `values().flat_map(buffered_data).map(len).sum()` 一遍：上限是
-/// max_streams_per_session（默认 256）× MAX_PENDING_STREAM_FRAMES（1024）
-/// = 26 万条目，而触发条件恰是它要防的那一个——消费者不 accept、帧开始落
-/// 到 pending，于是背压一发生就是 O(n²) 放大。这正是 `PendingData` 上方那段
-/// 注释已经修掉的反模式，服务端 pre-accept 这条路径漏了。
-///
-/// 载荷本身仍由 `BufferedPayload` 的 RAII 记账维护 buffered_stream_bytes 那
-/// 本账；这里维护的是 pending_open 自己的限额账，两本互不干扰。
-#[derive(Default)]
-pub(crate) struct PendingOpenStreams {
-    streams: HashMap<u32, PendingOpenStream>,
-    total_bytes: usize,
-}
-
-impl PendingOpenStreams {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.streams.is_empty()
-    }
-
-    pub(crate) fn contains(&self, sid: u32) -> bool {
-        self.streams.contains_key(&sid)
-    }
-
-    pub(crate) fn total_bytes(&self) -> usize {
-        self.total_bytes
-    }
-
-    pub(crate) fn stream_frames(&self, sid: u32) -> usize {
-        self.streams
-            .get(&sid)
-            .map(|stream| stream.buffered_data.len())
-            .unwrap_or(0)
-    }
-
-    /// 登记一个新的 pre-accept 条目（重复 SYN 由调用方在此之前拒绝；万一
-    /// 覆盖，旧条目的字节先扣账，计数不会漂移）。
-    pub(crate) fn insert_new(&mut self, sid: u32) {
-        self.remove(sid);
-        self.streams.insert(sid, PendingOpenStream::default());
-    }
-
-    /// 丢弃条目：未投递载荷由 `BufferedPayload::drop` 回 buffered_stream_bytes
-    /// 的账，此处扣的是限额账。
-    pub(crate) fn remove(&mut self, sid: u32) {
-        if let Some(stream) = self.streams.remove(&sid) {
-            self.total_bytes -= stream.bytes;
-        }
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.streams.clear();
-        self.total_bytes = 0;
-    }
-
-    /// 入队一帧；条目不存在时返回 false（载荷随作用域丢弃自动回账）。
-    pub(crate) fn push_data(&mut self, sid: u32, payload: BufferedPayload) -> bool {
-        let len = payload.len();
-        match self.streams.get_mut(&sid) {
-            Some(stream) => {
-                stream.buffered_data.push(payload);
-                stream.bytes += len;
-                self.total_bytes += len;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// 取走一批待投递内容（所有权转交调用方，限额账同步扣减）并清掉 FIN
-    /// 标记；None 表示条目不存在。
-    pub(crate) fn take_ready(&mut self, sid: u32) -> Option<(Vec<BufferedPayload>, bool)> {
-        let stream = self.streams.get_mut(&sid)?;
-        let data = std::mem::take(&mut stream.buffered_data);
-        let fin = stream.buffered_fin;
-        let bytes = std::mem::take(&mut stream.bytes);
-        stream.buffered_fin = false;
-        self.total_bytes -= bytes;
-        Some((data, fin))
-    }
-
-    /// 置位 buffered_fin；返回条目是否存在。
-    pub(crate) fn set_buffered_fin(&mut self, sid: u32) -> bool {
-        match self.streams.get_mut(&sid) {
-            Some(stream) => {
-                stream.buffered_fin = true;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// 入站流预留的一次性释放：Some(true) 表示本次首次释放，None 表示条目
-    /// 不存在。
-    pub(crate) fn release_reservation(&mut self, sid: u32) -> Option<bool> {
-        let stream = self.streams.get_mut(&sid)?;
-        if stream.reservation_released {
-            return Some(false);
-        }
-        stream.reservation_released = true;
-        Some(true)
-    }
 }
 
 #[derive(Debug)]
@@ -1201,19 +543,6 @@ struct FlushBatch {
     responders: Vec<oneshot::Sender<Result<(), String>>>,
     /// 自上次 flush 以来 prepare 的记录条数（合并上限之一）。
     records: usize,
-    /// 本连接累计成功 flush 的次数。
-    ///
-    /// 用途：给 `TrafficShaper` 一个**可辩护的包数下界**。socket 开了
-    /// `TCP_NODELAY`，一次 `flush()` = 一次 `write()` ⇒ 至少一个 TCP 段，
-    /// 因此「flush 次数」恒 ≤ 本端已发出的承载数据的包数。加上
-    /// `InboundSignal::arrivals()`（一次 `read()` ≥ 一个对端段，同样是下界），
-    /// 两者之和是**双向总包数的下界**。
-    ///
-    /// 为什么不能用 shaper 自己的 `packet_seq`：它计的是**记录**条数，而合并
-    /// flush 会把最多 `STICKY_BULK_FLUSH_MAX_RECORDS` 条记录塞进同一个段
-    /// ⇒ `packet_seq` 会**高估**包数，据此判「窗口已过」会放松得太早。下界则
-    /// 只会判得太晚——方向保守，与 PING 抑制处的口径一致。
-    flushes: u64,
 }
 
 impl FlushBatch {
@@ -1241,7 +570,6 @@ impl FlushBatch {
         self.records = 0;
         match write_half.flush().await {
             Ok(()) => {
-                self.flushes = self.flushes.saturating_add(1);
                 for responder in self.responders.drain(..) {
                     let _ = responder.send(Ok(()));
                 }
@@ -1261,6 +589,29 @@ impl FlushBatch {
         self.records = 0;
         for responder in self.responders.drain(..) {
             let _ = responder.send(Err(msg.to_string()));
+        }
+    }
+}
+
+/// 写循环的数据面诊断计数（每连接一份）：bulk 闩锁与交互采样两态各自
+/// 发出的记录条数与载荷字节数。会话结束时随写循环摘要输出，用于在
+/// 实验室区分「CPU（小记录占比异常）/缓冲/窗口」三类吞吐瓶颈。
+#[derive(Default)]
+struct DataPlaneStats {
+    bulk_records: u64,
+    bulk_bytes: u64,
+    shaped_records: u64,
+    shaped_bytes: u64,
+}
+
+impl DataPlaneStats {
+    fn note(&mut self, full_block: bool, payload_bytes: usize) {
+        if full_block {
+            self.bulk_records += 1;
+            self.bulk_bytes += payload_bytes as u64;
+        } else {
+            self.shaped_records += 1;
+            self.shaped_bytes += payload_bytes as u64;
         }
     }
 }
@@ -1806,6 +1157,12 @@ impl Session {
         }
 
         self.force_close();
+        let (stalls, stall_micros) = self.windows.stall_stats();
+        debug!(
+            "session flow-control summary: {} send-side stalls, {} ms total",
+            stalls,
+            stall_micros / 1000
+        );
         self.streams.write().await.clear();
         self.capacity_stream_count.store(0, Ordering::Relaxed);
         self.pending_open_streams.lock().await.clear();
@@ -2741,6 +2098,7 @@ impl SessionWriter {
         // responder。
         let mut batch = FlushBatch::default();
         let mut shaper = TrafficShaper::new(direction, traffic_script.as_deref(), post_script_off);
+        let mut data_stats = DataPlaneStats::default();
 
         loop {
             if close_requested.load(Ordering::Relaxed) {
@@ -2810,6 +2168,7 @@ impl SessionWriter {
                             &inbound,
                             pinned_sids,
                             &mut batch,
+                            &mut data_stats,
                         )
                         .await
                         {
@@ -2841,6 +2200,7 @@ impl SessionWriter {
                                 &inbound,
                                 pinned_sids,
                                 &mut batch,
+                                &mut data_stats,
                             )
                             .await
                             {
@@ -2923,6 +2283,7 @@ impl SessionWriter {
                             &inbound,
                             HashSet::new(),
                             &mut batch,
+                            &mut data_stats,
                         )
                         .await
                         {
@@ -2973,11 +2334,19 @@ impl SessionWriter {
                 &inbound,
                 HashSet::new(),
                 &mut batch,
+                &mut data_stats,
             )
             .await;
             // 明文积压已全部 prepare，等待者的字节这才进了 write_buffer。
             batch.responders.append(&mut responders);
         }
+        debug!(
+            "session writer data plane: bulk {} records/{} bytes, shaped {} records/{} bytes",
+            data_stats.bulk_records,
+            data_stats.bulk_bytes,
+            data_stats.shaped_records,
+            data_stats.shaped_bytes
+        );
         // 主循环退出时批里可能还留着已 prepare 未 flush 的字节：先冲刷并
         // 据实应答，再走 GOAWAY / close_notify。
         let _ = batch.flush(&mut write_half).await;
@@ -3063,6 +2432,7 @@ impl SessionWriter {
         inbound: &InboundSignal,
         pinned_sids: HashSet<u32>,
         batch: &mut FlushBatch,
+        stats: &mut DataPlaneStats,
     ) -> Result<Vec<WriteRequest>, String> {
         match Self::drive_shaper(
             pending,
@@ -3074,6 +2444,7 @@ impl SessionWriter {
             inbound,
             pinned_sids,
             batch,
+            stats,
         )
         .await
         {
@@ -3140,7 +2511,7 @@ impl SessionWriter {
     /// 是确定值而非抖动值：真实实现在这里也不抖动。批量有界，write_buffer
     /// 不会无界增长。
     ///
-    /// 脚本/Markov 策略的 delay 窗口内监听 control 通道：真实协议控制帧
+    /// 脚本策略的 delay 窗口内监听 control 通道：真实协议控制帧
     /// （SYN/FIN/SETTINGS/SYNACK，且不触及 pinned_sids 与 pending 数据流）
     /// 立即 prepare+flush 插队上链——真实 H2 端点本就优先控制帧；其余
     /// control 写（CMD_PADDING 骨架/假响应等）暂存返回，由主循环按到达
@@ -3165,6 +2536,7 @@ impl SessionWriter {
         inbound: &InboundSignal,
         mut pinned_sids: HashSet<u32>,
         batch: &mut FlushBatch,
+        stats: &mut DataPlaneStats,
     ) -> std::io::Result<(Vec<u8>, Vec<WriteRequest>)> {
         let mut fake_responses: Vec<u8> = Vec::new();
         let mut deferred_control = Vec::new();
@@ -3174,10 +2546,7 @@ impl SessionWriter {
         // pinned_sids 只在 policy.delay > 0 的窗口里被读（wait_shaping_delay），
         // 而 sticky bulk 路径的 delay 恒为 Duration::ZERO，于是大流量稳态下
         // 每轮 drain 都在白遍历全部帧头并建两个 HashSet。
-        // 窗口进度用**下界**喂给 shaper：flush 次数 + 对端到达次数（论证见
-        // `FlushBatch::flushes`）。逐轮 drain 更新一次即可——drain 内部的 flush
-        // 只会让真实进度更靠前，而少算只推迟放松，方向保守。
-        shaper.begin_drain(batch.flushes.saturating_add(inbound.arrivals()));
+        shaper.begin_drain();
         let mut first_policy = if pending.is_empty() {
             None
         } else {
@@ -3290,6 +2659,7 @@ impl SessionWriter {
             consumed += take;
             shaper.advance();
             batch.note_records(1 + usize::from(inline_fake.is_some()));
+            stats.note(policy.allow_full_block, take);
 
             // delay 非零时必须先 flush 再 sleep：否则已 prepare 的字节会攒到
             // sleep 之后一起出网，延迟根本作用不到线上，IAT 模型失效。这同时
@@ -3659,26 +3029,16 @@ pub(crate) fn remember_closing_stream_sync(
     }
 }
 
-/// buffered_stream_bytes 的统一减法口径：任何扣减都不允许下溢回绕。
-pub(crate) fn subtract_buffered_stream_bytes(counter: &AtomicUsize, bytes: usize) {
-    if bytes == 0 {
-        return;
-    }
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-        Some(value.saturating_sub(bytes))
-    });
-}
-
 /// 隧道重组缓冲的初始容量。
 const TUNNEL_REASSEMBLY_CAPACITY: usize = 65536;
 
 /// 单次隧道读取的上限。
 ///
 /// **这个数字是线上可观测的，不能顺手放大。** `InboundSignal::arrivals()`
-/// 计的就是「成功 read 的次数」，而它同时是：喂给 `TrafficShaper` 的窗口
-/// 进度下界（`begin_drain`）与让出方向的等待条件（`wait_for_peer_turn`）。
-/// 一次读得越多，arrivals 涨得越慢，整形窗口就退出得越晚——记录尺寸与延迟
-/// 分布随之改变。
+/// 计的就是「成功 read 的次数」，而它同时是：观测窗口（`Wo = 25`）进度
+/// 的口径（合成 H2 交换的开场判定、测试断言）与让出方向的等待条件
+/// （`wait_for_peer_turn`）。一次读得越多，arrivals 涨得越慢，窗口内行为
+/// 就退出得越晚。
 const TUNNEL_READ_CHUNK: usize = 16384;
 
 /// 直接读进重组缓冲的未初始化尾部。
